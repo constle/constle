@@ -1,0 +1,174 @@
+#!/bin/sh
+# install.sh — one-line installer for constle (Linux & macOS)
+#
+# Usage (what users run):
+#   curl -fsSL https://constle.dev/install | sh
+#
+# What this script does, step by step:
+#   1. Detect the OS (Linux or macOS)
+#   2. Detect the CPU architecture (amd64 or arm64)
+#   3. Ask the GitHub API for the latest release tag
+#   4. Construct the download URL for the right archive
+#   5. Download and extract the binary
+#   6. Install it to /usr/local/bin/constle (using sudo if needed)
+
+set -e  # Exit immediately if any command returns a non-zero exit code.
+        # Without this, a failed curl would let the script continue with
+        # an empty file and produce a confusing error later.
+
+# ---------------------------------------------------------------------------
+# Configuration — change these if you fork the project
+# ---------------------------------------------------------------------------
+REPO="constle/constle"
+BINARY="constle"
+INSTALL_DIR="/usr/local/bin"
+
+# ---------------------------------------------------------------------------
+# Pretty output helpers
+# ---------------------------------------------------------------------------
+info()  { printf "  \033[34m→\033[0m %s\n" "$*"; }  # blue arrow
+ok()    { printf "  \033[32m✓\033[0m %s\n" "$*"; }  # green check
+error() { printf "\n\033[31merror:\033[0m %s\n\n" "$*" >&2; exit 1; }
+
+printf "\n\033[1mconstle installer\033[0m\n\n"
+
+# ---------------------------------------------------------------------------
+# Step 1: Detect OS
+# uname -s returns the kernel name: "Linux" on Linux, "Darwin" on macOS.
+# GoReleaser uses lowercase: "linux", "darwin".
+# ---------------------------------------------------------------------------
+OS="$(uname -s)"
+case "$OS" in
+  Linux)  OS="linux"  ;;
+  Darwin) OS="darwin" ;;
+  *)      error "unsupported OS: $OS (only Linux and macOS are supported)" ;;
+esac
+info "OS: $OS"
+
+# ---------------------------------------------------------------------------
+# Step 2: Detect architecture
+# uname -m returns the machine hardware name.
+#   x86_64   — 64-bit Intel/AMD  (most PCs, cloud VMs)
+#   aarch64  — 64-bit ARM on Linux  (AWS Graviton, Raspberry Pi 4, etc.)
+#   arm64    — 64-bit ARM on macOS  (Apple Silicon: M1, M2, M3, ...)
+# GoReleaser uses "amd64" and "arm64".
+# ---------------------------------------------------------------------------
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64 | amd64)   ARCH="amd64" ;;
+  aarch64 | arm64)  ARCH="arm64" ;;
+  *)                 error "unsupported architecture: $ARCH" ;;
+esac
+info "arch: $ARCH"
+
+# ---------------------------------------------------------------------------
+# Step 3: Check for required tools
+# ---------------------------------------------------------------------------
+if ! command -v curl > /dev/null 2>&1; then
+  error "curl is required but not found. Install it with your package manager:\n  Ubuntu/Debian: sudo apt install curl\n  Fedora/RHEL:   sudo dnf install curl\n  macOS:         brew install curl"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 4: Fetch latest release version from the GitHub API
+#
+# The GitHub releases API endpoint returns JSON like:
+#   { "tag_name": "v0.5.0", "name": "Release v0.5.0", ... }
+#
+# We extract tag_name with grep + sed, which are available on all POSIX
+# systems without needing jq.
+#
+# curl flags:
+#   -f  fail fast (exit non-zero on HTTP 4xx/5xx, not print error page)
+#   -s  silent (no progress bar)
+#   -S  still show error messages even with -s
+#   -L  follow redirects
+# ---------------------------------------------------------------------------
+info "fetching latest release from GitHub..."
+
+API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+VERSION="$(curl -fsSL "$API_URL" \
+  | grep '"tag_name"' \
+  | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
+
+if [ -z "$VERSION" ]; then
+  error "could not determine latest release version.\nCheck your internet connection or visit: https://github.com/${REPO}/releases"
+fi
+
+ok "latest version: $VERSION"
+
+# ---------------------------------------------------------------------------
+# Step 5: Construct the download URL
+#
+# GoReleaser names archives using the template in .goreleaser.yaml:
+#   constle_{{ .Version }}_{{ .Os }}_{{ .Arch }}.tar.gz
+#
+# {{.Version}} is the tag WITHOUT the leading "v".  So tag "v0.5.0" →
+# archive "constle_0.5.0_linux_amd64.tar.gz", but the GitHub release URL
+# path still uses the full tag: /releases/download/v0.5.0/constle_0.5.0_...
+# ---------------------------------------------------------------------------
+VERSION_NO_V="${VERSION#v}"   # strip the leading "v": "v0.5.0" → "0.5.0"
+ARCHIVE="constle_${VERSION_NO_V}_${OS}_${ARCH}.tar.gz"
+URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
+
+info "downloading $ARCHIVE..."
+
+# ---------------------------------------------------------------------------
+# Step 6: Download to a temporary directory
+#
+# mktemp -d creates a new temporary directory with a random name, e.g.
+# /tmp/tmp.a3Bx9q.  The `trap` ensures we delete it on exit — whether the
+# script succeeds, fails, or the user presses Ctrl+C.
+# ---------------------------------------------------------------------------
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT   # cleanup on any exit
+
+curl -fsSL "$URL" -o "$TMP_DIR/$ARCHIVE"
+
+# ---------------------------------------------------------------------------
+# Step 7: Extract the binary
+#
+# tar flags:
+#   -x  extract
+#   -z  decompress with gzip (.tar.gz)
+#   -f  read from this file
+#   -C  change to this directory before extracting
+#
+# After extraction, find the binary anywhere in the temp dir (handles the
+# case where GoReleaser wraps files in a subdirectory).
+# ---------------------------------------------------------------------------
+info "extracting..."
+tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
+
+BINARY_PATH="$(find "$TMP_DIR" -name "$BINARY" -type f | head -1)"
+if [ -z "$BINARY_PATH" ]; then
+  error "binary '$BINARY' not found in archive — please report this at https://github.com/${REPO}/issues"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 8: Install
+#
+# Try writing to INSTALL_DIR directly.  If that fails (permission denied),
+# retry with sudo.  This way users who run as root or have write access don't
+# need to type their password.
+# ---------------------------------------------------------------------------
+info "installing to ${INSTALL_DIR}/${BINARY}..."
+
+if [ -w "$INSTALL_DIR" ]; then
+  mv "$BINARY_PATH" "$INSTALL_DIR/$BINARY"
+  chmod +x "$INSTALL_DIR/$BINARY"
+else
+  if ! command -v sudo > /dev/null 2>&1; then
+    error "cannot write to $INSTALL_DIR and sudo is not available.\nRun this script as root or install manually:\n  mv $BINARY_PATH $INSTALL_DIR/$BINARY"
+  fi
+  sudo mv "$BINARY_PATH" "$INSTALL_DIR/$BINARY"
+  sudo chmod +x "$INSTALL_DIR/$BINARY"
+fi
+
+# ---------------------------------------------------------------------------
+# Done!
+# ---------------------------------------------------------------------------
+printf "\n"
+ok "constle ${VERSION} installed to ${INSTALL_DIR}/${BINARY}"
+printf "\n  Get started:\n"
+printf "    constle --help\n"
+printf "    constle validate agent.yaml\n\n"
