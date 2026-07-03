@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint & test the Go CLI.
+  # Skipped entirely when no Go source files are present.
+  # ---------------------------------------------------------------------------
+  lint-and-test:
+    name: Lint & Test (Go)
+    runs-on: ubuntu-latest
+    if: hashFiles('cli/**/*.go') != ''
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+          cache-dependency-path: cli/go.sum
+
+      - name: Tidy modules
+        run: go mod tidy
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          working-directory: cli
+          args: --timeout=5m
+
+      - name: Test
+        run: go test ./...
+
+  # ---------------------------------------------------------------------------
+  # Validate YAML spec files with relaxed line-length rules.
+  # ---------------------------------------------------------------------------
+  validate-spec:
+    name: Validate Spec (YAML)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Lint YAML spec files
+        run: |
+          yamllint -d "{
+            extends: default,
+            rules: {
+              line-length: {max: 120, level: warning},
+              document-start: disable,
+              comments: {min-spaces-from-content: 1}
+            }
+          }" spec/
+
+  # ---------------------------------------------------------------------------
+  # Cross-platform build of the CLI binary.
+  # Only runs when Go source files exist. Generates go.sum if absent.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    if: hashFiles('cli/**/*.go') != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+          cache-dependency-path: cli/go.sum
+
+      - name: Tidy modules
+        run: go mod tidy
+
+      - name: Build
+        run: go build -v .
+
+      - name: Verify binary runs
+        run: go run . --version

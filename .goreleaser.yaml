@@ -1,0 +1,125 @@
+# .goreleaser.yaml — GoReleaser configuration
+#
+# GoReleaser is a tool that automates everything that needs to happen when you
+# push a git tag: compiling the binary for every OS/arch, packing it into
+# archives, computing checksums, and creating a GitHub Release with all those
+# assets attached.
+#
+# Install GoReleaser locally to test: https://goreleaser.com/install/
+# Dry-run without publishing:  goreleaser release --snapshot --clean
+# Real release (from CI only): goreleaser release --clean
+
+version: 2  # GoReleaser config schema version. Must be 2 for the 2.x CLI.
+
+# ---------------------------------------------------------------------------
+# Pre-build hooks
+# Run these shell commands before compiling anything.
+# ---------------------------------------------------------------------------
+before:
+  hooks:
+    - go mod tidy   # remove stale entries from go.sum / go.mod
+
+# ---------------------------------------------------------------------------
+# Builds — what to compile and for which platforms
+# ---------------------------------------------------------------------------
+builds:
+  - id: constle
+
+    # Path to the package that contains package main.
+    # ./cmd/constle  means  go build ./cmd/constle
+    main: ./cmd/constle
+
+    # Name of the produced executable (no extension — GoReleaser adds .exe for
+    # Windows automatically).
+    binary: constle
+
+    # Environment variables injected into the build.
+    # CGO_ENABLED=0 means "pure Go, no C code".  This is crucial for cross-
+    # compilation: without it, Go would try to use a C compiler for the target
+    # platform, which typically doesn't exist on the build machine.
+    env:
+      - CGO_ENABLED=0
+
+    # Target operating systems.
+    goos:
+      - linux
+      - darwin   # macOS
+      - windows
+
+    # Target CPU architectures.
+    # amd64  = 64-bit Intel/AMD  (most servers and desktops)
+    # arm64  = 64-bit ARM        (Apple Silicon Macs, AWS Graviton, Raspberry Pi 4)
+    goarch:
+      - amd64
+      - arm64
+
+    # Flags passed to the Go linker (the final step that turns .o files into a
+    # binary).  These are separate from compiler flags (go build -gcflags).
+    #
+    # -s          strip the symbol table   ↘  these two make the binary smaller
+    # -w          strip DWARF debug info   ↗  (no debugger, no stack-trace symbols)
+    #
+    # -X main.constleVersion={{.Version}}
+    #   Overwrite the Go string variable main.constleVersion at link time.
+    #   {{.Version}} is a GoReleaser template: the git tag without the leading
+    #   "v" (e.g. tag "v0.5.0" → Version "0.5.0").
+    #   This is why we changed `const` to `var` in main.go — the linker can
+    #   only patch variables, not compile-time constants.
+    ldflags:
+      - -s -w -X main.constleVersion={{.Version}}
+
+# ---------------------------------------------------------------------------
+# Archives — how to package each binary
+# ---------------------------------------------------------------------------
+archives:
+  - id: default
+
+    # Naming pattern for the archive file.
+    # Template variables:
+    #   .Version  — tag without "v"  (e.g. "0.5.0")
+    #   .Os       — lowercase OS     (e.g. "linux", "darwin", "windows")
+    #   .Arch     — lowercase arch   (e.g. "amd64", "arm64")
+    #
+    # Result example: constle_0.5.0_linux_amd64.tar.gz
+    name_template: "constle_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+    # Default format for all platforms.
+    formats:
+      - tar.gz
+
+    # Platform-specific format overrides.
+    # Windows users expect .zip, not .tar.gz (Windows Explorer can open zip
+    # natively; tar.gz requires extra tooling).
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+# ---------------------------------------------------------------------------
+# Checksums — a single file listing SHA-256 hashes of every archive
+# ---------------------------------------------------------------------------
+# Users can run:  sha256sum --check checksums.txt
+# to verify their download wasn't corrupted or tampered with.
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# ---------------------------------------------------------------------------
+# Snapshot — settings for local "dry run" builds (no real tag required)
+# ---------------------------------------------------------------------------
+# goreleaser release --snapshot --clean
+snapshot:
+  version_template: "{{ .Tag }}-dev"
+
+# ---------------------------------------------------------------------------
+# Changelog — auto-generated from git commits
+# ---------------------------------------------------------------------------
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"

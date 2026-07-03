@@ -1,0 +1,224 @@
+# Constle Agent Manifest Specification
+# Version: 0.1.0-draft
+# https://constle.dev/spec/agent-manifest
+#
+# The Agent Manifest is a declarative, portable descriptor for an AI agent.
+# It defines identity, execution environment, capabilities, governance, and
+# compliance requirements. Constle runtimes use this file to securely schedule,
+# sandbox, and audit agents — just as a Dockerfile defines how to build an image.
+#
+# Status: DRAFT — not yet stable. Field names and semantics may change.
+
+apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
+identity:
+  # Decentralized Identifier for this agent (W3C DID spec).
+  # Supported methods: did:web, did:key, did:constle
+  did: "did:constle:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+
+  # Human-readable name and version (semver).
+  name: "my-research-agent"
+  version: "1.0.0"
+
+  # Optional: parent agent that spawned or governs this one (for agent trees).
+  parent_did: null
+
+  # Verification method: public key used to sign agent payloads.
+  verification_method:
+    id: "did:constle:z6Mk...#key-1"
+    type: "Ed25519VerificationKey2020"
+    public_key_multibase: "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+
+# ---------------------------------------------------------------------------
+# Runtime / Sandbox
+# ---------------------------------------------------------------------------
+sandbox:
+  # Isolation backend. Options: firecracker | gvisor | wasm | none (dev only).
+  backend: firecracker
+
+  # Resource limits enforced by the runtime.
+  resources:
+    cpu_millicores: 1000       # 1 vCPU
+    memory_mb: 512
+    disk_mb: 2048
+    max_run_seconds: 300       # hard wall-clock timeout
+
+  # Network policy.
+  network:
+    egress: restricted         # restricted | open | none
+    allowed_hosts:
+      - "api.openai.com"
+      - "arxiv.org"
+    allowed_ports: [443]
+
+  # Filesystem mounts visible inside the sandbox.
+  mounts:
+    - name: workspace
+      host_path: "./workspace"
+      container_path: "/workspace"
+      read_only: false
+    - name: secrets
+      host_path: "./secrets"
+      container_path: "/run/secrets"
+      read_only: true
+
+# ---------------------------------------------------------------------------
+# Capabilities
+# ---------------------------------------------------------------------------
+# Explicit declaration of what protocols and tools this agent may use.
+# Constle enforces these at runtime; undeclared capabilities are denied.
+capabilities:
+
+  # Model Context Protocol (MCP) servers this agent may connect to.
+  mcp:
+    - id: "filesystem"
+      version: "2025-03-26"
+      tools: ["read_file", "write_file", "list_directory"]
+    - id: "web-search"
+      version: "2025-03-26"
+      tools: ["search"]
+
+  # Agent-to-Agent (A2A / ACP) peers this agent may call.
+  peers:
+    - did: "did:constle:z6MkSummarizerAgent"
+      protocols: [a2a, acp]
+      max_calls_per_run: 10
+
+  # External APIs beyond MCP (freeform, for documentation and enforcement).
+  external_apis:
+    - name: "OpenAI Chat Completions"
+      base_url: "https://api.openai.com/v1"
+      auth: bearer_token
+      secret_ref: "OPENAI_API_KEY"
+
+  # Human interaction gates (see human_gates section for policies).
+  human_interaction: true
+
+# ---------------------------------------------------------------------------
+# Spending Limits
+# ---------------------------------------------------------------------------
+# Agent commerce controls: x402 micropayments and AP2 budget policies.
+spending:
+  # Hard cap per single run.
+  max_per_run_usd: "0.50"
+
+  # Hard cap per calendar day (UTC).
+  max_per_day_usd: "5.00"
+
+  # Hard cap per calendar month.
+  max_per_month_usd: "50.00"
+
+  # Currency for all limits.
+  currency: USD
+
+  # Payment protocol. Options: x402 | none
+  payment_protocol: x402
+
+  # Payment channel configuration (x402).
+  x402:
+    receiver: "did:constle:z6MkPaymentReceiver"
+    max_single_payment_usd: "0.10"
+    require_human_approval_above_usd: "0.25"
+
+  # Alert thresholds (send notification, do not block).
+  alerts:
+    warn_at_pct_of_daily: 80
+
+# ---------------------------------------------------------------------------
+# Human Gate Policies
+# ---------------------------------------------------------------------------
+# Defines when the agent must pause and request human approval before acting.
+human_gates:
+
+  # Global enable/disable. When false, agent runs fully autonomously.
+  enabled: true
+
+  # Conditions that require a human checkpoint.
+  require_approval_for:
+    - action: "file_write"
+      paths: ["/workspace/output/**"]
+      condition: "always"          # always | on_error | never
+
+    - action: "external_api_call"
+      condition: "on_high_cost"    # triggers when call is projected to exceed threshold
+
+    - action: "spawn_subagent"
+      condition: "always"
+
+    - action: "payment"
+      condition: "always"
+
+  # How long to wait for human response before timing out.
+  approval_timeout_seconds: 300
+
+  # What to do when approval times out. Options: abort | proceed | retry
+  on_timeout: abort
+
+  # Notification channels for gate events.
+  notify:
+    - channel: webhook
+      url_secret_ref: "HUMAN_GATE_WEBHOOK_URL"
+    - channel: email
+      address_secret_ref: "HUMAN_GATE_EMAIL"
+
+# ---------------------------------------------------------------------------
+# Compliance Tags
+# ---------------------------------------------------------------------------
+# Structured metadata used by policy engines, auditors, and registries.
+compliance:
+
+  # Data classification of inputs this agent may process.
+  data_classification:
+    - public
+    # Uncomment as appropriate:
+    # - confidential
+    # - pii
+    # - phi          # HIPAA Protected Health Information
+    # - financial    # PCI-DSS scope
+
+  # Regulatory frameworks this agent deployment must satisfy.
+  frameworks:
+    - name: EU_AI_ACT
+      risk_tier: limited           # minimal | limited | high | unacceptable
+    - name: SOC2_TYPE2
+      in_scope: false
+
+  # Geographic restrictions on where this agent may execute.
+  geo_restrictions:
+    allowed_regions: []            # empty = no restriction
+    denied_regions: []
+
+  # Audit logging level. Options: none | minimal | standard | verbose
+  audit_log_level: standard
+
+  # Require cryptographic attestation of the sandbox environment.
+  require_tee_attestation: false
+
+  # Retention policy for agent run artifacts.
+  artifact_retention_days: 30
+
+  # Custom tags for internal policy engines.
+  tags:
+    team: "research"
+    cost_center: "cc-1042"
+    sensitivity: "low"
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+metadata:
+  description: >
+    A research agent that searches the web, reads papers, and produces
+    structured summaries. Operates within a strict spending budget and
+    requires human approval before writing output files.
+  author: "did:constle:z6MkAuthorDID"
+  license: "Apache-2.0"
+  source: "https://github.com/example/my-research-agent"
+  created_at: "2026-05-31T00:00:00Z"
+  labels:
+    use_case: research
+    maturity: experimental

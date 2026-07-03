@@ -1,0 +1,31 @@
+apiVersion: constle.dev/v1alpha1  
+kind: AgentManifest
+
+identity:
+  name: basic-agent
+  version: "0.1.0"
+
+sandbox:
+  image: basic-agent:latest
+  network:
+    egress: restricted
+    allowed_hosts:
+      - "api.groq.com"
+
+
+capabilities:
+  - external_api
+
+spending:
+  max_per_run_usd: "0.10"
+
+human_gates:
+  enabled: false
+
+compliance:
+  audit_log_level: minimal
+
+metadata:
+  description: "Minimal example: reads AGENT_TASK, calls Claude Haiku, prints the response."
+
+

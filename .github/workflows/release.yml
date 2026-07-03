@@ -1,0 +1,80 @@
+# .github/workflows/release.yml
+#
+# GitHub Actions workflow that runs GoReleaser whenever you push a version tag.
+#
+# How to trigger a release:
+#   git tag v0.5.0
+#   git push origin v0.5.0
+#
+# GitHub Actions will:
+#   1. Spin up an Ubuntu runner (a fresh Linux VM)
+#   2. Check out your code
+#   3. Install Go
+#   4. Run GoReleaser → builds binaries, creates archives, posts a GitHub Release
+
+name: Release
+
+# ---------------------------------------------------------------------------
+# Trigger: only fire on tag pushes that look like version tags (v1.2.3, etc.)
+# ---------------------------------------------------------------------------
+on:
+  push:
+    tags:
+      - 'v*'   # matches v0.5.0, v1.0.0, v2.3.4-beta.1, etc.
+
+# ---------------------------------------------------------------------------
+# Permissions
+# By default GitHub Actions tokens are read-only.  GoReleaser needs to CREATE
+# a release (write) and upload assets to it, so we grant contents:write.
+# Keeping all other permissions at their defaults (read or none) follows the
+# principle of least privilege.
+# ---------------------------------------------------------------------------
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: GoReleaser
+    runs-on: ubuntu-latest   # Linux runner — cross-compilation works fine here
+                              # because CGO_ENABLED=0 in .goreleaser.yaml
+
+    steps:
+      # ── 1. Check out the repository ────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 means "fetch the full git history", not just the
+          # latest commit.  GoReleaser needs this to:
+          #   • find the previous tag (to know what commits go in the changelog)
+          #   • compute the correct version from the tag
+          # Without this you get: "git tag was not found" errors.
+          fetch-depth: 0
+
+      # ── 2. Install Go ──────────────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Read the required Go version from go.mod instead of hardcoding it
+          # here.  When you update go.mod ("go 1.27"), the CI picks it up
+          # automatically.
+          go-version-file: go.mod
+
+          # Cache the Go module download cache and build cache between runs.
+          # Makes subsequent releases much faster (no re-downloading modules).
+          cache: true
+
+      # ── 3. Run GoReleaser ──────────────────────────────────────────────────
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser   # use goreleaser (not goreleaser-pro)
+          version: '~> v2'           # any v2.x release of GoReleaser
+          args: release --clean      # --clean: remove dist/ before building
+                                     # (avoids stale files from a previous run)
+        env:
+          # GITHUB_TOKEN is automatically created by GitHub for every workflow
+          # run.  GoReleaser uses it to:
+          #   • create the GitHub Release
+          #   • upload the compiled archives as release assets
+          # You do NOT need to add this secret manually — GitHub injects it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
