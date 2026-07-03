@@ -1,0 +1,47 @@
+apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+
+identity:
+  name: bypass-test
+  version: "1.0.0"
+
+sandbox:
+  image: curlimages/curl:latest
+  command:
+    - "sh"
+    - "-c"
+    - |
+      echo "=== testing proxy bypass attempts ==="
+
+      echo ""
+      echo "Test 1: normal blocked host (should fail)"
+      curl -sf --max-time 5 http://example.com > /dev/null 2>&1 \
+        && echo "  BLOCKED: NO — example.com accessible (bad!)" \
+        || echo "  BLOCKED: YES — example.com blocked (good)"
+
+      echo ""
+      echo "Test 2: unset proxy vars then try"
+      unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
+      curl -sf --max-time 5 http://example.com > /dev/null 2>&1 \
+        && echo "  BYPASS: SUCCEEDED — proxy is not enforced at network level!" \
+        || echo "  BYPASS: FAILED — network-level enforcement works"
+
+      echo ""
+      echo "Test 3: direct IP (bypasses hostname filtering)"
+      IP=$(nslookup example.com 2>/dev/null | grep -A1 'Name:' | grep Address | head -1 | awk '{print $2}')
+      echo "  example.com IP: $IP"
+      curl -sf --max-time 5 "http://$IP" > /dev/null 2>&1 \
+        && echo "  BYPASS: SUCCEEDED — direct IP works!" \
+        || echo "  BYPASS: FAILED — IP also blocked"
+
+  memory_mb: 128
+  network:
+    egress: restricted
+    allowed_hosts:
+      - httpbin.org
+
+capabilities:
+  - web_search
+
+human_gates:
+  enabled: false

@@ -1,0 +1,27 @@
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Go
+cli/constle.exe
+cli/constle
+constle.exe
+
+.claude/

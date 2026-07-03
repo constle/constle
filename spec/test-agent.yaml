@@ -1,0 +1,65 @@
+apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+
+# ============================================================
+# test-agent.yaml — Agent for testing network restrictions
+#
+# What this agent does:
+#   1. Tries to access httpbin.org (allowlisted) → should succeed
+#   2. Tries to access example.com (not allowlisted) → should be blocked
+#
+# This demonstrates how Constle enforces network restrictions in practice.
+# ============================================================
+
+identity:
+  name: network-test-agent
+  version: "1.0.0"
+
+sandbox:
+  # curlimages/curl — a small image (14MB) containing only curl
+  image: curlimages/curl:latest
+
+  # The command that will run inside the container
+  command:
+    - "sh"
+    - "-c"
+    - |
+      echo "=== Constle network restriction test ==="
+      echo ""
+
+      echo "Test 1: allowed host (httpbin.org)"
+      if curl -sf --max-time 5 http://httpbin.org/get > /dev/null 2>&1; then
+        echo "  PASS — httpbin.org is reachable (expected)"
+      else
+        echo "  FAIL — httpbin.org should be reachable"
+      fi
+
+      echo ""
+      echo "Test 2: blocked host (example.com)"
+      if curl -sf --max-time 5 http://example.com > /dev/null 2>&1; then
+        echo "  FAIL — example.com should be blocked"
+      else
+        echo "  PASS — example.com is blocked (expected)"
+      fi
+
+      echo ""
+      echo "=== test complete ==="
+
+  memory_mb: 128
+
+  network:
+    egress: restricted
+    allowed_hosts:
+      - httpbin.org   # Only this is allowed — example.com will be blocked
+
+# Constle infers isolation=network from this capability
+capabilities:
+  - web_search
+
+spending: {}  # User-defined, not developer-defined
+
+human_gates:
+  enabled: false  # Automated test — no human approval required
+
+compliance:
+  audit_log_level: standard
