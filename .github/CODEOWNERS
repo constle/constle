@@ -1,14 +1,9 @@
 # Constle CODEOWNERS
-# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
-# Spec changes require explicit review — the manifest is a public API.
-/spec/                  @constle-core
-
-# CLI
-/cli/                   @constle-core
-
-# Runtime (when it exists)
-/runtime/               @constle-core
-
-# CI / release pipeline
-/.github/               @constle-core
+/spec/            @constle/core
+/cmd/             @constle/core
+/internal/        @constle/core
+/pkg/             @constle/core
+/scripts/         @constle/core
+/examples/        @constle/core
+/.github/         @constle/core
