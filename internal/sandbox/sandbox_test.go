@@ -93,6 +93,26 @@ func TestNewRunID(t *testing.T) {
 	}
 }
 
+func TestHasListenerOnPort(t *testing.T) {
+	// Real /proc/net/tcp excerpt: 0CEA (3306) in LISTEN (0A), 0C38 (3128)
+	// only as an ESTABLISHED (01) remote peer.
+	dump := `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid
+   0: 00000000:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000   111
+   1: 0100007F:A3D2 0100007F:0C38 01 00000000:00000000 00:00000000 00000000  1000`
+
+	if hasListenerOnPort(dump, 3128) {
+		t.Error("3128 is not in LISTEN state — must not match remote peers or other states")
+	}
+	if !hasListenerOnPort(dump, 3306) {
+		t.Error("3306 is listed in LISTEN state (0A) and should match")
+	}
+
+	listening := dump + "\n   2: 00000000:0C38 00000000:0000 0A 00000000:00000000 00:00000000 00000000   113"
+	if !hasListenerOnPort(listening, 3128) {
+		t.Error("3128 in LISTEN state should match")
+	}
+}
+
 func TestDockerBackendIntegration(t *testing.T) {
 	if !dockerAvailable() {
 		t.Skip("Docker not available — skipping integration test")

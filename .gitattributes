@@ -1,0 +1,4 @@
+# Go tooling (gofmt, go vet) requires LF line endings regardless of the
+# platform the file was edited on.
+*.go text eol=lf
+* text=auto
