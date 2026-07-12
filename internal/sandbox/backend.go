@@ -21,6 +21,11 @@ type SandboxBackend interface {
 	// Wait blocks until the agent exits and returns its exit code.
 	Wait(ctx *RunContext) (int, error)
 
+	// Kill terminates the running agent (graceful first, force after a short
+	// grace period) WITHOUT cleaning up resources — Wait unblocks and the
+	// normal Stop path still runs. Used for Ctrl+C and max_duration_seconds.
+	Kill(ctx *RunContext) error
+
 	// Stop terminates and cleans up all resources for a run.
 	// Always called — even after Wait and on error paths.
 	Stop(ctx *RunContext) error
@@ -37,6 +42,9 @@ type RunContext struct {
 
 	AgentName string
 
+	// Backend identifies which backend created this context.
+	Backend BackendType
+
 	// AgentContainerID is the Docker container ID used for wait/logs/stop.
 	AgentContainerID string
 
@@ -52,6 +60,23 @@ type RunContext struct {
 	StartTime time.Time
 
 	IsolationLevel string
+
+	// VMPid is the firecracker process ID (Firecracker backend only).
+	VMPid int
+
+	// TAPDevice is the host TAP interface name (Firecracker backend only).
+	TAPDevice string
+
+	// SquidPID is the per-run host Squid process (Firecracker backend only).
+	SquidPID int
+
+	// SquidAccessLog is the host path of the per-run Squid access log
+	// (Firecracker backend only). Non-empty means network audit events are
+	// read from this file instead of from a proxy container.
+	SquidAccessLog string
+
+	// RunDir is the per-run state directory (Firecracker backend only).
+	RunDir string
 
 	// externalNetworkName is the outward-facing network (proxy ↔ internet).
 	// Package-internal; only Stop needs it for cleanup.

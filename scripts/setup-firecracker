@@ -1,0 +1,214 @@
+#!/bin/sh
+# setup-firecracker — one-time host setup for the Constle Firecracker backend.
+#
+# Usage:
+#   sudo ./scripts/setup-firecracker
+#
+# What this script does, step by step:
+#   1. Verify host preconditions (Linux, x86_64, /dev/kvm, required tools)
+#   2. Install the pinned firecracker + jailer release to /usr/local/bin
+#      (checksum-verified)
+#   3. Download the pinned guest kernel (Firecracker CI build) to
+#      /var/lib/constle/firecracker/
+#   4. Build the reference guest rootfs from examples/basic-agent plus a
+#      thin overlay (busybox, curl, /constle/init) and pack it into an
+#      ext4 image — no loop mounts needed (mkfs.ext4 -d)
+#   5. Create the runtime directory layout and the unprivileged user that
+#      jailer drops the VMM into
+#   6. Record all pinned versions in /var/lib/constle/firecracker/VERSIONS
+#
+# Everything lands under /var/lib/constle — runtime artifacts must live on
+# a native Linux filesystem (jailer hard-links the binary into its chroot,
+# which requires same-filesystem paths).
+
+set -e
+
+# ---------------------------------------------------------------------------
+# Pinned versions — update deliberately, never implicitly.
+#
+# FC_VERSION is a firecracker GitHub release tag. KERNEL_KEY is an S3 object
+# from Firecracker's CI artifacts (the same kernels the Firecracker project
+# tests against). The CI folder version trails the release version; v1.15 is
+# the newest folder published at the time of pinning and its kernels are
+# compatible with firecracker v1.16.x.
+# ---------------------------------------------------------------------------
+FC_VERSION="v1.16.1"
+KERNEL_KEY="firecracker-ci/v1.15/x86_64/vmlinux-6.1.155"
+KERNEL_NAME="vmlinux-6.1.155"
+
+CONSTLE_DIR="/var/lib/constle"
+FC_DIR="$CONSTLE_DIR/firecracker"
+IMAGES_DIR="$FC_DIR/images"
+INSTALL_DIR="/usr/local/bin"
+FC_USER="constle-fc"
+BASE_IMAGE_TAG="constle-guest-base:latest"
+GUEST_IMAGE_TAG="constle-guest:latest"
+
+info()  { printf "  \033[34m→\033[0m %s\n" "$*"; }
+ok()    { printf "  \033[32m✓\033[0m %s\n" "$*"; }
+error() { printf "\n\033[31merror:\033[0m %s\n\n" "$*" >&2; exit 1; }
+
+printf "\n\033[1mconstle firecracker setup\033[0m\n\n"
+
+# ---------------------------------------------------------------------------
+# Step 1: Preconditions
+# ---------------------------------------------------------------------------
+[ "$(uname -s)" = "Linux" ]   || error "the Firecracker backend requires Linux"
+[ "$(uname -m)" = "x86_64" ]  || error "this setup script currently supports x86_64 only"
+[ "$(id -u)" = "0" ]          || error "must run as root: sudo $0"
+[ -e /dev/kvm ]               || error "/dev/kvm not found — KVM (hardware or nested virtualization) is required"
+
+for tool in curl docker nft squid mkfs.ext4 debugfs tar ip; do
+  command -v "$tool" > /dev/null 2>&1 \
+    || error "required tool '$tool' not found — on Ubuntu/Debian: sudo apt install nftables squid e2fsprogs iproute2 (squid is spawned per run by constle; disable the system service: sudo systemctl disable --now squid)"
+done
+docker info > /dev/null 2>&1 || error "docker daemon is not reachable (needed to build the reference rootfs)"
+ok "host preconditions satisfied"
+
+# Resolve the repository root from this script's location — the rootfs build
+# needs examples/basic-agent and scripts/guest-init.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+[ -f "$REPO_DIR/examples/basic-agent/Dockerfile" ] || error "cannot locate examples/basic-agent relative to $SCRIPT_DIR"
+[ -f "$SCRIPT_DIR/guest-init" ] || error "scripts/guest-init not found"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# ---------------------------------------------------------------------------
+# Step 2: firecracker + jailer
+#
+# Release archives contain firecracker-<ver>-x86_64 and jailer-<ver>-x86_64;
+# we install them under their canonical names. The .sha256.txt shipped with
+# the release verifies the archive before anything is unpacked.
+# ---------------------------------------------------------------------------
+if [ "$(firecracker --version 2>/dev/null | head -1 | grep -c "${FC_VERSION#v}")" = "1" ]; then
+  ok "firecracker $FC_VERSION already installed"
+else
+  info "downloading firecracker $FC_VERSION..."
+  RELEASE_URL="https://github.com/firecracker-microvm/firecracker/releases/download"
+  ARCHIVE="firecracker-$FC_VERSION-x86_64.tgz"
+  curl -fsSL "$RELEASE_URL/$FC_VERSION/$ARCHIVE" -o "$TMP_DIR/$ARCHIVE"
+  curl -fsSL "$RELEASE_URL/$FC_VERSION/$ARCHIVE.sha256.txt" -o "$TMP_DIR/$ARCHIVE.sha256.txt"
+  (cd "$TMP_DIR" && sha256sum -c "$ARCHIVE.sha256.txt" > /dev/null) \
+    || error "checksum verification failed for $ARCHIVE"
+  tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
+  install -m 0755 "$TMP_DIR/release-$FC_VERSION-x86_64/firecracker-$FC_VERSION-x86_64" "$INSTALL_DIR/firecracker"
+  install -m 0755 "$TMP_DIR/release-$FC_VERSION-x86_64/jailer-$FC_VERSION-x86_64" "$INSTALL_DIR/jailer"
+  ok "installed $(firecracker --version | head -1) + jailer to $INSTALL_DIR"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3: guest kernel
+# ---------------------------------------------------------------------------
+mkdir -p "$FC_DIR" "$IMAGES_DIR"
+if [ -f "$FC_DIR/$KERNEL_NAME" ]; then
+  ok "guest kernel $KERNEL_NAME already present"
+else
+  info "downloading guest kernel $KERNEL_KEY..."
+  curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/$KERNEL_KEY" -o "$FC_DIR/$KERNEL_NAME"
+  ok "guest kernel installed to $FC_DIR/$KERNEL_NAME"
+fi
+ln -sf "$KERNEL_NAME" "$FC_DIR/vmlinux"
+
+# ---------------------------------------------------------------------------
+# Step 4: reference rootfs
+#
+# Base layer:   examples/basic-agent/Dockerfile (python + groq + agent.py) —
+#               the same image the Docker backend runs.
+# Overlay:      static busybox (guest init tooling), curl + CA certs, a few
+#               busybox applet symlinks, and /constle/init (PID 1).
+#
+# The flattened container filesystem is packed with `mkfs.ext4 -d`, which
+# populates the image directly from a directory tree — no privileged loop
+# mount required.
+# ---------------------------------------------------------------------------
+info "building reference rootfs (docker build + export)..."
+
+docker build -q -t "$BASE_IMAGE_TAG" "$REPO_DIR/examples/basic-agent" > /dev/null
+
+# When an Agentfile declares no command, the Docker backend falls back to
+# the image CMD. Mirror that: bake the base image's CMD (and WORKDIR) into
+# the rootfs as /constle/default-cmd, which the guest init runs by default.
+BASE_WORKDIR="$(docker image inspect --format '{{.Config.WorkingDir}}' "$BASE_IMAGE_TAG")"
+BASE_CMD="$(docker image inspect --format '{{join .Config.Cmd " "}}' "$BASE_IMAGE_TAG")"
+[ -n "$BASE_CMD" ] || error "base image $BASE_IMAGE_TAG has no CMD"
+{
+  echo "#!/bin/sh"
+  [ -n "$BASE_WORKDIR" ] && echo "cd $BASE_WORKDIR"
+  echo "exec $BASE_CMD"
+} > "$TMP_DIR/default-cmd"
+
+cp "$SCRIPT_DIR/guest-init" "$TMP_DIR/guest-init"
+cat > "$TMP_DIR/Dockerfile" <<'EOF'
+FROM constle-guest-base:latest
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends busybox-static curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && for applet in nslookup ping ip; do ln -sf /bin/busybox "/usr/local/bin/$applet"; done \
+ && mkdir -p /constle /workspace \
+ && printf 'nameserver 8.8.8.8\n' > /constle/resolv.conf
+COPY guest-init /constle/init
+COPY default-cmd /constle/default-cmd
+RUN chmod 0755 /constle/init /constle/default-cmd
+EOF
+docker build -q -t "$GUEST_IMAGE_TAG" "$TMP_DIR" > /dev/null
+
+STAGING="$TMP_DIR/rootfs"
+mkdir -p "$STAGING"
+CID="$(docker create "$GUEST_IMAGE_TAG")"
+docker export "$CID" | tar -xf - --numeric-owner -C "$STAGING"
+docker rm -f "$CID" > /dev/null
+
+# Size: content + 1/3 headroom, at least 1 GiB — the guest needs writable
+# space for /tmp and Python runtime files.
+SIZE_MB="$(du -sm "$STAGING" | cut -f1)"
+SIZE_MB=$(( SIZE_MB + SIZE_MB / 3 + 256 ))
+[ "$SIZE_MB" -lt 1024 ] && SIZE_MB=1024
+
+info "packing rootfs (${SIZE_MB} MB ext4)..."
+rm -f "$TMP_DIR/rootfs.ext4"
+truncate -s "${SIZE_MB}M" "$TMP_DIR/rootfs.ext4"
+mkfs.ext4 -q -F -d "$STAGING" "$TMP_DIR/rootfs.ext4"
+
+install -m 0644 "$TMP_DIR/rootfs.ext4" "$IMAGES_DIR/default.ext4"
+# Convention used by the backend: images/<sanitized docker image>.ext4,
+# falling back to default.ext4. The reference rootfs serves basic-agent.
+ln -sf "default.ext4" "$IMAGES_DIR/basic-agent-latest.ext4"
+ok "reference rootfs installed to $IMAGES_DIR/default.ext4"
+
+# ---------------------------------------------------------------------------
+# Step 5: runtime layout + jailer user
+#
+# runs/ is world-readable so `constle ps` works without root; jail/ holds
+# per-VM chroots and stays private to root. The VMM itself runs as the
+# unprivileged $FC_USER inside the jailer chroot.
+# ---------------------------------------------------------------------------
+mkdir -p "$CONSTLE_DIR/runs" "$CONSTLE_DIR/jail"
+chmod 0755 "$CONSTLE_DIR" "$CONSTLE_DIR/runs"
+chmod 0700 "$CONSTLE_DIR/jail"
+
+if ! id "$FC_USER" > /dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$FC_USER"
+  ok "created system user $FC_USER (jailer drops privileges to it)"
+else
+  ok "system user $FC_USER already exists"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 6: record pinned versions
+# ---------------------------------------------------------------------------
+{
+  echo "firecracker=$FC_VERSION"
+  echo "jailer=$FC_VERSION"
+  echo "guest_kernel=$KERNEL_KEY"
+  echo "guest_kernel_sha256=$(sha256sum "$FC_DIR/$KERNEL_NAME" | cut -d' ' -f1)"
+  echo "rootfs_sha256=$(sha256sum "$IMAGES_DIR/default.ext4" | cut -d' ' -f1)"
+  echo "rootfs_base=examples/basic-agent (python:3.12-slim)"
+  echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$FC_DIR/VERSIONS"
+
+printf "\n"
+ok "setup complete — versions recorded in $FC_DIR/VERSIONS"
+printf "\n  Next steps:\n"
+printf "    sudo constle run --backend=firecracker examples/basic-agent/agent.yaml\n\n"

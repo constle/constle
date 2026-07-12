@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"sync"
 	"time"
@@ -105,9 +106,27 @@ func (l *Logger) Path() string {
 }
 
 // DefaultLogPath returns the default log file path for an agent.
+//
+// When constle runs under sudo (required by the Firecracker backend), the
+// log still goes to the invoking user's home so all runs of an agent land
+// in one place regardless of backend.
 func DefaultLogPath(agentName string) string {
-	home, _ := os.UserHomeDir()
+	home := invokingUserHome()
 	date := time.Now().UTC().Format("2006-01-02")
 	filename := fmt.Sprintf("%s-%s.jsonl", agentName, date)
 	return filepath.Join(home, ".constle", "logs", filename)
+}
+
+// invokingUserHome resolves the home directory of the user who actually
+// invoked constle, looking through sudo.
+func invokingUserHome() string {
+	if os.Geteuid() == 0 {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && sudoUser != "root" {
+			if u, err := user.Lookup(sudoUser); err == nil && u.HomeDir != "" {
+				return u.HomeDir
+			}
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return home
 }

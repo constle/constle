@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -48,10 +47,11 @@ func main() {
 		}
 
 	case "run":
-		if len(os.Args) < 3 {
-			die("usage: constle run <agentfile.yaml>")
+		agentfile, backendOverride, err := parseRunArgs(os.Args[2:])
+		if err != nil {
+			die("%v", err)
 		}
-		if err := cmdRun(os.Args[2]); err != nil {
+		if err := cmdRun(agentfile, backendOverride); err != nil {
 			die("%v", err)
 		}
 
@@ -87,7 +87,28 @@ func main() {
 	}
 }
 
-func cmdRun(agentfilePath string) error {
+// parseRunArgs extracts the Agentfile path and the optional --backend flag
+// from `constle run` arguments.
+func parseRunArgs(args []string) (agentfile, backendOverride string, err error) {
+	for _, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, "--backend="):
+			backendOverride = strings.TrimPrefix(arg, "--backend=")
+		case strings.HasPrefix(arg, "-"):
+			return "", "", fmt.Errorf("unknown flag %q\nusage: constle run [--backend=docker|firecracker] <agentfile.yaml>", arg)
+		case agentfile == "":
+			agentfile = arg
+		default:
+			return "", "", fmt.Errorf("unexpected argument %q", arg)
+		}
+	}
+	if agentfile == "" {
+		return "", "", fmt.Errorf("usage: constle run [--backend=docker|firecracker] <agentfile.yaml>")
+	}
+	return agentfile, backendOverride, nil
+}
+
+func cmdRun(agentfilePath, backendOverride string) error {
 	printf("\nconstle v%s\n\n", constleVersion)
 
 	printStep("parsing %s", agentfilePath)
@@ -115,7 +136,7 @@ func cmdRun(agentfilePath string) error {
 
 	printStep("detecting backend")
 
-	backend, backendType, err := sandbox.DetectBestBackend(m.Sandbox.Isolation)
+	backend, backendType, err := sandbox.DetectBestBackend(m.Sandbox.Isolation, backendOverride)
 	if err != nil {
 		return err
 	}
@@ -142,26 +163,28 @@ func cmdRun(agentfilePath string) error {
 		return fmt.Errorf("cannot start sandbox: %w", err)
 	}
 
-	// Squid logs must be read before Stop() removes the proxy container.
+	// Squid logs must be read before Stop() removes the proxy container
+	// (Docker) or the run directory (Firecracker).
 	defer func() {
 		printStep("reading network audit logs...")
-		if err := audit.FlushSquidLogs(
-			runCtx.RunID,
-			m.Identity.Name,
-			runCtx.ProxyContainerID,
-			logger,
-		); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: could not read network logs: %v\n", err)
+		var flushErr error
+		if runCtx.SquidAccessLog != "" {
+			flushErr = audit.FlushSquidLogFile(runCtx.RunID, m.Identity.Name, runCtx.SquidAccessLog, logger)
+		} else {
+			flushErr = audit.FlushSquidLogs(runCtx.RunID, m.Identity.Name, runCtx.ProxyContainerID, logger)
+		}
+		if flushErr != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not read network logs: %v\n", flushErr)
 		} else {
 			printOK("network events logged")
 		}
 
 		printf("\n")
-		printStep("cleaning up containers...")
+		printStep("cleaning up sandbox...")
 		if err := backend.Stop(runCtx); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: cleanup error: %v\n", err)
 		} else {
-			printOK("containers removed")
+			printOK("sandbox removed")
 		}
 	}()
 
@@ -192,7 +215,7 @@ func cmdRun(agentfilePath string) error {
 		sig := <-sigCh
 		printf("\nconstle: received %s — stopping agent...\n", sig)
 		close(userStopped)
-		exec.Command("docker", "stop", "--time=5", runCtx.AgentContainerID).Run()
+		backend.Kill(runCtx)
 	}()
 
 	// limitReached is closed by the timer goroutine when MaxDurationSeconds
@@ -209,7 +232,7 @@ func cmdRun(agentfilePath string) error {
 			select {
 			case <-time.After(time.Duration(m.Limits.MaxDurationSeconds) * time.Second):
 				close(limitReached)
-				exec.Command("docker", "stop", "--time=5", runCtx.AgentContainerID).Run()
+				backend.Kill(runCtx)
 			case <-userStopped:
 				// User stopped first; let the signal goroutine handle cleanup.
 			}
@@ -322,6 +345,7 @@ func printHelp() {
 usage:
   constle init                  create agent.yaml with sensible defaults
   constle run <agentfile>       run an agent in a sandbox
+    --backend=<name>            force a backend: docker or firecracker
   constle validate <agentfile>  check if an Agentfile is valid
   constle ps                    list running and recent agents
   constle stop <run_id>         stop a running agent by run ID

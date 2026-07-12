@@ -99,18 +99,7 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 
 	// Forward API keys from the host environment into the agent container.
 	// Only included when the variable is set on the host; absent key → omitted flag.
-	agentEnv := map[string]string{}
-	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
-		agentEnv["ANTHROPIC_API_KEY"] = key
-	}
-
-	if key := os.Getenv("GROQ_API_KEY"); key != "" {
-		agentEnv["GROQ_API_KEY"] = key
-	}
-
-	if task := os.Getenv("AGENT_TASK"); task != "" {
-		agentEnv["AGENT_TASK"] = task
-	}
+	agentEnv := forwardedHostEnv()
 
 	agentID, err := startAgentContainer(agentName, intNet, image, m.Sandbox.MemoryMB, m.Sandbox.Command, agentLabels, agentEnv)
 	if err != nil {
@@ -125,6 +114,7 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 	return &RunContext{
 		RunID:               runID,
 		AgentName:           m.Identity.Name,
+		Backend:             BackendDocker,
 		AgentContainerID:    agentID,
 		ProxyContainerID:    proxyID,
 		NetworkName:         intNet,
@@ -146,6 +136,13 @@ func (d *DockerBackend) Wait(ctx *RunContext) (int, error) {
 		return -1, fmt.Errorf("cannot parse exit code: %w", err)
 	}
 	return exitCode, nil
+}
+
+// Kill gracefully stops the agent container (SIGTERM, then SIGKILL after
+// 5 seconds) without cleaning up resources — Wait unblocks and the normal
+// Stop path still runs.
+func (d *DockerBackend) Kill(ctx *RunContext) error {
+	return dockerRun("stop", "--time=5", ctx.AgentContainerID)
 }
 
 // Stop removes all containers and networks for this run.
@@ -189,6 +186,17 @@ func (d *DockerBackend) Logs(ctx *RunContext) ([]byte, error) {
 }
 
 func writeSquidConfig(runID string, allowedHosts []string) (string, error) {
+	config := buildSquidConfig(runID, allowedHosts, "3128", "/var/log/squid/access.log", "")
+	path := filepath.Join(os.TempDir(), "constle-squid-"+runID+".conf")
+	return path, os.WriteFile(path, []byte(config), 0644)
+}
+
+// buildSquidConfig renders the allowlist-enforcing Squid configuration
+// shared by both backends. httpPort is either a bare port (Docker: Squid
+// listens inside its own container) or "ip:port" (Firecracker: Squid runs
+// on the host and must bind only the per-run TAP gateway address). extra
+// appends backend-specific directives.
+func buildSquidConfig(runID string, allowedHosts []string, httpPort, accessLogPath, extra string) string {
 	var config string
 	if len(allowedHosts) > 0 {
 		hosts := strings.Join(allowedHosts, " ")
@@ -203,22 +211,40 @@ http_access allow allowed_hosts
 http_access allow CONNECT allowed_hosts
 http_access deny all
 
-http_port 3128
+http_port %s
 cache deny all
-access_log /var/log/squid/access.log
+access_log %s
 cache_log /dev/null
 coredump_dir /tmp
-`, runID, hosts)
+`, runID, hosts, httpPort, accessLogPath)
 	} else {
 		config = fmt.Sprintf(`# Constle - run %s - no network
 http_access deny all
-http_port 3128
+http_port %s
 cache deny all
-`, runID)
+access_log %s
+cache_log /dev/null
+coredump_dir /tmp
+`, runID, httpPort, accessLogPath)
 	}
 
-	path := filepath.Join(os.TempDir(), "constle-squid-"+runID+".conf")
-	return path, os.WriteFile(path, []byte(config), 0644)
+	if extra != "" {
+		config += extra + "\n"
+	}
+	return config
+}
+
+// forwardedHostEnv collects the host environment variables forwarded into
+// every agent sandbox, regardless of backend. Only variables actually set
+// on the host are included.
+func forwardedHostEnv() map[string]string {
+	env := map[string]string{}
+	for _, key := range []string{"ANTHROPIC_API_KEY", "GROQ_API_KEY", "AGENT_TASK"} {
+		if value := os.Getenv(key); value != "" {
+			env[key] = value
+		}
+	}
+	return env
 }
 
 func startProxyContainer(name, extNet, intNet, configPath string) (string, error) {
@@ -239,16 +265,35 @@ func startProxyContainer(name, extNet, intNet, configPath string) (string, error
 	return proxyID, nil
 }
 
+// waitForSquid polls until the proxy container actually LISTENs on 3128.
+// `squid -k check` is not enough: it passes as soon as the PID file exists,
+// which is before the listener is up — the agent would then get an instant
+// connection refused. /proc/net/tcp is readable in any container and shows
+// the authoritative socket state.
 func waitForSquid(proxyName string) error {
 	for i := 0; i < 30; i++ {
-		out, _ := exec.Command("docker", "exec", proxyName,
-			"squid", "-k", "check").CombinedOutput()
-		if !strings.Contains(string(out), "No running copy") {
+		out, err := exec.Command("docker", "exec", proxyName,
+			"sh", "-c", "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null").Output()
+		if err == nil && hasListenerOnPort(string(out), 3128) {
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	return fmt.Errorf("squid did not become ready after 15s")
+}
+
+// hasListenerOnPort reports whether a /proc/net/tcp dump contains a socket
+// in LISTEN state (st == 0A) whose local address ends with the given port.
+func hasListenerOnPort(procNetTCP string, port int) bool {
+	suffix := fmt.Sprintf(":%04X", port)
+	for _, line := range strings.Split(procNetTCP, "\n") {
+		fields := strings.Fields(line)
+		// sl local_address rem_address st ...
+		if len(fields) >= 4 && strings.HasSuffix(fields[1], suffix) && fields[3] == "0A" {
+			return true
+		}
+	}
+	return false
 }
 
 func startAgentContainer(name, intNet, image string, memoryMB int, command []string, labels map[string]string, envVars map[string]string) (string, error) {
