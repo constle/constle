@@ -10,6 +10,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/constle/constle/internal/sandbox"
 )
 
 // psContainer represents a single entry from `docker ps --format "{{json .}}"`.
@@ -22,21 +24,18 @@ type psContainer struct {
 	Labels string `json:"Labels"`
 }
 
-func runPS() error {
-	// Using {{json .}} instead of {{index .Labels "key"}} avoids quote escaping
-	// issues when passing the format string as an exec.Command argument on Windows.
-	out, err := exec.Command(
-		"docker", "ps",
-		"-a",
-		"--filter", "label=constle.managed=true",
-		"--format", "{{json .}}",
-	).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("docker ps failed: %s", strings.TrimSpace(string(out)))
-	}
+// psRow is one line of `constle ps` output, backend-agnostic.
+type psRow struct {
+	runID     string
+	agentName string
+	status    string
+	duration  string
+}
 
-	output := strings.TrimSpace(string(out))
-	if output == "" {
+func runPS() error {
+	rows := append(dockerPSRows(), firecrackerPSRows()...)
+
+	if len(rows) == 0 {
 		fmt.Println("No agents found.")
 		fmt.Println("Tip: constle run <agentfile>")
 		return nil
@@ -46,7 +45,36 @@ func runPS() error {
 	fmt.Fprintln(w, "RUN ID\tAGENT\tSTATUS\tDURATION")
 	fmt.Fprintln(w, "------\t-----\t------\t--------")
 
-	for _, line := range strings.Split(output, "\n") {
+	for _, row := range rows {
+		displayID := row.runID
+		if len(displayID) > 12 {
+			displayID = displayID[:12] + "..."
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+			displayID, row.agentName, row.status, row.duration)
+	}
+
+	return w.Flush()
+}
+
+// dockerPSRows lists constle-managed Docker containers. An unreachable
+// Docker daemon yields no rows instead of an error — the host may be
+// running Firecracker-only.
+func dockerPSRows() []psRow {
+	// Using {{json .}} instead of {{index .Labels "key"}} avoids quote escaping
+	// issues when passing the format string as an exec.Command argument on Windows.
+	out, err := exec.Command(
+		"docker", "ps",
+		"-a",
+		"--filter", "label=constle.managed=true",
+		"--format", "{{json .}}",
+	).CombinedOutput()
+	if err != nil {
+		return nil
+	}
+
+	var rows []psRow
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
 			continue
 		}
@@ -59,22 +87,33 @@ func runPS() error {
 		// docker ps JSON labels are "key1=val1,key2=val2,..." not a map.
 		labels := parseDockerLabels(c.Labels)
 
-		runID := labels["constle.run-id"]
-		agentName := labels["constle.agent-name"]
-		startedAt := labels["constle.started-at"]
-
-		displayID := runID
-		if len(displayID) > 12 {
-			displayID = displayID[:12] + "..."
-		}
-
-		duration := calcDuration(startedAt)
-
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
-			displayID, agentName, c.State, duration)
+		rows = append(rows, psRow{
+			runID:     labels["constle.run-id"],
+			agentName: labels["constle.agent-name"],
+			status:    c.State,
+			duration:  calcDuration(labels["constle.started-at"]),
+		})
 	}
+	return rows
+}
 
-	return w.Flush()
+// firecrackerPSRows lists Firecracker runs. Status is verified against the
+// live process table (PID + cmdline), never trusted from the state file.
+func firecrackerPSRows() []psRow {
+	var rows []psRow
+	for _, run := range sandbox.ListFirecrackerRuns() {
+		status := "exited"
+		if run.Running {
+			status = "running"
+		}
+		rows = append(rows, psRow{
+			runID:     run.RunID,
+			agentName: run.AgentName,
+			status:    status,
+			duration:  calcDuration(run.StartedAt.Format(time.RFC3339)),
+		})
+	}
+	return rows
 }
 
 // parseDockerLabels converts "key1=val1,key2=val2" to map[string]string.

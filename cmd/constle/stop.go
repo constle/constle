@@ -18,10 +18,25 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/constle/constle/internal/sandbox"
 )
 
 func cmdStop(runID string) error {
 	printf("\nconstle stop %s\n\n", runID)
+
+	// Firecracker-backed runs are recognized by their state directory and
+	// torn down through the sandbox package (VMM process, TAP device,
+	// nftables table, chroot). Everything else falls through to Docker.
+	if sandbox.FirecrackerRunExists(runID) {
+		printStep("removing firecracker microVM, TAP device and firewall rules...")
+		if err := sandbox.StopFirecrackerRun(runID); err != nil {
+			return err
+		}
+		printOK("run %s stopped and resources removed", runID)
+		printf("\n")
+		return nil
+	}
 
 	containers := []string{
 		"constle-agent-" + runID,

@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -41,6 +42,25 @@ func FlushSquidLogs(runID, agentName, proxyContainerID string, logger *Logger) e
 		// 1. Container does not exist (Stop() ran first — wrong call order).
 		// 2. access.log does not exist (agent made no network requests — normal).
 		return fmt.Errorf("cannot read squid log from %s: %w", proxyContainerID, err)
+	}
+
+	if len(output) == 0 {
+		return nil
+	}
+
+	return parseAndLog(strings.NewReader(string(output)), runID, agentName, logger)
+}
+
+// FlushSquidLogFile reads a Squid access log from a host file path and
+// writes audit events — used by the Firecracker backend, whose per-run
+// Squid instance runs on the host. Attribution works exactly like the
+// Docker path: each run has its own Squid instance and log file, so every
+// line in the file belongs to this run.
+// Must be called before backend.Stop() — Stop removes the run directory.
+func FlushSquidLogFile(runID, agentName, path string, logger *Logger) error {
+	output, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("cannot read squid log at %s: %w", path, err)
 	}
 
 	if len(output) == 0 {
@@ -107,7 +127,14 @@ func parseSquidLine(line string) (action, host, method string, status int, bytes
 	// Field 5: HTTP method ("CONNECT", "GET", "POST", ...)
 	method = fields[5]
 
-	// Field 6: URL → extract hostname
+	// Field 6: URL → extract hostname.
+	// Squid logs protocol-level failures (aborted connections, readiness
+	// probes) with an "error:..." pseudo-URL — not a network access attempt,
+	// so not an audit event.
+	if strings.HasPrefix(fields[6], "error:") {
+		err = fmt.Errorf("squid pseudo-URL, not an access record: %q", fields[6])
+		return
+	}
 	host = extractHost(fields[6])
 
 	// TCP_DENIED = blocked by Squid ACL; NONE = connection error; everything else = allowed.

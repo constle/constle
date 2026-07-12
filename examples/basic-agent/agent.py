@@ -14,5 +14,3 @@ response = client.chat.completions.create(
     max_tokens=512
 )
 print(response.choices[0].message.content)
-import time
-time.sleep(30)  # מחכה 30 שניות

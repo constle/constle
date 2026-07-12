@@ -1,0 +1,91 @@
+#!/bin/busybox sh
+# guest-init — PID 1 inside a Constle Firecracker guest.
+#
+# Installed into the reference rootfs at /constle/init by
+# scripts/setup-firecracker and selected via the kernel boot argument
+# `init=/constle/init`.
+#
+# Boot flow:
+#   1. Mount kernel filesystems (/proc, /sys; /dev is devtmpfs, mounted by
+#      the kernel itself — CONFIG_DEVTMPFS_MOUNT=y in the pinned kernel).
+#   2. Mount the per-run workspace drive (/dev/vdb) at /workspace. The host
+#      builds this ext4 image fresh for every run; it carries the run's
+#      environment (`env`), the command to execute (`cmd`), and receives the
+#      agent's output (`agent.log`) and exit code (`exitcode`) back.
+#   3. Configure eth0 from the workspace env. This is convenience config
+#      only — egress enforcement happens on the HOST (nftables + Squid);
+#      nothing the guest does to its own network stack can widen access.
+#   4. Run /workspace/cmd, capturing combined output and the exit code.
+#   5. Sync and reboot. In a Firecracker microVM a guest reboot terminates
+#      the firecracker process — that is how the host learns the run ended.
+#
+# Graceful stop: the host sends Ctrl+Alt+Del through the Firecracker API,
+# which makes the kernel deliver SIGINT to PID 1. The trap below forwards
+# SIGTERM to the agent, waits briefly, and exits with code 124.
+
+bb=/bin/busybox
+
+# The kernel starts init with a minimal PATH that misses /usr/local/bin,
+# where the python:*-slim images install the interpreter.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+$bb mount -t proc proc /proc
+$bb mount -t sysfs sys /sys
+
+# finish <code> — record the exit code, echo the agent output to the serial
+# console (visible in the host's console.log), and shut the VM down.
+finish() {
+	echo "$1" > /workspace/exitcode
+	[ -f /workspace/agent.log ] && $bb cat /workspace/agent.log
+	echo "constle-init: agent exited with code $1"
+	$bb sync
+	$bb umount /workspace 2>/dev/null
+	$bb reboot -f
+}
+
+$bb mkdir -p /workspace
+if ! $bb mount /dev/vdb /workspace; then
+	echo "constle-init: cannot mount workspace drive /dev/vdb"
+	$bb sync
+	$bb reboot -f
+fi
+
+[ -f /workspace/env ] && . /workspace/env
+
+# CONSTLE_GUEST_CIDR / CONSTLE_GATEWAY_IP are written by the host backend.
+# The default route makes bypass attempts leave the guest so they are
+# observably dropped by the host firewall rather than failing locally.
+if [ -n "$CONSTLE_GUEST_CIDR" ]; then
+	$bb ip addr add "$CONSTLE_GUEST_CIDR" dev eth0
+	$bb ip link set eth0 up
+	[ -n "$CONSTLE_GATEWAY_IP" ] && $bb ip route add default via "$CONSTLE_GATEWAY_IP" dev eth0
+fi
+
+# The image build cannot persist /etc/resolv.conf (Docker bind-mounts it
+# during builds), so the rootfs carries it at /constle/resolv.conf instead.
+[ -f /constle/resolv.conf ] && $bb cp /constle/resolv.conf /etc/resolv.conf
+
+agent_pid=""
+
+# The kernel's default Ctrl+Alt+Del behavior is an immediate hard reboot,
+# which would skip the agent's SIGTERM and lose unsynced workspace writes.
+# Soft mode (0) delivers SIGINT to PID 1 instead, taken by the trap below.
+echo 0 > /proc/sys/kernel/ctrl-alt-del
+
+# Ctrl+Alt+Del → SIGINT to PID 1.
+on_int() {
+	[ -n "$agent_pid" ] && $bb kill -TERM "$agent_pid" 2>/dev/null
+	$bb sleep 2
+	finish 124
+}
+trap on_int INT
+
+if [ ! -f /workspace/cmd ]; then
+	echo "constle-init: no /workspace/cmd to run"
+	finish 127
+fi
+
+sh /workspace/cmd > /workspace/agent.log 2>&1 &
+agent_pid=$!
+wait $agent_pid
+finish $?
