@@ -173,10 +173,17 @@ func teardownFirecrackerRun(st *fcRunState) []string {
 	}
 
 	// Only signal the squid PID if it still looks like our squid — the PID
-	// may have been reused after a host crash.
+	// may have been reused after a host crash. SIGTERM first so Squid can
+	// flush its access log, but never report success while it is still
+	// alive (its shutdown takes ~2s even with shutdown_lifetime 0):
+	// wait for it to exit, escalate to SIGKILL, and surface survival.
 	if cmdlineMatches(st.SquidPID, "squid", "") {
-		if proc, err := os.FindProcess(st.SquidPID); err == nil {
-			proc.Signal(syscall.SIGTERM)
+		syscall.Kill(st.SquidPID, syscall.SIGTERM)
+		if !waitProcessGone(st.SquidPID, "squid", 5*time.Second) {
+			syscall.Kill(st.SquidPID, syscall.SIGKILL)
+			if !waitProcessGone(st.SquidPID, "squid", 2*time.Second) {
+				errs = append(errs, fmt.Sprintf("squid %d still running after SIGKILL", st.SquidPID))
+			}
 		}
 	}
 
@@ -196,6 +203,19 @@ func teardownFirecrackerRun(st *fcRunState) []string {
 		errs = append(errs, fmt.Sprintf("rm run dir: %v", err))
 	}
 	return errs
+}
+
+// waitProcessGone polls until pid no longer looks like binaryName or the
+// timeout elapses. A reaped, exited, or reused PID all count as gone.
+func waitProcessGone(pid int, binaryName string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !cmdlineMatches(pid, binaryName, "") {
+			return true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return !cmdlineMatches(pid, binaryName, "")
 }
 
 // cleanupAbandonedFirecracker removes resources of runs whose VMM is no
