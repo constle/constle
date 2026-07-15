@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,10 @@ import (
 
 	"github.com/constle/constle/pkg/manifest"
 )
+
+// detectOut is where DetectBestBackend prints isolation-downgrade warnings.
+// It is a package variable so tests can capture the output.
+var detectOut io.Writer = os.Stdout
 
 // DetectBestBackend selects the best available sandbox backend for the
 // required isolation level.
@@ -23,6 +28,12 @@ func DetectBestBackend(required manifest.IsolationLevel, override string) (Sandb
 	case string(BackendDocker):
 		if !dockerAvailable() {
 			return nil, "", fmt.Errorf("backend %q requested but the Docker daemon is not reachable", override)
+		}
+		// An explicit --backend=docker override still downgrades isolation
+		// when the manifest asks for kernel-level isolation. Warn just as
+		// loudly as the automatic path does, instead of running silently.
+		if required == manifest.IsolationKernel {
+			warnKernelIsolationOnDocker("Docker was explicitly requested with --backend=docker")
 		}
 		return &DockerBackend{}, BackendDocker, nil
 
@@ -42,9 +53,7 @@ func DetectBestBackend(required manifest.IsolationLevel, override string) (Sandb
 		if reason := firecrackerUnavailableReason(); reason == "" {
 			return &FirecrackerBackend{}, BackendFirecracker, nil
 		} else if dockerAvailable() {
-			fmt.Println("⚠️  warning: kernel isolation requested but Firecracker is unavailable:")
-			fmt.Println("   " + reason)
-			fmt.Println("   falling back to Docker — network isolation only, NOT kernel-level isolation")
+			warnKernelIsolationOnDocker("Firecracker is unavailable: " + reason)
 			return &DockerBackend{}, BackendDocker, nil
 		}
 	}
@@ -60,8 +69,21 @@ func DetectBestBackend(required manifest.IsolationLevel, override string) (Sandb
 	)
 }
 
-// dockerAvailable reports whether the Docker daemon is reachable.
-func dockerAvailable() bool {
+// warnKernelIsolationOnDocker prints a warning that a manifest requiring
+// kernel-level isolation is being served by the Docker backend, which
+// isolates the network but NOT the kernel. reason explains why Docker is
+// being used (Firecracker unavailable, or an explicit --backend=docker
+// override). Both the automatic and the override paths route through here so
+// the downgrade is never silent.
+func warnKernelIsolationOnDocker(reason string) {
+	fmt.Fprintln(detectOut, "⚠️  warning: kernel isolation requested but running on Docker:")
+	fmt.Fprintln(detectOut, "   "+reason)
+	fmt.Fprintln(detectOut, "   Docker provides network isolation only, NOT kernel-level isolation")
+}
+
+// dockerAvailable reports whether the Docker daemon is reachable. It is a
+// variable so tests can stub the daemon check without a real Docker install.
+var dockerAvailable = func() bool {
 	err := exec.Command("docker", "info").Run()
 	return err == nil
 }
