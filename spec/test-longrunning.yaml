@@ -1,0 +1,50 @@
+apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+
+# ============================================================
+# test-longrunning.yaml — Agent for testing lifecycle/cleanup
+#
+# The agent just sleeps for 120 seconds, giving you a window to
+# kill the firecracker VMM (or the constle supervisor) from the
+# host and verify that all run resources are cleaned up:
+# TAP device, nftables table, squid, jailer chroot, run dir.
+#
+# The VMM PID is recorded in:
+#   /var/lib/constle/runs/<run_id>/state.json  (field: vm_pid)
+# ============================================================
+
+identity:
+  name: longrunning-test-agent
+  version: "1.0.0"
+
+sandbox:
+  # Force the Firecracker backend (kernel isolation auto-selects it).
+  isolation: kernel
+
+  # No image: resolveRootfs falls back to
+  # /var/lib/constle/firecracker/images/default.ext4
+
+  command:
+    - "sh"
+    - "-c"
+    - |
+      echo "=== longrunning test: sleeping 120s — kill me from the host ==="
+      sleep 120
+      echo "=== sleep finished normally (kill test NOT performed) ==="
+
+  memory_mb: 128
+
+  network:
+    egress: none
+
+# Empty on purpose — isolation is set explicitly above, and no
+# limits.max_duration_seconds so the watchdog never fires first.
+capabilities: []
+
+spending: {}
+
+human_gates:
+  enabled: false  # Automated test — no human approval required
+
+compliance:
+  audit_log_level: standard
