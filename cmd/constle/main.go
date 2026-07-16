@@ -27,6 +27,8 @@ var stdoutMu sync.Mutex
 
 // printf is the single path for all stdout writes in this package.
 // Callers must NOT hold stdoutMu when calling printf (not reentrant).
+// (Exception: warnUnenforcedHumanGates in gates.go writes via a swappable
+// writer for tests, but holds stdoutMu directly to keep the same invariant.)
 func printf(format string, args ...any) {
 	stdoutMu.Lock()
 	defer stdoutMu.Unlock()
@@ -133,6 +135,8 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		printf("     max_duration: %ds\n", m.Limits.MaxDurationSeconds)
 	}
 	printf("\n")
+
+	warnUnenforcedHumanGates(m.HumanGates)
 
 	printStep("detecting backend")
 
@@ -327,11 +331,14 @@ func cmdValidate(agentfilePath string) error {
 
 	gates := manifest.InferRequiredGates(m.Capabilities)
 	if len(gates) > 0 {
-		printf("  human gates: %s (will require approval)\n",
+		// Careful wording: gate enforcement does not exist yet, so this must
+		// not promise that approval will actually happen at runtime.
+		printf("  human gates: %s (approval required by spec — not enforced yet)\n",
 			strings.Join(gates, ", "))
 	}
 
 	printf("\n")
+	warnUnenforcedHumanGates(m.HumanGates)
 	return nil
 }
 
