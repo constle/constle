@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/mcpgate"
 	"github.com/constle/constle/internal/sandbox"
 	"github.com/constle/constle/pkg/manifest"
 )
@@ -33,6 +34,17 @@ func printf(format string, args ...any) {
 	stdoutMu.Lock()
 	defer stdoutMu.Unlock()
 	fmt.Printf(format, args...)
+}
+
+// lockedStdout adapts stdout for the MCP gate's prompt and warnings, which
+// print from gate goroutines at arbitrary times. Each Write holds stdoutMu,
+// preserving the serialisation invariant documented on printf.
+type lockedStdout struct{}
+
+func (lockedStdout) Write(p []byte) (int, error) {
+	stdoutMu.Lock()
+	defer stdoutMu.Unlock()
+	return os.Stdout.Write(p)
 }
 
 func main() {
@@ -134,9 +146,16 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	if m.Limits.MaxDurationSeconds > 0 {
 		printf("     max_duration: %ds\n", m.Limits.MaxDurationSeconds)
 	}
+	if len(m.MCP.Servers) > 0 {
+		ids := make([]string, len(m.MCP.Servers))
+		for i, srv := range m.MCP.Servers {
+			ids[i] = srv.ID
+		}
+		printf("     mcp:       %s (via gate proxy)\n", strings.Join(ids, ", "))
+	}
 	printf("\n")
 
-	warnUnenforcedHumanGates(m.HumanGates)
+	warnUnenforcedHumanGates(m)
 
 	printStep("detecting backend")
 
@@ -153,6 +172,33 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		return fmt.Errorf("cannot open audit log: %w", err)
 	}
 	defer logger.Close()
+
+	// Human-gate enforcement: every declared MCP server is reachable from
+	// the sandbox only through this gate proxy, which pauses gated tool
+	// calls for approval. The gate lives in this process — it owns the
+	// terminal the approve/deny prompt needs.
+	var gate *mcpgate.Gate
+	if len(m.MCP.Servers) > 0 {
+		approver := mcpgate.NewTerminalApprover(lockedStdout{})
+
+		var notifier mcpgate.Notifier
+		if wn := mcpgate.NewWebhookNotifier(m.HumanGates, lockedStdout{}); wn != nil {
+			notifier = wn
+		}
+
+		gate, err = mcpgate.New(m, approver, notifier, logger)
+		if err != nil {
+			return fmt.Errorf("cannot build MCP gate: %w", err)
+		}
+		defer gate.Close()
+
+		if setter, ok := backend.(sandbox.MCPGateSetter); ok {
+			setter.SetMCPGate(gate)
+		} else {
+			// Fail closed: never run declared MCP servers without the gate.
+			return fmt.Errorf("backend %s does not support the MCP gate proxy", backendType)
+		}
+	}
 
 	// DockerBackend.Start() silently removes any abandoned constle containers
 	// (exited/dead state) before allocating new resources.
@@ -203,6 +249,22 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	)
 
 	printOK("sandbox started (run_id: %s)", runCtx.RunID)
+
+	// gateAborted is closed by the MCP gate when a gated tool call times out
+	// under on_timeout: abort. Checked after Wait() like limitReached, so the
+	// termination is attributed to the gate.
+	gateAborted := make(chan struct{})
+
+	if gate != nil {
+		var abortOnce sync.Once
+		gate.SetAbortRun(func() {
+			abortOnce.Do(func() {
+				printf("\nconstle: human gate timed out (on_timeout: abort) — stopping agent...\n")
+				close(gateAborted)
+				backend.Kill(runCtx)
+			})
+		})
+	}
 
 	// The goroutine below is the only place in this process that writes to
 	// stdout from a non-main goroutine. It uses printf (which holds stdoutMu)
@@ -274,6 +336,21 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	}
 
 	select {
+	case <-gateAborted:
+		// The gate itself already logged the gate_timeout event; this entry
+		// records the run-level consequence.
+		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventRunFailed,
+			map[string]any{
+				"reason":   "human_gate_timeout_abort",
+				"duration": duration.String(),
+			})
+		printf("⚑ agent terminated: human gate timed out without approval (on_timeout: abort)    duration=%s\n", duration)
+		printf("  audit log: %s\n\n", logPath)
+		return fmt.Errorf("agent terminated: human gate timed out without approval")
+	default:
+	}
+
+	select {
 	case <-userStopped:
 		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventRunFailed,
 			map[string]any{
@@ -331,14 +408,20 @@ func cmdValidate(agentfilePath string) error {
 
 	gates := manifest.InferRequiredGates(m.Capabilities)
 	if len(gates) > 0 {
-		// Careful wording: gate enforcement does not exist yet, so this must
-		// not promise that approval will actually happen at runtime.
-		printf("  human gates: %s (approval required by spec — not enforced yet)\n",
+		// Careful wording: capability-derived gates are spec-level advice;
+		// enforcement happens on MCP tool calls whose names exactly match
+		// require_approval_for entries.
+		printf("  human gates: %s (approval required by spec — enforced for matching MCP tools)\n",
 			strings.Join(gates, ", "))
 	}
 
+	if enforced, _ := m.EnforcedGateEntries(); len(enforced) > 0 {
+		printf("  enforced:    %s (paused at the MCP gate proxy for approval)\n",
+			strings.Join(enforced, ", "))
+	}
+
 	printf("\n")
-	warnUnenforcedHumanGates(m.HumanGates)
+	warnUnenforcedHumanGates(m)
 	return nil
 }
 

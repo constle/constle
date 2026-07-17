@@ -24,8 +24,8 @@ func withCapturedGatesWarn(t *testing.T) *bytes.Buffer {
 }
 
 // writeTempAgentfile writes a minimal valid Agentfile with the given
-// human_gates block and returns its path.
-func writeTempAgentfile(t *testing.T, humanGatesYAML string) string {
+// extra YAML (human_gates and/or mcp blocks) and returns its path.
+func writeTempAgentfile(t *testing.T, extraYAML string) string {
 	t.Helper()
 
 	content := `apiVersion: constle.dev/v1alpha1
@@ -35,7 +35,7 @@ identity:
   version: "0.0.1"
 capabilities:
   - read_file
-` + humanGatesYAML
+` + extraYAML
 
 	path := filepath.Join(t.TempDir(), "agent.yaml")
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -44,38 +44,78 @@ capabilities:
 	return path
 }
 
-// TestWarnUnenforcedHumanGates covers the trigger condition: any declared
-// human gate (enabled, or a non-empty require_approval_for) must warn that
-// enforcement does not exist, and an undeclared one must stay silent.
+// gatesManifest builds an in-memory manifest for warnUnenforcedHumanGates
+// unit cases.
+func gatesManifest(gates manifest.HumanGates, servers []manifest.MCPServer) *manifest.AgentManifest {
+	return &manifest.AgentManifest{
+		APIVersion: "constle.dev/v1alpha1",
+		Kind:       "AgentManifest",
+		Identity:   manifest.Identity{Name: "gates-warning-test"},
+		HumanGates: gates,
+		MCP:        manifest.MCP{Servers: servers},
+	}
+}
+
+// TestWarnUnenforcedHumanGates covers the narrowed warning: only
+// require_approval_for entries that provably match no declared MCP tool are
+// reported; enforced entries stay silent.
 func TestWarnUnenforcedHumanGates(t *testing.T) {
+	emailServer := []manifest.MCPServer{
+		{ID: "email", URL: "http://10.0.0.5:9000/mcp", Tools: []string{"send_email"}},
+	}
+
 	tests := []struct {
-		name     string
-		gates    manifest.HumanGates
-		wantWarn bool
+		name           string
+		m              *manifest.AgentManifest
+		wantWarn       bool
+		wantListed     []string
+		wantNotListed  []string
+		wantNoMCPGloss bool
 	}{
 		{
-			name:     "enabled without actions warns",
-			gates:    manifest.HumanGates{Enabled: true},
-			wantWarn: true,
-		},
-		{
-			name: "require_approval_for without enabled warns",
-			gates: manifest.HumanGates{
-				RequireApprovalFor: []string{"send_email"},
-			},
-			wantWarn: true,
-		},
-		{
-			name: "enabled with actions warns",
-			gates: manifest.HumanGates{
+			name: "entries without any MCP servers all warn",
+			m: gatesManifest(manifest.HumanGates{
 				Enabled:            true,
-				RequireApprovalFor: []string{"external_transfer", "delete_records"},
-			},
-			wantWarn: true,
+				RequireApprovalFor: []string{"send_email", "payment"},
+			}, nil),
+			wantWarn:       true,
+			wantListed:     []string{"send_email", "payment"},
+			wantNoMCPGloss: true,
+		},
+		{
+			name: "entry matching a declared tool stays silent",
+			m: gatesManifest(manifest.HumanGates{
+				Enabled:            true,
+				RequireApprovalFor: []string{"send_email"},
+			}, emailServer),
+			wantWarn: false,
+		},
+		{
+			name: "only the unmatched entry is listed",
+			m: gatesManifest(manifest.HumanGates{
+				Enabled:            true,
+				RequireApprovalFor: []string{"send_email", "payment"},
+			}, emailServer),
+			wantWarn:      true,
+			wantListed:    []string{"payment"},
+			wantNotListed: []string{"send_email,"},
+		},
+		{
+			name: "server without a tools list makes entries possibly enforced — silent",
+			m: gatesManifest(manifest.HumanGates{
+				Enabled:            true,
+				RequireApprovalFor: []string{"anything_at_all"},
+			}, []manifest.MCPServer{{ID: "open", URL: "http://10.0.0.5:9000/mcp"}}),
+			wantWarn: false,
+		},
+		{
+			name:     "enabled without actions stays silent",
+			m:        gatesManifest(manifest.HumanGates{Enabled: true}, nil),
+			wantWarn: false,
 		},
 		{
 			name:     "disabled and empty stays silent",
-			gates:    manifest.HumanGates{Enabled: false},
+			m:        gatesManifest(manifest.HumanGates{Enabled: false}, nil),
 			wantWarn: false,
 		},
 	}
@@ -84,7 +124,7 @@ func TestWarnUnenforcedHumanGates(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			buf := withCapturedGatesWarn(t)
 
-			warnUnenforcedHumanGates(tt.gates)
+			warnUnenforcedHumanGates(tt.m)
 
 			out := buf.String()
 			if !tt.wantWarn {
@@ -97,22 +137,29 @@ func TestWarnUnenforcedHumanGates(t *testing.T) {
 				t.Errorf("expected a ⚠️ warning, got:\n%s", out)
 			}
 			if !strings.Contains(out, "NOT enforced") {
-				t.Errorf("warning should state gates are NOT enforced, got:\n%s", out)
+				t.Errorf("warning should state entries are NOT enforced, got:\n%s", out)
 			}
-			for _, action := range tt.gates.RequireApprovalFor {
+			for _, action := range tt.wantListed {
 				if !strings.Contains(out, action) {
-					t.Errorf("warning should list unprotected action %q, got:\n%s", action, out)
+					t.Errorf("warning should list unenforced entry %q, got:\n%s", action, out)
 				}
+			}
+			for _, needle := range tt.wantNotListed {
+				if strings.Contains(out, needle) {
+					t.Errorf("warning must not list enforced entries (%q), got:\n%s", needle, out)
+				}
+			}
+			if tt.wantNoMCPGloss && !strings.Contains(out, "no mcp.servers are declared") {
+				t.Errorf("warning should explain that no MCP servers are declared, got:\n%s", out)
 			}
 		})
 	}
 }
 
-// TestValidateWarnsOnDeclaredHumanGates is the regression guard for the
-// `constle validate` path: an Agentfile that declares human gates must
-// produce the not-enforced warning, because the runtime has no
-// gate-enforcement engine yet.
-func TestValidateWarnsOnDeclaredHumanGates(t *testing.T) {
+// TestValidateWarnsOnUnenforceableGates is the regression guard for the
+// `constle validate` path: an Agentfile whose require_approval_for entries
+// match no declared MCP tool must produce the not-enforced warning.
+func TestValidateWarnsOnUnenforceableGates(t *testing.T) {
 	buf := withCapturedGatesWarn(t)
 	path := writeTempAgentfile(t, `human_gates:
   enabled: true
@@ -126,10 +173,34 @@ func TestValidateWarnsOnDeclaredHumanGates(t *testing.T) {
 
 	out := buf.String()
 	if !strings.Contains(out, "NOT enforced") {
-		t.Errorf("validate should warn that human_gates are NOT enforced, got:\n%s", out)
+		t.Errorf("validate should warn about unenforceable gate entries, got:\n%s", out)
 	}
 	if !strings.Contains(out, "send_email") {
 		t.Errorf("validate warning should list the ungated action, got:\n%s", out)
+	}
+}
+
+// TestValidateQuietWhenGatesAreEnforced: entries that match a declared MCP
+// tool are enforced by the gate proxy, so validate must not warn.
+func TestValidateQuietWhenGatesAreEnforced(t *testing.T) {
+	buf := withCapturedGatesWarn(t)
+	path := writeTempAgentfile(t, `mcp:
+  servers:
+    - id: email
+      url: "http://10.0.0.5:9000/mcp"
+      tools: [send_email]
+human_gates:
+  enabled: true
+  require_approval_for:
+    - send_email
+`)
+
+	if err := cmdValidate(path); err != nil {
+		t.Fatalf("cmdValidate() error = %v, want nil", err)
+	}
+
+	if out := buf.String(); out != "" {
+		t.Errorf("validate must not warn when every gate entry is enforced, got:\n%s", out)
 	}
 }
 
@@ -151,14 +222,16 @@ func TestValidateQuietWithoutDeclaredHumanGates(t *testing.T) {
 	}
 }
 
-// TestRunWarnsOnDeclaredHumanGates is the regression guard for the
+// TestRunWarnsOnUnenforceableGates is the regression guard for the
 // `constle run` path. The bogus --backend override makes cmdRun fail during
 // backend detection — after Agentfile loading — so the test proves the
 // warning fires on run without needing a real sandbox backend.
-func TestRunWarnsOnDeclaredHumanGates(t *testing.T) {
+func TestRunWarnsOnUnenforceableGates(t *testing.T) {
 	buf := withCapturedGatesWarn(t)
 	path := writeTempAgentfile(t, `human_gates:
   enabled: true
+  require_approval_for:
+    - payment
 `)
 
 	err := cmdRun(path, "no-such-backend")
@@ -171,6 +244,6 @@ func TestRunWarnsOnDeclaredHumanGates(t *testing.T) {
 
 	out := buf.String()
 	if !strings.Contains(out, "NOT enforced") {
-		t.Errorf("run should warn that human_gates are NOT enforced, got:\n%s", out)
+		t.Errorf("run should warn about unenforceable gate entries, got:\n%s", out)
 	}
 }

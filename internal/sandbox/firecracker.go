@@ -62,12 +62,22 @@ type FirecrackerBackend struct {
 	// reap the child. Runs started by other constle processes are handled
 	// through PID polling instead (see Wait).
 	vmCmds map[string]*exec.Cmd
+
+	// mcpGate is attached by the CLI (SetMCPGate) when the manifest declares
+	// MCP servers; Start fails closed if servers are declared without it.
+	mcpGate MCPGateBinder
 }
 
 // Start provisions the network, the per-run Squid proxy, and the microVM.
 func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 	if os.Geteuid() != 0 {
 		return nil, fmt.Errorf("the firecracker backend requires root (jailer, TAP and nftables setup) — re-run with sudo")
+	}
+
+	if len(m.MCP.Servers) > 0 && f.mcpGate == nil {
+		// Fail closed: declared MCP servers without a gate would either not
+		// work or, worse, tempt a fallback to direct access.
+		return nil, fmt.Errorf("manifest declares mcp servers but no MCP gate is attached to the backend")
 	}
 
 	// Remove leftovers of runs that ended without a clean Stop() (host crash,
@@ -99,13 +109,28 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		return nil, fmt.Errorf("cannot create TAP device: %w", err)
 	}
 
-	if err := installNFTRules(runID, tapName, gatewayIP); err != nil {
+	// Bind the MCP gate on the TAP gateway address before installing the
+	// nftables rules, which open exactly guest → gateway on this one port
+	// (alongside the Squid port). Unlike the Docker backend, the guest
+	// reaches the gate directly — constle owns this network namespace.
+	gatePort := 0
+	gateToken := ""
+	if len(m.MCP.Servers) > 0 {
+		gatePort, gateToken, err = f.mcpGate.Bind(runID, []string{gatewayIP})
+		if err != nil {
+			deleteTAP(tapName)
+			os.RemoveAll(runDir)
+			return nil, fmt.Errorf("cannot bind MCP gate: %w", err)
+		}
+	}
+
+	if err := installNFTRules(runID, tapName, gatewayIP, gatePort); err != nil {
 		deleteTAP(tapName)
 		os.RemoveAll(runDir)
 		return nil, fmt.Errorf("cannot install nftables rules: %w", err)
 	}
 
-	squidPID, accessLogPath, err := startHostSquid(runID, runDir, gatewayIP, m.Sandbox.Network.AllowedHosts)
+	squidPID, accessLogPath, err := startHostSquid(runID, runDir, gatewayIP, m.Sandbox.Network.AllowedHosts, gatePort)
 	if err != nil {
 		deleteNFTRules(runID)
 		deleteTAP(tapName)
@@ -122,7 +147,16 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		os.RemoveAll(runDir)
 	}
 
-	workspacePath, err := buildWorkspaceImage(runDir, m, gatewayIP, guestIP)
+	mcpEnv := mcpGateEnv(m, gatewayIP, gatePort, gateToken)
+	if gatePort > 0 {
+		// The guest reaches the gate directly on the TAP gateway; keep MCP
+		// clients that honour proxy env vars from detouring through Squid.
+		// (Squid also carries a gate allow rule for clients that don't.)
+		mcpEnv["NO_PROXY"] = gatewayIP
+		mcpEnv["no_proxy"] = gatewayIP
+	}
+
+	workspacePath, err := buildWorkspaceImage(runDir, m, gatewayIP, guestIP, mcpEnv)
 	if err != nil {
 		cleanupNet()
 		return nil, fmt.Errorf("cannot build workspace image: %w", err)
@@ -325,8 +359,9 @@ func fcWorkspacePath(runID string) string {
 
 // buildWorkspaceImage creates the per-run ext4 drive carrying the run's
 // environment and command into the guest. `mkfs.ext4 -d` packs a staging
-// directory without requiring a loop mount.
-func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, guestIP string) (string, error) {
+// directory without requiring a loop mount. mcpEnv carries the
+// CONSTLE_MCP_<ID>_URL gate addresses (empty when no MCP servers declared).
+func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, guestIP string, mcpEnv map[string]string) (string, error) {
 	staging := filepath.Join(runDir, "ws")
 	if err := os.MkdirAll(staging, 0700); err != nil {
 		return "", err
@@ -343,6 +378,9 @@ func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, gu
 		"CONSTLE_GATEWAY_IP": gatewayIP,
 	}
 	for k, v := range forwardedHostEnv() {
+		env[k] = v
+	}
+	for k, v := range mcpEnv {
 		env[k] = v
 	}
 
