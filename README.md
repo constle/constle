@@ -41,7 +41,7 @@ The result is bespoke, fragile security stitched together per agent — and most
 | **Max duration** | Agent is forcibly stopped after `max_duration_seconds`. Not a suggestion — the runtime kills it. | ✅ v0.4 |
 | **Audit log** | Every agent run produces a signed JSONL log of actions and network events at `~/.constle/logs/`. | ✅ v0.4 |
 | **Spending limits** | Hard cap per run and per day enforced by the runtime. Agent code cannot exceed them regardless of instructions. | 🔨 v0.5 |
-| **Human gate policies** | Sensitive actions (transfers, deletions, external comms) pause and require human approval before proceeding. | 🔨 v0.5 |
+| **Human gate policies** | Declared MCP servers are reachable only through a protocol-aware gate proxy; tool calls listed in `human_gates.require_approval_for` (exact tool-name match) pause for human approval — deny or timeout provably never reaches the server. | ✅ v0.5 (MCP tool calls) |
 | **Cryptographic identity** | Every agent gets a W3C DID anchored to a human owner. Every action is signed and attributable. | 🔨 v0.5 |
 
 Constle is **not** a framework. It does not tell agents how to think or plan. LangGraph, CrewAI, OpenAI Agents SDK, or any other framework run inside Constle unchanged.
