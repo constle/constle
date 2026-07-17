@@ -41,6 +41,7 @@ type AgentManifest struct {
 	Identity     Identity     `yaml:"identity"`
 	Sandbox      Sandbox      `yaml:"sandbox"`
 	Capabilities []Capability `yaml:"capabilities"`
+	MCP          MCP          `yaml:"mcp"`
 	Spending     Spending     `yaml:"spending"`
 	Limits       Limits       `yaml:"limits"`
 	HumanGates   HumanGates   `yaml:"human_gates"`
@@ -85,6 +86,33 @@ type Network struct {
 	AllowedHosts []string `yaml:"allowed_hosts,omitempty"`
 }
 
+// MCP declares the Model Context Protocol servers the agent may call.
+//
+// Every declared MCP call is routed through the constle gate proxy — a
+// protocol-aware chokepoint analogous to Squid for HTTP egress. The agent
+// receives only the proxy address (CONSTLE_MCP_<ID>_URL); the real server
+// URL never enters the sandbox, and the sandbox network policy blocks any
+// direct path to it.
+type MCP struct {
+	Servers []MCPServer `yaml:"servers,omitempty"`
+}
+
+// MCPServer describes one MCP server the agent may call through the gate proxy.
+type MCPServer struct {
+	// ID is a unique name for this server, used in audit events and in the
+	// CONSTLE_MCP_<ID>_URL environment variable ("-" becomes "_", uppercased).
+	// Lowercase letters, digits, hyphens, and underscores only.
+	ID string `yaml:"id"`
+
+	// URL is the real streamable-HTTP endpoint of the MCP server.
+	// Only visible on the host side — never forwarded into the sandbox.
+	URL string `yaml:"url"`
+
+	// Tools is an optional allowlist of tool names the agent may call on this
+	// server. Empty means every tool passes through (gated tools still gate).
+	Tools []string `yaml:"tools,omitempty"`
+}
+
 // Spending declares cost limits. Empty means the operator sets them at runtime.
 type Spending struct {
 	MaxPerRunUSD   string `yaml:"max_per_run_usd,omitempty"`
@@ -106,11 +134,38 @@ type HumanGates struct {
 	Enabled bool `yaml:"enabled"`
 
 	// RequireApprovalFor lists actions that must be approved before execution.
+	//
+	// MAPPING CONTRACT: an entry gates an MCP tool call when it is an exact,
+	// case-sensitive match for the tool name (the params.name of a tools/call
+	// request) on any server declared under mcp.servers. The tool name is the
+	// only protocol-level identifier the gate proxy observes, and exact match
+	// is the only deterministic, auditable mapping — no semantic guessing.
+	// Entries that match no declared MCP tool are NOT enforced and are called
+	// out with a warning at run and validate time.
 	RequireApprovalFor []string `yaml:"require_approval_for,omitempty"`
+
+	// ApprovalTimeoutSeconds is how long a gated call waits for a human
+	// decision before OnTimeout applies. Default is 300.
+	ApprovalTimeoutSeconds int `yaml:"approval_timeout_seconds,omitempty"`
 
 	// OnTimeout controls what happens if approval is not received in time: "abort" or "proceed".
 	// Default is "abort".
 	OnTimeout string `yaml:"on_timeout,omitempty"`
+
+	// Notify lists channels notified when a gate triggers. Only the webhook
+	// channel is supported by this version; unsupported channels are a
+	// validation error so a declared notification never silently goes nowhere.
+	Notify []NotifyChannel `yaml:"notify,omitempty"`
+}
+
+// NotifyChannel is one notification target for gate events.
+type NotifyChannel struct {
+	// Channel is the delivery mechanism. Supported: "webhook".
+	Channel string `yaml:"channel"`
+
+	// URLSecretRef names the environment variable holding the webhook URL.
+	// Indirection keeps secrets out of the committed Agentfile.
+	URLSecretRef string `yaml:"url_secret_ref,omitempty"`
 }
 
 // Compliance captures regulatory and audit requirements.
