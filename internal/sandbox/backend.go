@@ -83,6 +83,35 @@ type RunContext struct {
 	externalNetworkName string
 }
 
+// MCPGateBinder is the sandbox-side handle to the MCP gate proxy
+// (internal/mcpgate). Kept as a minimal interface so this package does not
+// depend on the gate implementation.
+//
+// Backends call Bind mid-Start, once the run's network exists: the gate
+// listens on every candidate IP that is actually present on this host, all
+// on one ephemeral port, and returns that port plus the per-run URL token.
+// The backend then injects CONSTLE_MCP_<ID>_URL variables pointing at the
+// gate — the real MCP server URLs never enter the sandbox.
+type MCPGateBinder interface {
+	Bind(runID string, candidateIPs []string) (port int, token string, err error)
+}
+
+// MCPGateSetter is implemented by backends that can route the sandbox's MCP
+// traffic through the gate proxy. The CLI feature-detects it with a type
+// assertion so the SandboxBackend interface stays unchanged — and fails
+// closed when a manifest declares MCP servers on a backend without it.
+type MCPGateSetter interface {
+	SetMCPGate(g MCPGateBinder)
+}
+
+// SetMCPGate attaches the MCP gate to a backend before Start. Both backends
+// implement it; the CLI feature-detects with a type assertion so the
+// SandboxBackend interface stays unchanged.
+func (d *DockerBackend) SetMCPGate(g MCPGateBinder) { d.mcpGate = g }
+
+// SetMCPGate attaches the MCP gate to the Firecracker backend before Start.
+func (f *FirecrackerBackend) SetMCPGate(g MCPGateBinder) { f.mcpGate = g }
+
 // BackendType is a human-readable backend identifier used in audit logs and CLI output.
 type BackendType string
 

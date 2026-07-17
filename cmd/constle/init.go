@@ -89,6 +89,25 @@ capabilities:
   - write_file   # write results back to a mounted directory
 
 # ---------------------------------------------------------------------------
+# mcp — Model Context Protocol servers the agent may call
+# ---------------------------------------------------------------------------
+# Every declared server is reachable ONLY through constle's MCP gate proxy:
+# the agent receives a CONSTLE_MCP_<ID>_URL environment variable pointing at
+# the gate, the real URL below never enters the sandbox, and the sandbox
+# network blocks every direct path. Tool calls matching human_gates
+# entries below pause for approval at the gate.
+#
+# mcp:
+#   servers:
+#       # Unique name; also names the env var (email -> CONSTLE_MCP_EMAIL_URL).
+#     - id: email
+#       # Real streamable-HTTP endpoint of the MCP server (host side only).
+#       url: "http://192.168.1.50:9000/mcp"
+#       # Optional tool allowlist; the gate rejects tools not listed here.
+#       # Omit to allow every tool the server offers.
+#       tools: [send_email, list_inbox]
+
+# ---------------------------------------------------------------------------
 # spending — cost guardrails applied across the agent's lifetime
 # ---------------------------------------------------------------------------
 spending:
@@ -112,22 +131,35 @@ limits:
 # ---------------------------------------------------------------------------
 # human_gates — when to pause and wait for a human to approve an action
 # ---------------------------------------------------------------------------
+# Enforcement: an entry gates an MCP tool call when it is an EXACT,
+# case-sensitive match for the tool's name on a server declared under mcp
+# above (e.g. the entry "send_email" pauses every tools/call named
+# send_email). Entries that match no declared MCP tool are NOT enforced —
+# constle warns about them at validate and run time.
 human_gates:
   # Master switch. Set to false only for fully automated pipelines where
   # no human can reasonably be reached during a run.
   enabled: true
 
-  # Actions that must be explicitly approved before the agent proceeds.
-  # Remove an entry to allow that action to run without approval.
-  require_approval_for:
-    - file_write       # before persisting output files
-    - spawn_subagent   # before launching a child agent
-    - payment          # before any financial transaction
+  # MCP tool names that must be explicitly approved before each call.
+  # Add the risky tools of the servers you declare under mcp above, e.g.:
+  #   require_approval_for:
+  #     - send_email
+  require_approval_for: []
+
+  # How long a paused call waits for a human decision. Default: 300.
+  approval_timeout_seconds: 300
 
   # What to do when the approver does not respond in time.
   #   abort   — stop the run and log a timeout event (safe default)
   #   proceed — continue without approval (use only for low-risk actions)
   on_timeout: abort
+
+  # Where to announce a triggered gate, in addition to the terminal prompt.
+  # url_secret_ref names an environment variable holding the webhook URL.
+  # notify:
+  #   - channel: webhook
+  #     url_secret_ref: HUMAN_GATE_WEBHOOK_URL
 
 # ---------------------------------------------------------------------------
 # compliance — audit and regulatory metadata

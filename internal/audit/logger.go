@@ -23,6 +23,7 @@ const (
 	EventGateTimeout       EventType = "gate_timeout"
 	EventNetworkBlocked    EventType = "network_blocked"
 	EventNetworkAllowed    EventType = "network_allowed"
+	EventMCPToolBlocked    EventType = "mcp_tool_blocked"
 	EventSpendingLimit     EventType = "spending_limit_reached"
 	EventTerminatedByLimit EventType = "terminated_by_limit"
 )
