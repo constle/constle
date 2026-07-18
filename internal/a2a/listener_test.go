@@ -424,6 +424,63 @@ func TestInboundInboxFullShedsLoad(t *testing.T) {
 	}
 }
 
+func TestInboxQuotaFreesAfterDelivery(t *testing.T) {
+	// The quota counts UNDELIVERED calls: draining one call to the agent
+	// must free exactly one slot, letting a previously shed peer through
+	// again — no permanent lockout.
+	bob := newTestSigner(t, 2)
+	alice := newTestSigner(t, 1)
+	g, publicURL, sandboxURL := newInboundGate(t, bob, alice)
+	g.replyTimeoutOverride = 500 * time.Millisecond
+
+	fillPeerQuota(t, g, publicURL, alice, bob.DID())
+
+	// At quota: the next call is shed.
+	wire, _, err := Seal(alice, bob.DID(), "", []byte(`{"shed":true}`))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	resp, err := http.Post(publicURL, "application/json", bytes.NewReader(wire))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("call at quota = HTTP %d, want 503", resp.StatusCode)
+	}
+
+	// The agent drains ONE call — delivery, not reply, frees the slot.
+	resp, err = http.Get(sandboxURL + "/inbox")
+	if err != nil {
+		t.Fatalf("GET inbox: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("inbox = HTTP %d, want 200", resp.StatusCode)
+	}
+
+	// The same peer is admitted again: parked awaiting the agent (504
+	// after the shortened reply timeout), not shed.
+	wire, _, err = Seal(alice, bob.DID(), "", []byte(`{"after_release":true}`))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	resp, err = http.Post(publicURL, "application/json", bytes.NewReader(wire))
+	if err != nil {
+		t.Fatalf("POST after release: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		t.Fatal("same peer still shed after a delivery freed a slot — quota never released")
+	}
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("call after release = HTTP %d, want 504 (admitted, unanswered)", resp.StatusCode)
+	}
+	if got := len(g.inbox); got != perPeerInboxCapacity {
+		t.Fatalf("inbox holds %d, want %d (quota-1 undelivered + 1 new)", got, perPeerInboxCapacity)
+	}
+}
+
 func TestInboxIsolationBetweenPeers(t *testing.T) {
 	// The inbox quota is per peer: a noisy but fully authenticated peer
 	// (alice) filling her own quota must not cause an unrelated declared
