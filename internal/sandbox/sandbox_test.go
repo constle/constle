@@ -7,7 +7,7 @@ import (
 )
 
 func TestWriteSquidConfigWithHosts(t *testing.T) {
-	path, err := writeSquidConfig("testrun01", []string{"api.openai.com", "arxiv.org"}, "", 0)
+	path, err := writeSquidConfig("testrun01", []string{"api.openai.com", "arxiv.org"}, "", nil)
 	if err != nil {
 		t.Fatalf("writeSquidConfig() error: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestWriteSquidConfigWithHosts(t *testing.T) {
 }
 
 func TestWriteSquidConfigEmpty(t *testing.T) {
-	path, err := writeSquidConfig("testrun02", []string{}, "", 0)
+	path, err := writeSquidConfig("testrun02", []string{}, "", nil)
 	if err != nil {
 		t.Fatalf("writeSquidConfig() error: %v", err)
 	}
@@ -66,34 +66,52 @@ func TestWriteSquidConfigEmpty(t *testing.T) {
 	}
 }
 
-func TestBuildSquidConfigMCPGateClause(t *testing.T) {
+func TestBuildSquidConfigGateClause(t *testing.T) {
 	// IP-literal gate host (both backends since the IPv6-preference fix)
-	// must use a dst ACL, scoped to exactly the gate port, and must precede
-	// the deny rules so the gate stays reachable with an empty allowlist.
-	config := buildSquidConfig("testrun03", nil, "3128", "/tmp/x.log", "", "192.168.65.254", 41234)
+	// must use a dst ACL, scoped to exactly the gate ports, and must precede
+	// the deny rules so the gates stay reachable with an empty allowlist.
+	config := buildSquidConfig("testrun03", nil, "3128", "/tmp/x.log", "", "192.168.65.254", []int{41234})
 	for _, want := range []string{
-		"acl mcp_gate_dst dst 192.168.65.254",
-		"acl mcp_gate_port port 41234",
-		"http_access allow mcp_gate_dst mcp_gate_port",
+		"acl constle_gate_dst dst 192.168.65.254",
+		"acl constle_gate_port port 41234",
+		"http_access allow constle_gate_dst constle_gate_port",
 	} {
 		if !strings.Contains(config, want) {
 			t.Errorf("config missing %q:\n%s", want, config)
 		}
 	}
-	if strings.Index(config, "http_access allow mcp_gate_dst") > strings.Index(config, "http_access deny all") {
+	if strings.Index(config, "http_access allow constle_gate_dst") > strings.Index(config, "http_access deny all") {
 		t.Error("gate allow rule must precede the deny-all rule")
 	}
 
+	// Two gates bound (MCP + A2A): one port ACL listing both ports.
+	config = buildSquidConfig("testrun06", nil, "3128", "/tmp/x.log", "", "192.168.65.254", []int{41234, 51234})
+	if !strings.Contains(config, "acl constle_gate_port port 41234 51234") {
+		t.Errorf("config must scope the gate ACL to both gate ports:\n%s", config)
+	}
+
 	// A hostname gate host uses dstdomain.
-	config = buildSquidConfig("testrun04", []string{"api.openai.com"}, "3128", "/tmp/x.log", "", "gate.internal", 41234)
-	if !strings.Contains(config, "acl mcp_gate_dst dstdomain gate.internal") {
+	config = buildSquidConfig("testrun04", []string{"api.openai.com"}, "3128", "/tmp/x.log", "", "gate.internal", []int{41234})
+	if !strings.Contains(config, "acl constle_gate_dst dstdomain gate.internal") {
 		t.Errorf("hostname gate host should use dstdomain:\n%s", config)
 	}
 
-	// Port 0 (no MCP servers): no gate clause at all.
-	config = buildSquidConfig("testrun05", nil, "3128", "/tmp/x.log", "", "", 0)
-	if strings.Contains(config, "mcp_gate") {
+	// No gates bound: no gate clause at all.
+	config = buildSquidConfig("testrun05", nil, "3128", "/tmp/x.log", "", "", nil)
+	if strings.Contains(config, "constle_gate") {
 		t.Errorf("config must have no gate clause when no gate is bound:\n%s", config)
+	}
+}
+
+func TestGatePorts(t *testing.T) {
+	if got := gatePorts(0, 0); len(got) != 0 {
+		t.Errorf("gatePorts(0,0) = %v, want empty", got)
+	}
+	if got := gatePorts(41234, 0); len(got) != 1 || got[0] != 41234 {
+		t.Errorf("gatePorts(41234,0) = %v, want [41234]", got)
+	}
+	if got := gatePorts(41234, 51234); len(got) != 2 {
+		t.Errorf("gatePorts(41234,51234) = %v, want both", got)
 	}
 }
 

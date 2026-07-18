@@ -42,6 +42,7 @@ type AgentManifest struct {
 	Sandbox      Sandbox      `yaml:"sandbox"`
 	Capabilities []Capability `yaml:"capabilities"`
 	MCP          MCP          `yaml:"mcp"`
+	A2A          A2A          `yaml:"a2a"`
 	Spending     Spending     `yaml:"spending"`
 	Limits       Limits       `yaml:"limits"`
 	HumanGates   HumanGates   `yaml:"human_gates"`
@@ -123,6 +124,47 @@ type MCPServer struct {
 	// Tools is an optional allowlist of tool names the agent may call on this
 	// server. Empty means every tool passes through (gated tools still gate).
 	Tools []string `yaml:"tools,omitempty"`
+}
+
+// A2A declares signed agent-to-agent communication with explicitly known
+// peers.
+//
+// Every peer is declared here by the operator (DID + endpoint, exchanged out
+// of band). There is deliberately NO discovery mechanism: an agent can only
+// ever exchange A2A calls with peers written into this file.
+//
+// All A2A traffic is signed and verified in the HOST constle process using
+// the agent's local identity — identity.did is therefore required. The
+// sandbox never signs, never verifies, and never sees a peer's real
+// endpoint: it talks only to the per-run A2A gate (CONSTLE_A2A_URL), the
+// same trust model as the MCP gate proxy applied in the reverse direction.
+type A2A struct {
+	// Listen is the host-side address ("host:port" or ":port") on which the
+	// constle process accepts inbound calls from declared peers. The listener
+	// runs on the host, never inside the sandbox; only calls that pass
+	// signature verification AND appear in Peers are relayed to the agent.
+	// Empty means this agent makes outbound A2A calls only.
+	Listen string `yaml:"listen,omitempty"`
+
+	// Peers lists the only agents this agent may exchange A2A calls with —
+	// both as outbound targets and as authorized inbound senders.
+	Peers []A2APeer `yaml:"peers,omitempty"`
+}
+
+// A2APeer is one explicitly declared peer agent.
+type A2APeer struct {
+	// Name is the local alias for this peer, used in gate URLs and audit
+	// events. Lowercase letters, digits, hyphens, and underscores only.
+	Name string `yaml:"name"`
+
+	// DID is the peer's did:key identifier. The verification key for every
+	// message from (and to) this peer is recovered from this string alone.
+	DID string `yaml:"did"`
+
+	// Endpoint is the peer's public A2A URL — its host process's a2a.listen
+	// address. Only visible on the host side; never forwarded into the
+	// sandbox.
+	Endpoint string `yaml:"endpoint"`
 }
 
 // Spending declares cost limits. Empty means the operator sets them at runtime.
