@@ -9,7 +9,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/constle/constle/internal/a2a"
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/identity"
 	"github.com/constle/constle/internal/mcpgate"
 	"github.com/constle/constle/internal/sandbox"
 	"github.com/constle/constle/pkg/manifest"
@@ -170,6 +172,13 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		}
 		printf("     mcp:       %s (via gate proxy)\n", strings.Join(ids, ", "))
 	}
+	if len(m.A2A.Peers) > 0 {
+		names := make([]string, len(m.A2A.Peers))
+		for i, p := range m.A2A.Peers {
+			names[i] = p.Name
+		}
+		printf("     a2a:       %s (signed via host gate)\n", strings.Join(names, ", "))
+	}
 	printf("\n")
 
 	warnUnenforcedHumanGates(m)
@@ -189,17 +198,20 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	// every audit entry must be signed with the matching local key — running
 	// unsigned while the manifest promises a signed log would make the
 	// declared protection a lie (same principle as warnUnenforcedHumanGates).
+	// The loaded identity also signs outbound A2A calls, so it is kept for
+	// the A2A gate below.
+	var runIdentity *identity.Identity
 	var logger *audit.Logger
 	if m.Identity.DID != "" {
-		id, err := loadRunIdentity(m)
+		runIdentity, err = loadRunIdentity(m)
 		if err != nil {
 			return err
 		}
-		logger, err = audit.NewSigned(logPath, id)
+		logger, err = audit.NewSigned(logPath, runIdentity)
 		if err != nil {
 			return fmt.Errorf("cannot open signed audit log: %w", err)
 		}
-		printOK("identity: %s", id.DID())
+		printOK("identity: %s", runIdentity.DID())
 		printf("     audit log entries are Ed25519-signed and hash-chained\n\n")
 	} else {
 		var err error
@@ -240,6 +252,30 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		} else {
 			// Fail closed: never run declared MCP servers without the gate.
 			return fmt.Errorf("backend %s does not support the MCP gate proxy", backendType)
+		}
+	}
+
+	// A2A: every outbound call is signed (and every peer response verified)
+	// by this host process with the agent's identity — the private key never
+	// enters the sandbox, and peers' real endpoints never enter it either.
+	var a2aGate *a2a.Gate
+	if len(m.A2A.Peers) > 0 {
+		// Validate() guarantees identity.did is declared whenever a2a.peers
+		// exist, and the fail-closed identity block above already loaded it.
+		if runIdentity == nil {
+			return fmt.Errorf("internal error: a2a.peers are declared but no identity was loaded — refusing to run unsigned A2A")
+		}
+		a2aGate, err = a2a.New(m, runIdentity, logger)
+		if err != nil {
+			return fmt.Errorf("cannot build A2A gate: %w", err)
+		}
+		defer a2aGate.Close()
+
+		if setter, ok := backend.(sandbox.A2AGateSetter); ok {
+			setter.SetA2AGate(a2aGate)
+		} else {
+			// Fail closed: never run declared A2A peers without the signing gate.
+			return fmt.Errorf("backend %s does not support the A2A gate", backendType)
 		}
 	}
 
