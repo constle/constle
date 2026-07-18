@@ -29,6 +29,9 @@ const (
 	EventNetworkBlocked    EventType = "network_blocked"
 	EventNetworkAllowed    EventType = "network_allowed"
 	EventMCPToolBlocked    EventType = "mcp_tool_blocked"
+	EventA2ACallSent       EventType = "a2a_call_sent"
+	EventA2ACallReceived   EventType = "a2a_call_received"
+	EventA2ACallRejected   EventType = "a2a_call_rejected"
 	EventSpendingLimit     EventType = "spending_limit_reached"
 	EventTerminatedByLimit EventType = "terminated_by_limit"
 )
