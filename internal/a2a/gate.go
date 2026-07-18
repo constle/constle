@@ -37,10 +37,17 @@ const callTimeout = 120 * time.Second
 // The gate deliberately mirrors mcpgate.Gate: per-run URL token, ephemeral
 // port bound on every candidate host IP, fail-closed routing.
 type Gate struct {
-	signer Signer
-	peers  map[string]manifest.A2APeer // by declared name
-	logger *audit.Logger
-	client *http.Client
+	signer     Signer
+	peers      map[string]manifest.A2APeer // by declared name
+	peersByDID map[string]manifest.A2APeer // inbound authorization set
+	logger     *audit.Logger
+	client     *http.Client
+	replay     *replayGuard
+
+	// inbox holds verified inbound calls until the agent drains them;
+	// pending tracks delivered calls awaiting the agent's reply.
+	inbox   chan *inboundCall
+	pending map[string]*inboundCall
 
 	mu        sync.Mutex
 	runID     string
@@ -50,6 +57,11 @@ type Gate struct {
 	port      int
 	listeners []net.Listener
 	server    *http.Server
+	public    *http.Server // host-facing listener (a2a.listen), see listener.go
+
+	// test overrides (0 = production values).
+	replyTimeoutOverride time.Duration
+	pollTimeoutOverride  time.Duration
 }
 
 // New builds a Gate from the manifest's a2a.peers and the agent's identity.
@@ -65,14 +77,19 @@ func New(m *manifest.AgentManifest, signer Signer, logger *audit.Logger) (*Gate,
 	}
 
 	g := &Gate{
-		signer:    signer,
-		peers:     map[string]manifest.A2APeer{},
-		logger:    logger,
-		client:    &http.Client{Timeout: callTimeout},
-		agentName: m.Identity.Name,
+		signer:     signer,
+		peers:      map[string]manifest.A2APeer{},
+		peersByDID: map[string]manifest.A2APeer{},
+		logger:     logger,
+		client:     &http.Client{Timeout: callTimeout},
+		replay:     newReplayGuard(),
+		inbox:      make(chan *inboundCall, inboxCapacity),
+		pending:    map[string]*inboundCall{},
+		agentName:  m.Identity.Name,
 	}
 	for _, p := range m.A2A.Peers {
 		g.peers[p.Name] = p
+		g.peersByDID[p.DID] = p
 	}
 	return g, nil
 }
@@ -123,21 +140,30 @@ func (g *Gate) Bind(runID string, candidateIPs []string) (port int, token string
 // Port returns the bound gate port (0 before Bind).
 func (g *Gate) Port() int { return g.port }
 
-// Close immediately shuts the gate down, aborting in-flight connections.
-// Safe to call before Bind and more than once.
+// Close immediately shuts down the sandbox-facing gate and the public
+// listener, aborting in-flight connections. Safe to call before Bind /
+// StartListener and more than once.
 func (g *Gate) Close() error {
-	if g.server == nil {
-		return nil
+	var err error
+	if g.server != nil {
+		err = g.server.Close()
 	}
-	return g.server.Close()
+	if g.public != nil {
+		if perr := g.public.Close(); err == nil {
+			err = perr
+		}
+	}
+	return err
 }
 
 // ServeHTTP routes the sandbox-facing API. Everything that cannot be
 // positively matched — wrong token, unknown path, undeclared peer — fails
 // closed with no fallback.
 //
-//	POST /{token}/send/{peer} — sign body, deliver to the declared peer,
-//	                            verify the signed response, return its body.
+//	POST /{token}/send/{peer}  — sign body, deliver to the declared peer,
+//	                             verify the signed response, return its body.
+//	GET  /{token}/inbox        — long-poll the next verified inbound call.
+//	POST /{token}/reply/{id}   — answer a delivered call; the host signs it.
 func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rest, ok := strings.CutPrefix(r.URL.Path, "/"+g.token+"/")
 	if !ok {
@@ -145,12 +171,16 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if peerName, ok := strings.CutPrefix(rest, "send/"); ok && r.Method == http.MethodPost {
-		g.serveSend(w, r, peerName)
-		return
+	switch {
+	case r.Method == http.MethodPost && strings.HasPrefix(rest, "send/"):
+		g.serveSend(w, r, strings.TrimPrefix(rest, "send/"))
+	case r.Method == http.MethodGet && rest == "inbox":
+		g.serveInbox(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(rest, "reply/"):
+		g.serveReply(w, r, strings.TrimPrefix(rest, "reply/"))
+	default:
+		http.Error(w, "constle a2a gate: unknown path", http.StatusNotFound)
 	}
-
-	http.Error(w, "constle a2a gate: unknown path", http.StatusNotFound)
 }
 
 // serveSend handles one outbound call: the host signs the sandbox's JSON

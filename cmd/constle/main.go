@@ -329,6 +329,18 @@ func cmdRun(agentfilePath, backendOverride string) error {
 
 	printOK("sandbox started (run_id: %s)", runCtx.RunID)
 
+	// The public A2A listener starts only after the sandbox is up: the gate
+	// already carries the run id (set at Bind, mid-Start), so every inbound
+	// event is attributed, and a2aGate.Close (deferred above) tears the
+	// listener down with the run. Verification and peer authorization happen
+	// in this process — an unverified call never has a path into the sandbox.
+	if a2aGate != nil && m.A2A.Listen != "" {
+		if err := a2aGate.StartListener(m.A2A.Listen); err != nil {
+			return fmt.Errorf("cannot start A2A listener: %w", err)
+		}
+		printOK("a2a listener: %s (verified peers only)", m.A2A.Listen)
+	}
+
 	// gateAborted is closed by the MCP gate when a gated tool call times out
 	// under on_timeout: abort. Checked after Wait() like limitReached, so the
 	// termination is attributed to the gate.

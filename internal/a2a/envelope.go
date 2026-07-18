@@ -127,6 +127,7 @@ const (
 	ReasonWrongRecipient RejectReason = "wrong_recipient"
 	ReasonStaleTimestamp RejectReason = "stale_timestamp"
 	ReasonReplay         RejectReason = "replay"
+	ReasonInboxFull      RejectReason = "inbox_full"
 )
 
 // RejectError reports a refused envelope with a machine-readable reason.

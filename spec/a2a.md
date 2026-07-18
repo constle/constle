@@ -1,7 +1,7 @@
 # A2A — Signed Agent-to-Agent Communication
 
-Status: Phase 1 implemented (outbound). Phases 2–4 (inbound listener, audit
-completion, adversarial verification) follow this design.
+Status: Phases 1–2 implemented (outbound + inbound listener/inbox).
+Phases 3–4 (audit completion, adversarial verification) follow this design.
 
 ## Scope
 
@@ -69,9 +69,23 @@ sandbox can name an endpoint — only declared peer aliases.
 ### Inbound (Phase 2): pull, not push
 
 The receiving host process runs a public listener on `a2a.listen` — the
-project's first host-facing listener, hardened accordingly (body-size cap
-and clean rejection of malformed input **before** any signature work; a
-crash here would take down the host supervisor, not a disposable sandbox).
+project's first host-facing listener, and therefore categorically new
+attack surface. A crash or hang here takes down the host supervisor, not a
+disposable sandbox, so the listener is hardened independently of — and
+strictly before — any signature work:
+
+1. exact route match (`POST /a2a/v1/call` only; everything else a flat 404);
+2. hard server timeouts (header read, body read, write) and a header-size
+   cap, so a slow or stalling client cannot pin connections;
+3. body-size cap enforced on byte count **before any parsing**;
+4. malformed input (bad JSON, framing, base64, DID) rejected via error
+   returns — no panics, no body echo;
+5. bounded inbox: beyond capacity the listener sheds load (503) instead of
+   growing host memory.
+
+Verification then runs in a fixed order — envelope signature (`Open`),
+sender ∈ declared peers, correct recipient, replay — and each rejection is
+audited with its precise failing check.
 
 Delivery into the sandbox is **pull-based**: verified calls are parked in a
 per-run inbox that the agent drains over a connection it initiates to the
