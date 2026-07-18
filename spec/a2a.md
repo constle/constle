@@ -80,8 +80,11 @@ strictly before — any signature work:
 3. body-size cap enforced on byte count **before any parsing**;
 4. malformed input (bad JSON, framing, base64, DID) rejected via error
    returns — no panics, no body echo;
-5. bounded inbox: beyond capacity the listener sheds load (503) instead of
-   growing host memory.
+5. bounded inbox with a **per-peer admission quota**: each declared peer
+   may hold at most a fixed number of undelivered calls; exceeding it sheds
+   that peer's calls (503) without affecting any other peer, so a noisy or
+   buggy — but fully authenticated — peer cannot starve an unrelated one,
+   and total host memory stays bounded by (quota × declared peers).
 
 Verification then runs in a fixed order — envelope signature (`Open`),
 sender ∈ declared peers, correct recipient, replay — and each rejection is

@@ -38,10 +38,14 @@ import (
 // ============================================================
 
 const (
-	// inboxCapacity bounds how many verified-but-undelivered calls the host
-	// holds. Beyond it the listener sheds load (503) instead of growing
-	// memory on the host process.
-	inboxCapacity = 64
+	// perPeerInboxCapacity bounds how many verified-but-undelivered calls
+	// the host holds PER DECLARED PEER. The quota is per peer, not shared:
+	// a noisy (or buggy) — but fully authenticated — peer that fills its
+	// own quota is shed with 503 without affecting an unrelated peer's
+	// calls, so one trusted peer cannot starve another. The delivery
+	// channel's total capacity is the sum of all quotas, which is why
+	// admission under quota can never block on the channel itself.
+	perPeerInboxCapacity = 16
 
 	// replyTimeout bounds how long the public listener holds a peer's
 	// connection open waiting for the sandboxed agent to answer. Shorter
@@ -147,15 +151,21 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Every check passed — only now may the call become sandbox-visible.
+	// Admission is bounded per peer (see perPeerInboxCapacity): exceeding
+	// your own quota sheds only your calls, never another peer's.
 	call := &inboundCall{env: env, peerName: peer.Name, respCh: make(chan []byte, 1)}
-	select {
-	case g.inbox <- call:
-	default:
+	g.mu.Lock()
+	if g.inboxUsed[peer.Name] >= perPeerInboxCapacity {
+		g.mu.Unlock()
 		g.logRejected(env.From, env.MsgID, ReasonInboxFull,
-			fmt.Sprintf("inbox holds %d undelivered calls", inboxCapacity))
-		http.Error(w, "constle a2a: agent inbox is full, retry later", http.StatusServiceUnavailable)
+			fmt.Sprintf("peer %q has %d undelivered calls", peer.Name, perPeerInboxCapacity))
+		http.Error(w, "constle a2a: this peer's inbox quota is full, retry later", http.StatusServiceUnavailable)
 		return
 	}
+	g.inboxUsed[peer.Name]++
+	g.mu.Unlock()
+	// Never blocks: the channel's capacity is the sum of all peer quotas.
+	g.inbox <- call
 
 	g.log(audit.EventA2ACallReceived, map[string]any{
 		"peer":     peer.Name,
@@ -196,6 +206,7 @@ func (g *Gate) serveInbox(w http.ResponseWriter, r *http.Request) {
 	case call := <-g.inbox:
 		g.mu.Lock()
 		g.pending[call.env.MsgID] = call
+		g.inboxUsed[call.peerName]-- // delivered: frees the peer's quota slot
 		g.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")

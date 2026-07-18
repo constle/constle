@@ -373,14 +373,13 @@ func TestInboundReplayRejected(t *testing.T) {
 	}
 }
 
-func TestInboundInboxFullShedsLoad(t *testing.T) {
-	bob := newTestSigner(t, 2)
-	alice := newTestSigner(t, 1)
-	g, publicURL, _ := newInboundGate(t, bob, alice)
-
-	// Fill the inbox to capacity without any agent draining it.
-	for i := 0; i < inboxCapacity; i++ {
-		wire, _, err := Seal(alice, bob.DID(), "", []byte(fmt.Sprintf(`{"n":%d}`, i)))
+// fillPeerQuota fires quota-many valid calls from signer without draining,
+// and waits until they are all admitted.
+func fillPeerQuota(t *testing.T, g *Gate, publicURL string, from *testSigner, to string) {
+	t.Helper()
+	before := len(g.inbox)
+	for i := 0; i < perPeerInboxCapacity; i++ {
+		wire, _, err := Seal(from, to, "", []byte(fmt.Sprintf(`{"n":%d}`, i)))
 		if err != nil {
 			t.Fatalf("Seal: %v", err)
 		}
@@ -392,12 +391,20 @@ func TestInboundInboxFullShedsLoad(t *testing.T) {
 		}()
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for len(g.inbox) < inboxCapacity && time.Now().Before(deadline) {
+	for len(g.inbox) < before+perPeerInboxCapacity && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if len(g.inbox) != inboxCapacity {
-		t.Fatalf("inbox holds %d, want %d", len(g.inbox), inboxCapacity)
+	if got := len(g.inbox); got != before+perPeerInboxCapacity {
+		t.Fatalf("inbox holds %d, want %d", got, before+perPeerInboxCapacity)
 	}
+}
+
+func TestInboundInboxFullShedsLoad(t *testing.T) {
+	bob := newTestSigner(t, 2)
+	alice := newTestSigner(t, 1)
+	g, publicURL, _ := newInboundGate(t, bob, alice)
+
+	fillPeerQuota(t, g, publicURL, alice, bob.DID())
 
 	// One more verified call: shed with 503, not queued, not crashed.
 	wire, _, err := Seal(alice, bob.DID(), "", []byte(`{"overflow":true}`))
@@ -412,8 +419,84 @@ func TestInboundInboxFullShedsLoad(t *testing.T) {
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("overflow call = HTTP %d, want 503", resp.StatusCode)
 	}
-	if len(g.inbox) != inboxCapacity {
+	if len(g.inbox) != perPeerInboxCapacity {
 		t.Fatalf("overflow was queued anyway (len=%d)", len(g.inbox))
+	}
+}
+
+func TestInboxIsolationBetweenPeers(t *testing.T) {
+	// The inbox quota is per peer: a noisy but fully authenticated peer
+	// (alice) filling her own quota must not cause an unrelated declared
+	// peer (carol) to be shed.
+	bob := newTestSigner(t, 2)
+	alice := newTestSigner(t, 1)
+	carol := newTestSigner(t, 4)
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "bob", DID: bob.DID()},
+		A2A: manifest.A2A{
+			Listen: "127.0.0.1:0",
+			Peers: []manifest.A2APeer{
+				{Name: "alice", DID: alice.DID(), Endpoint: "http://127.0.0.1:1"},
+				{Name: "carol", DID: carol.DID(), Endpoint: "http://127.0.0.1:2"},
+			},
+		},
+	}
+	g, err := New(m, bob, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { g.Close() })
+	g.replyTimeoutOverride = 500 * time.Millisecond
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	if err := g.StartListener(addr); err != nil {
+		t.Fatalf("StartListener: %v", err)
+	}
+	waitForListener(t, addr)
+	publicURL := "http://" + addr + CallPath
+
+	// Alice floods her whole quota; nothing drains it.
+	fillPeerQuota(t, g, publicURL, alice, bob.DID())
+
+	// Alice's next call is shed...
+	wire, _, err := Seal(alice, bob.DID(), "", []byte(`{"noise":true}`))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	resp, err := http.Post(publicURL, "application/json", bytes.NewReader(wire))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("alice over quota = HTTP %d, want 503", resp.StatusCode)
+	}
+
+	// ...but carol's call is still admitted: it parks awaiting the agent
+	// (504 after the shortened reply timeout), never 503.
+	wire, _, err = Seal(carol, bob.DID(), "", []byte(`{"important":true}`))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	resp, err = http.Post(publicURL, "application/json", bytes.NewReader(wire))
+	if err != nil {
+		t.Fatalf("carol POST: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusServiceUnavailable {
+		t.Fatal("carol was shed because of alice's noise — quota is not per-peer")
+	}
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("carol = HTTP %d, want 504 (admitted, unanswered)", resp.StatusCode)
+	}
+	if got := len(g.inbox); got != perPeerInboxCapacity+1 {
+		t.Fatalf("inbox holds %d, want %d (alice's quota + carol's call)", got, perPeerInboxCapacity+1)
 	}
 }
 

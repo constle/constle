@@ -45,9 +45,12 @@ type Gate struct {
 	replay     *replayGuard
 
 	// inbox holds verified inbound calls until the agent drains them;
-	// pending tracks delivered calls awaiting the agent's reply.
-	inbox   chan *inboundCall
-	pending map[string]*inboundCall
+	// inboxUsed counts undelivered calls per peer name (admission quota,
+	// mu-guarded); pending tracks delivered calls awaiting the agent's
+	// reply.
+	inbox     chan *inboundCall
+	inboxUsed map[string]int
+	pending   map[string]*inboundCall
 
 	mu        sync.Mutex
 	runID     string
@@ -83,7 +86,8 @@ func New(m *manifest.AgentManifest, signer Signer, logger *audit.Logger) (*Gate,
 		logger:     logger,
 		client:     &http.Client{Timeout: callTimeout},
 		replay:     newReplayGuard(),
-		inbox:      make(chan *inboundCall, inboxCapacity),
+		inbox:      make(chan *inboundCall, perPeerInboxCapacity*max(len(m.A2A.Peers), 1)),
+		inboxUsed:  map[string]int{},
 		pending:    map[string]*inboundCall{},
 		agentName:  m.Identity.Name,
 	}
