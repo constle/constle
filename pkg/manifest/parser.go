@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/constle/constle/pkg/did"
 )
 
 // ParseFile reads a YAML file from disk and returns an AgentManifest.
@@ -73,6 +75,12 @@ func (m *AgentManifest) Validate() error {
 
 	if m.Identity.Name == "" {
 		return fmt.Errorf("identity.name is required")
+	}
+
+	if m.Identity.DID != "" {
+		if err := did.Validate(m.Identity.DID); err != nil {
+			return fmt.Errorf("identity.did: %w", err)
+		}
 	}
 
 	for _, cap := range m.Capabilities {

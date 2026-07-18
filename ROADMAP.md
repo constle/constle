@@ -66,12 +66,17 @@ _Goal: agents can use tools declared in the manifest, nothing more._
 
 ---
 
-## v0.5 — Identity & KYA `planned`
+## v0.5 — Identity & KYA `in progress`
 
 _Goal: every agent has a verifiable identity; trust can be established and delegated._
 
-- [ ] `constle identity new` — generate Ed25519 key pair, emit `did:constle` DID document
-- [ ] `constle identity verify <did>` — resolve and verify a DID
+- [x] `constle identity create` — generate Ed25519 key pair, emit a standard
+      [did:key](https://w3c-ccg.github.io/did-method-key/) identifier (chosen over a custom
+      `did:constle` method: the DID self-describes the public key, so verification needs no
+      resolution service — see `spec/identity.md`)
+- [x] Audit log signing: every entry Ed25519-signed and hash-chained when `identity.did`
+      is declared; `constle audit verify` detects and localizes tampering
+- [x] `constle run` fails closed when `identity.did` has no matching local private key
 - [ ] Agent manifest signed at publish time; signature verified at `constle run`
 - [ ] Parent/child DID chain: child agent inherits a subset of parent's capabilities
 - [ ] KYA registry API (hosted at `constle.dev`): publish and resolve DID documents

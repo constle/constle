@@ -125,6 +125,38 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+func TestValidateIdentityDID(t *testing.T) {
+	base := func(did string) *AgentManifest {
+		return &AgentManifest{
+			APIVersion: "constle.dev/v1alpha1",
+			Kind:       "AgentManifest",
+			Identity:   Identity{Name: "my-agent", DID: did},
+		}
+	}
+
+	// A well-formed did:key (Ed25519) passes.
+	good := base("did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr")
+	if err := good.Validate(); err != nil {
+		t.Errorf("valid identity.did failed validation: %v", err)
+	}
+
+	// Empty DID stays optional — unchanged behavior.
+	if err := base("").Validate(); err != nil {
+		t.Errorf("manifest without identity.did failed validation: %v", err)
+	}
+
+	for _, bad := range []string{
+		"did:web:example.com", // wrong method — only did:key is supported
+		"did:key:uABCD",       // wrong multibase encoding
+		"did:key:z6MkiTBz",    // truncated key
+		"not-a-did",
+	} {
+		if err := base(bad).Validate(); err == nil {
+			t.Errorf("identity.did %q passed validation, want error", bad)
+		}
+	}
+}
+
 func TestParseMCPAndGateDefaults(t *testing.T) {
 	yaml := `
 apiVersion: constle.dev/v1alpha1

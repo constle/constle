@@ -39,6 +39,14 @@ identity:
   # Optional: email or team identifier of the person responsible for this agent.
   owner: ""
 
+  # Optional: cryptographic identity — a did:key identifier created with
+  # "constle identity create <name>". When set, every audit log entry is
+  # Ed25519-signed and hash-chained (verify with "constle audit verify"),
+  # and "constle run" refuses to start without the matching local private
+  # key. Only the public DID goes here; the private key stays under
+  # ~/.constle/identities/ and must never be pasted into this file.
+  # did: "did:key:z6Mk..."
+
 # ---------------------------------------------------------------------------
 # sandbox — how to run the agent in isolation
 # ---------------------------------------------------------------------------

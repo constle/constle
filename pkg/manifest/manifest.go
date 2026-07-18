@@ -55,6 +55,18 @@ type Identity struct {
 	Version string `yaml:"version"`
 	// Owner is the email of the person responsible for this agent. Optional.
 	Owner string `yaml:"owner,omitempty"`
+
+	// DID is the agent's did:key identifier — the public half of a local
+	// Ed25519 identity created with `constle identity create`. When set,
+	// every audit log entry is signed and hash-chained with that identity,
+	// and `constle run` refuses to start unless the matching private key
+	// exists locally (fail closed — a declared identity must never look
+	// real when it isn't).
+	//
+	// Only the public DID appears here. The private key lives under
+	// ~/.constle/identities/<name>/ and is never embedded in the Agentfile,
+	// following the same indirection pattern as url_secret_ref.
+	DID string `yaml:"did,omitempty"`
 }
 
 // Sandbox describes how to run the agent in isolation.

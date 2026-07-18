@@ -77,6 +77,23 @@ func main() {
 			die("%v", err)
 		}
 
+	case "identity":
+		if err := cmdIdentity(os.Args[2:]); err != nil {
+			die("%v", err)
+		}
+
+	case "audit":
+		if len(os.Args) < 3 || os.Args[2] != "verify" {
+			die("usage: constle audit verify [--did=<did:key:…>] <logfile>")
+		}
+		logPath, expectedDID, err := parseAuditVerifyArgs(os.Args[3:])
+		if err != nil {
+			die("%v", err)
+		}
+		if err := cmdAuditVerify(logPath, expectedDID); err != nil {
+			die("%v", err)
+		}
+
 	case "ps":
 		if err := runPS(); err != nil {
 			die("%v", err)
@@ -167,11 +184,37 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	printf("\n")
 
 	logPath := audit.DefaultLogPath(m.Identity.Name)
-	logger, err := audit.New(logPath)
-	if err != nil {
-		return fmt.Errorf("cannot open audit log: %w", err)
+
+	// Fail closed on identity: when the Agentfile declares identity.did,
+	// every audit entry must be signed with the matching local key — running
+	// unsigned while the manifest promises a signed log would make the
+	// declared protection a lie (same principle as warnUnenforcedHumanGates).
+	var logger *audit.Logger
+	if m.Identity.DID != "" {
+		id, err := loadRunIdentity(m)
+		if err != nil {
+			return err
+		}
+		logger, err = audit.NewSigned(logPath, id)
+		if err != nil {
+			return fmt.Errorf("cannot open signed audit log: %w", err)
+		}
+		printOK("identity: %s", id.DID())
+		printf("     audit log entries are Ed25519-signed and hash-chained\n\n")
+	} else {
+		var err error
+		logger, err = audit.New(logPath)
+		if err != nil {
+			return fmt.Errorf("cannot open audit log: %w", err)
+		}
 	}
 	defer logger.Close()
+
+	if m.Identity.DID != "" && !logger.Signed() {
+		// Unreachable by construction; guards against future refactors ever
+		// letting a declared identity run with an unsigned log.
+		return fmt.Errorf("internal error: identity.did is declared but the audit logger is not signing — refusing to run")
+	}
 
 	// Human-gate enforcement: every declared MCP server is reachable from
 	// the sandbox only through this gate proxy, which pauses gated tool
@@ -397,6 +440,9 @@ func cmdValidate(agentfilePath string) error {
 	printf("✓ %s is valid\n\n", agentfilePath)
 	printf("  name:        %s\n", m.Identity.Name)
 	printf("  version:     %s\n", m.Identity.Version)
+	if m.Identity.DID != "" {
+		printf("  did:         %s\n", m.Identity.DID)
+	}
 	printf("  isolation:   %s (inferred from capabilities)\n", m.Sandbox.Isolation)
 	printf("  image:       %s\n", m.Sandbox.Image)
 	printf("  memory:      %dMB\n", m.Sandbox.MemoryMB)
@@ -422,6 +468,7 @@ func cmdValidate(agentfilePath string) error {
 
 	printf("\n")
 	warnUnenforcedHumanGates(m)
+	warnUnverifiableIdentity(m)
 	return nil
 }
 
@@ -437,6 +484,11 @@ usage:
   constle run <agentfile>       run an agent in a sandbox
     --backend=<name>            force a backend: docker or firecracker
   constle validate <agentfile>  check if an Agentfile is valid
+  constle identity create <name>  create a cryptographic agent identity (did:key)
+    --owner=<email>             bind the identity to an owner
+  constle identity show <name>  show an agent's DID and key location
+  constle audit verify <logfile>  verify a signed audit log (signatures + hash chain)
+    --did=<did:key:…>           pin the identity the log must be signed with
   constle ps                    list running and recent agents
   constle stop <run_id>         stop a running agent by run ID
   constle version               show version

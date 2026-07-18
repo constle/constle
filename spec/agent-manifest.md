@@ -112,6 +112,7 @@ identity:
   name: "invoice-processor"
   version: "1.2.0"
   owner: "finance@company.com"
+  did: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
 ```
 
 ### identity.name
@@ -150,6 +151,34 @@ If absent, audit events record the owner as `"unknown"`.
 
 Why this matters: in a compliance review or security incident, `owner` is what tells you which
 human authorized this agent to run. Without it, attribution is impossible.
+
+### identity.did
+
+| | |
+|-|-|
+| Type | string |
+| Required | optional |
+| Valid values | a `did:key` identifier for an Ed25519 public key |
+| Enforcement | ENFORCED — when set, every audit log entry is signed and hash-chained, and the run refuses to start without the matching local private key |
+
+The agent's cryptographic identity: a [did:key](https://w3c-ccg.github.io/did-method-key/)
+identifier that self-describes the agent's Ed25519 public key. Create one with
+`constle identity create <name>` and paste the printed DID here.
+
+Only the **public** DID appears in the manifest. The private key lives under
+`~/.constle/identities/<name>/key.pem` (mode 0600) and never enters the Agentfile, the
+audit log, or the sandbox — the same indirection principle as
+`human_gates.notify[].url_secret_ref`.
+
+When `did` is set:
+
+- every audit log entry is Ed25519-signed with the agent's key and hash-chained to the
+  previous entry, making the log tamper-evident (`constle audit verify`);
+- `constle run` fails closed if the local private key is missing, has permissions other
+  than 0600, or derives a different DID than declared — a declared identity must never
+  look real when it isn't.
+
+See `spec/identity.md` for the full design.
 
 ---
 
