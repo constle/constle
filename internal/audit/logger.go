@@ -90,14 +90,26 @@ type Logger struct {
 
 // New creates a Logger that writes to path, creating the directory if needed.
 // Entries are written unsigned; use NewSigned when the agent has an identity.
+//
+// Under sudo (required by the Firecracker backend) the log directory and
+// file are handed back to the invoking user, so a sudo run never blocks a
+// later non-sudo run from writing the same agent's log.
 func New(path string) (*Logger, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	dir := filepath.Dir(path)
+	if err := homedir.MkdirAllOwned(dir, 0755); err != nil {
 		return nil, fmt.Errorf("cannot create log directory: %w", err)
 	}
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open log file %q: %w", path, err)
+	}
+
+	// Chown the directory too (not only created levels): it heals a dir left
+	// root-owned by runs that predate this ownership restoration.
+	if err := homedir.ChownToInvokingUser(dir, path); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("cannot restore log ownership to the invoking user: %w", err)
 	}
 
 	return &Logger{file: f, path: path}, nil

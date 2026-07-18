@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -110,7 +109,7 @@ func Create(agentName, owner string) (*Identity, error) {
 		return nil, err
 	}
 
-	if err := os.MkdirAll(dir, dirMode); err != nil {
+	if err := homedir.MkdirAllOwned(dir, dirMode); err != nil {
 		return nil, fmt.Errorf("cannot create identity directory: %w", err)
 	}
 
@@ -138,31 +137,11 @@ func Create(agentName, owner string) (*Identity, error) {
 	// Under sudo (the Firecracker backend requires it) the files above were
 	// created as root inside the invoking user's home. Hand them back, or
 	// the user's next non-sudo command finds an identity it cannot read.
-	if err := chownToInvokingUser(Root(), dir, keyPath, metaPath); err != nil {
+	if err := homedir.ChownToInvokingUser(dir, keyPath, metaPath); err != nil {
 		return nil, fmt.Errorf("cannot restore identity ownership to the invoking user: %w", err)
 	}
 
 	return &Identity{Name: agentName, Owner: owner, CreatedAt: now, did: didStr, priv: priv}, nil
-}
-
-// chownToInvokingUser transfers ownership of the given paths to the user who
-// invoked constle via sudo. Outside sudo (or as a real root user) it is a
-// no-op.
-func chownToInvokingUser(paths ...string) error {
-	if os.Geteuid() != 0 {
-		return nil
-	}
-	uid, err1 := strconv.Atoi(os.Getenv("SUDO_UID"))
-	gid, err2 := strconv.Atoi(os.Getenv("SUDO_GID"))
-	if err1 != nil || err2 != nil || uid == 0 {
-		return nil
-	}
-	for _, p := range paths {
-		if err := os.Chown(p, uid, gid); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // Load reads an agent's identity from disk, failing closed on anything that
