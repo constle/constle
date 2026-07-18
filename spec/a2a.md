@@ -1,7 +1,8 @@
 # A2A — Signed Agent-to-Agent Communication
 
-Status: Phases 1–3 implemented (outbound, inbound listener/inbox, audit
-completeness). Phase 4 (adversarial verification) follows this design.
+Status: complete. Phases 1–4 implemented and verified end to end on both
+the Docker and Firecracker backends (outbound, inbound listener/inbox, audit
+completeness, adversarial verification).
 
 ## Scope
 
@@ -194,3 +195,37 @@ on whichever log records it; `direction` names the failed leg. Reasons:
   machines under different operators: without them, a sender's log would
   end at `a2a_call_sent` forever, indistinguishable from a completion
   recorded on a log its operator cannot see.
+
+## Adversarial verification
+
+Phase 4 proves the enforcement holds under attack, using the project's
+existing conformance methodology (a ground-truth target attacked from inside
+a real sandbox, every scenario run on both backends with parity asserted).
+The tests live in `internal/sandbox/a2a_conformance_test.go` and
+`a2a_twoprocess_test.go`, gated behind `CONSTLE_E2E=1`:
+
+- **Undeclared DID / forged signature never reach the sandbox.** A call
+  signed by an undeclared identity and a tampered call are both rejected at
+  B's host listener (403). B's *sandbox* is the ground truth — an inbox
+  drainer that echoes every body it receives — and it records only the one
+  genuine declared-peer call, never the attacker payloads. The proof is the
+  sandbox never seeing them, not merely that the host returned an error.
+
+- **Direct sandbox access fails at the network layer.** An attacker running
+  in its own sandbox tries to inject a call directly into B — at B's sandbox
+  address and at B's public listener, both via the egress proxy and with
+  proxy env unset. Every attempt fails at the network layer (no route /
+  refused) and B's sandbox records nothing. B's sandbox exposes no inbound
+  A2A port on either backend; the only ingress is B's host listener, which
+  verifies.
+
+- **Two-process signed round trip.** Two independent `constle run`
+  invocations — separate OS processes, separate DIDs, separate audit logs,
+  each declaring the other — complete a genuine signed, mutually
+  authenticated round trip.
+
+- **Two-process replay.** Against a real running receiver, the exact same
+  validly signed envelope sent twice within one run is accepted once and
+  rejected the second time by the in-memory `msg_id` guard; the sandbox sees
+  it once. (This is the per-run guard whose limitation is named above — it
+  does not span runs or restarts.)
