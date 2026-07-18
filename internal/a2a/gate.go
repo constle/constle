@@ -210,13 +210,18 @@ func (g *Gate) serveSend(w http.ResponseWriter, r *http.Request, peerName string
 	}
 
 	g.log(audit.EventA2ACallSent, map[string]any{
-		"peer":   peerName,
-		"to_did": peer.DID,
-		"msg_id": sealed.MsgID,
+		"direction": "request",
+		"peer":      peerName,
+		"to_did":    peer.DID,
+		"msg_id":    sealed.MsgID,
 	})
 
 	resp, err := g.client.Post(peer.Endpoint+CallPath, "application/json", strings.NewReader(string(wire)))
 	if err != nil {
+		// The request envelope never made it out — without this entry the
+		// sender's log would end at a2a_call_sent with no way to tell "the
+		// peer went dark" from "completed on a log I cannot see".
+		g.logRejected(peerName, "", "request", sealed.MsgID, "", ReasonPeerUnreachable, err.Error())
 		http.Error(w, fmt.Sprintf("constle a2a gate: cannot reach peer %q: %v", peerName, err), http.StatusBadGateway)
 		return
 	}
@@ -224,31 +229,38 @@ func (g *Gate) serveSend(w http.ResponseWriter, r *http.Request, peerName string
 
 	respWire, err := readCapped(resp.Body)
 	if err != nil {
+		g.logRejected(peerName, "", "response", "", sealed.MsgID, ReasonPeerHTTPError, err.Error())
 		http.Error(w, fmt.Sprintf("constle a2a gate: response from peer %q: %v", peerName, err), http.StatusBadGateway)
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
 		// The peer refused the call (or errored). Do not relay its body —
 		// only the status reaches the sandbox.
+		g.logRejected(peerName, "", "response", "", sealed.MsgID, ReasonPeerHTTPError,
+			fmt.Sprintf("peer answered HTTP %d", resp.StatusCode))
 		http.Error(w, fmt.Sprintf("constle a2a gate: peer %q refused the call (HTTP %d)", peerName, resp.StatusCode), http.StatusBadGateway)
 		return
 	}
 
 	respEnv, err := g.verifyResponse(respWire, peer, sealed.MsgID)
 	if err != nil {
-		reason := RejectReason("response_error")
+		reason := ReasonMalformed
 		if re, ok := err.(*RejectError); ok {
 			reason = re.Reason
 		}
-		g.log(audit.EventA2ACallRejected, map[string]any{
-			"peer":      peerName,
-			"direction": "response",
-			"reason":    string(reason),
-			"detail":    err.Error(),
-		})
+		g.logRejected(peerName, "", "response", "", sealed.MsgID, reason, err.Error())
 		http.Error(w, fmt.Sprintf("constle a2a gate: response from peer %q rejected: %v", peerName, err), http.StatusBadGateway)
 		return
 	}
+
+	// The response verified: the round trip is complete on this log too.
+	g.log(audit.EventA2ACallReceived, map[string]any{
+		"direction":   "response",
+		"peer":        peerName,
+		"from_did":    respEnv.From,
+		"msg_id":      respEnv.MsgID,
+		"in_reply_to": respEnv.InReplyTo,
+	})
 
 	// Only the verified body crosses into the sandbox, plus the verified
 	// sender as a header — the sandbox never sees the raw envelope.

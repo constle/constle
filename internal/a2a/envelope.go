@@ -128,6 +128,19 @@ const (
 	ReasonStaleTimestamp RejectReason = "stale_timestamp"
 	ReasonReplay         RejectReason = "replay"
 	ReasonInboxFull      RejectReason = "inbox_full"
+
+	// Transport-failure reasons. a2a_call_rejected means "this round trip
+	// did not complete, for reason X" on whichever log records it; a
+	// transport failure is another value of X, not a separate event
+	// category. These matter precisely because peers are usually separate
+	// machines under different operators: without them, a sender's own log
+	// would show a2a_call_sent and then nothing, forever, with no way to
+	// distinguish "completed on a log I cannot see" from "the peer went
+	// dark".
+	ReasonPeerUnreachable  RejectReason = "peer_unreachable"
+	ReasonPeerHTTPError    RejectReason = "peer_http_error"
+	ReasonReplyTimeout     RejectReason = "reply_timeout"
+	ReasonPeerDisconnected RejectReason = "peer_disconnected"
 )
 
 // RejectError reports a refused envelope with a machine-readable reason.

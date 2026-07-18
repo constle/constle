@@ -105,7 +105,7 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 	// Cap before parse: reject on byte count alone, no inspection.
 	wire, err := readCapped(r.Body)
 	if err != nil {
-		g.logRejected("", "", ReasonMalformed, err.Error())
+		g.logRejected("", "", "request", "", "", ReasonMalformed, err.Error())
 		http.Error(w, "constle a2a: "+err.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -117,7 +117,7 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 		if re, ok := err.(*RejectError); ok {
 			reason = re.Reason
 		}
-		g.logRejected("", "", reason, err.Error())
+		g.logRejected("", "", "request", "", "", reason, err.Error())
 		http.Error(w, "constle a2a: envelope rejected", http.StatusForbidden)
 		return
 	}
@@ -125,7 +125,7 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 	// Peer authorization: the sender DID must be explicitly declared.
 	peer, ok := g.peersByDID[env.From]
 	if !ok {
-		g.logRejected(env.From, env.MsgID, ReasonUnknownPeer,
+		g.logRejected("", env.From, "request", env.MsgID, "", ReasonUnknownPeer,
 			fmt.Sprintf("sender %s is not a declared peer", env.From))
 		http.Error(w, "constle a2a: sender is not a declared peer", http.StatusForbidden)
 		return
@@ -133,7 +133,7 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 
 	// The call must be addressed to this agent, not relayed or misrouted.
 	if env.To != g.signer.DID() {
-		g.logRejected(env.From, env.MsgID, ReasonWrongRecipient,
+		g.logRejected(peer.Name, env.From, "request", env.MsgID, "", ReasonWrongRecipient,
 			fmt.Sprintf("call addressed to %s", env.To))
 		http.Error(w, "constle a2a: call is not addressed to this agent", http.StatusForbidden)
 		return
@@ -145,7 +145,7 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 		if re, ok := err.(*RejectError); ok {
 			reason = re.Reason
 		}
-		g.logRejected(env.From, env.MsgID, reason, err.Error())
+		g.logRejected(peer.Name, env.From, "request", env.MsgID, "", reason, err.Error())
 		http.Error(w, "constle a2a: envelope rejected", http.StatusForbidden)
 		return
 	}
@@ -157,7 +157,7 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
 	if g.inboxUsed[peer.Name] >= perPeerInboxCapacity {
 		g.mu.Unlock()
-		g.logRejected(env.From, env.MsgID, ReasonInboxFull,
+		g.logRejected(peer.Name, env.From, "request", env.MsgID, "", ReasonInboxFull,
 			fmt.Sprintf("peer %q has %d undelivered calls", peer.Name, perPeerInboxCapacity))
 		http.Error(w, "constle a2a: this peer's inbox quota is full, retry later", http.StatusServiceUnavailable)
 		return
@@ -168,9 +168,10 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 	g.inbox <- call
 
 	g.log(audit.EventA2ACallReceived, map[string]any{
-		"peer":     peer.Name,
-		"from_did": env.From,
-		"msg_id":   env.MsgID,
+		"direction": "request",
+		"peer":      peer.Name,
+		"from_did":  env.From,
+		"msg_id":    env.MsgID,
 	})
 
 	// Hold the peer's connection for the agent's signed reply.
@@ -183,12 +184,18 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(respWire)
 	case <-time.After(timeout):
+		// The round trip died on the response leg: our agent never
+		// answered. Recorded so this log alone tells the whole story.
 		g.expireCall(env.MsgID)
+		g.logRejected(peer.Name, "", "response", "", env.MsgID, ReasonReplyTimeout,
+			fmt.Sprintf("agent did not answer within %s", timeout))
 		http.Error(w, "constle a2a: agent did not answer in time", http.StatusGatewayTimeout)
 	case <-r.Context().Done():
 		// Peer hung up; stop tracking the call so a late reply gets a 404
 		// instead of feeding a dead connection.
 		g.expireCall(env.MsgID)
+		g.logRejected(peer.Name, "", "response", "", env.MsgID, ReasonPeerDisconnected,
+			"peer closed the connection before the reply was ready")
 	}
 }
 
@@ -241,7 +248,7 @@ func (g *Gate) serveReply(w http.ResponseWriter, r *http.Request, msgID string) 
 		return
 	}
 
-	respWire, _, err := Seal(g.signer, call.env.From, call.env.MsgID, body)
+	respWire, sealedResp, err := Seal(g.signer, call.env.From, call.env.MsgID, body)
 	if err != nil {
 		// The call stays consumed: a reply the host cannot sign is not
 		// retried with a different body against the same envelope.
@@ -250,6 +257,16 @@ func (g *Gate) serveReply(w http.ResponseWriter, r *http.Request, msgID string) 
 	}
 
 	call.respCh <- respWire
+
+	// A signed envelope is leaving this host: the response leg of the
+	// round trip, completing the symmetric sent/received pairing.
+	g.log(audit.EventA2ACallSent, map[string]any{
+		"direction":   "response",
+		"peer":        call.peerName,
+		"to_did":      call.env.From,
+		"msg_id":      sealedResp.MsgID,
+		"in_reply_to": call.env.MsgID,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -261,19 +278,29 @@ func (g *Gate) expireCall(msgID string) {
 	g.mu.Unlock()
 }
 
-// logRejected writes one a2a_call_rejected audit entry. claimedDID and
-// msgID may be empty when rejection happened before parsing.
-func (g *Gate) logRejected(claimedDID, msgID string, reason RejectReason, detail string) {
+// logRejected writes one a2a_call_rejected audit entry: "this round trip
+// did not complete, for reason X" — verification failures and transport
+// failures alike. direction names the envelope leg the failure concerns
+// ("request" or "response"). Empty fields are omitted; claimedDID carries
+// the sender DID asserted by an envelope that failed authorization, which
+// is claimed, not verified attribution.
+func (g *Gate) logRejected(peerName, claimedDID, direction, msgID, inReplyTo string, reason RejectReason, detail string) {
 	details := map[string]any{
-		"direction": "inbound",
+		"direction": direction,
 		"reason":    string(reason),
 		"detail":    detail,
+	}
+	if peerName != "" {
+		details["peer"] = peerName
 	}
 	if claimedDID != "" {
 		details["claimed_did"] = claimedDID
 	}
 	if msgID != "" {
 		details["msg_id"] = msgID
+	}
+	if inReplyTo != "" {
+		details["in_reply_to"] = inReplyTo
 	}
 	g.log(audit.EventA2ACallRejected, details)
 }

@@ -1,7 +1,7 @@
 # A2A — Signed Agent-to-Agent Communication
 
-Status: Phases 1–2 implemented (outbound + inbound listener/inbox).
-Phases 3–4 (audit completion, adversarial verification) follow this design.
+Status: Phases 1–3 implemented (outbound, inbound listener/inbox, audit
+completeness). Phase 4 (adversarial verification) follows this design.
 
 ## Scope
 
@@ -164,10 +164,33 @@ separate runs by more than the window.
 ## Audit events
 
 Following the `gate_*` pattern; signed and hash-chained (A2A always runs
-with a declared identity):
+with a declared identity). Three event types, governed by one invariant:
 
-- `a2a_call_sent` — sender side: peer alias, destination DID, `msg_id`;
-- `a2a_call_received` — receiver side, after full verification;
-- `a2a_call_rejected` — receiver side (or sender side for a bad response),
-  with a machine-readable `reason`: `malformed_envelope`, `bad_signature`,
-  `unknown_peer`, `wrong_recipient`, `stale_timestamp`, `replay`.
+> Every signed envelope leaving this host is audited as `a2a_call_sent`;
+> every envelope arriving and passing full verification as
+> `a2a_call_received`; every round trip that does not complete as
+> `a2a_call_rejected` with the precise reason. "Verified" is not a separate
+> event — it is the precondition of `received`.
+
+A completed round trip therefore produces four symmetric entries, and each
+side's log alone shows its half closing (`in_reply_to` quoting the request
+`msg_id`):
+
+| side | event | key details |
+|---|---|---|
+| caller | `a2a_call_sent` | `direction:"request"`, peer, to_did, msg_id |
+| callee | `a2a_call_received` | `direction:"request"`, peer, from_did, msg_id |
+| callee | `a2a_call_sent` | `direction:"response"`, peer, to_did, msg_id, in_reply_to |
+| caller | `a2a_call_received` | `direction:"response"`, peer, from_did, msg_id, in_reply_to |
+
+`a2a_call_rejected` means "this round trip did not complete, for reason X",
+on whichever log records it; `direction` names the failed leg. Reasons:
+
+- verification: `malformed_envelope`, `bad_signature`, `unknown_peer`
+  (with the *claimed*, unverified sender DID), `wrong_recipient`,
+  `stale_timestamp`, `replay`, `inbox_full`;
+- transport: `peer_unreachable`, `peer_http_error`, `reply_timeout`,
+  `peer_disconnected`. These exist because peers usually run on separate
+  machines under different operators: without them, a sender's log would
+  end at `a2a_call_sent` forever, indistinguishable from a completion
+  recorded on a log its operator cannot see.
