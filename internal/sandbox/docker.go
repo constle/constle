@@ -64,6 +64,10 @@ type DockerBackend struct {
 	// mcpGate is attached by the CLI (SetMCPGate) when the manifest declares
 	// MCP servers; Start fails closed if servers are declared without it.
 	mcpGate MCPGateBinder
+
+	// a2aGate is attached by the CLI (SetA2AGate) when the manifest declares
+	// a2a peers; Start fails closed if peers are declared without it.
+	a2aGate A2AGateBinder
 }
 
 // Start creates two networks, starts the Squid proxy, and starts the agent container.
@@ -83,6 +87,11 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 		// work or, worse, tempt a fallback to direct access.
 		return nil, fmt.Errorf("manifest declares mcp servers but no MCP gate is attached to the backend")
 	}
+	if len(m.A2A.Peers) > 0 && d.a2aGate == nil {
+		// Same fail-closed rule for A2A: declared peers without the signing
+		// gate must never fall back to unsigned direct access.
+		return nil, fmt.Errorf("manifest declares a2a peers but no A2A gate is attached to the backend")
+	}
 
 	extNet := "constle-ext-" + runID
 	intNet := "constle-int-" + runID
@@ -98,20 +107,25 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 		return nil, fmt.Errorf("cannot create internal network: %w", err)
 	}
 
-	// Bind the MCP gate before writing the Squid config: the per-run ACL
-	// opens exactly one route to it (host IP + this port), so both must
-	// exist first. Candidates cover both Docker host-network layouts —
-	// see MCPGateBinder.
+	// Bind the gates before writing the Squid config: the per-run ACL opens
+	// exactly one route per gate (host IP + that gate's port), so both must
+	// exist first. Candidates cover both Docker host-network layouts — see
+	// MCPGateBinder. The MCP and A2A gates share the same routing mechanism;
+	// each gets its own ephemeral port and per-run token.
 	gatePort := 0
 	gateToken := ""
 	gateHost := ""
-	if len(m.MCP.Servers) > 0 {
+	a2aPort := 0
+	a2aToken := ""
+	if len(m.MCP.Servers) > 0 || len(m.A2A.Peers) > 0 {
 		gateHost, err = resolveMCPGateIPv4()
 		if err != nil {
 			dockerRun("network", "rm", extNet)
 			dockerRun("network", "rm", intNet)
-			return nil, fmt.Errorf("cannot set up MCP gate route: %w", err)
+			return nil, fmt.Errorf("cannot set up gate route: %w", err)
 		}
+	}
+	if len(m.MCP.Servers) > 0 {
 		gatePort, gateToken, err = d.mcpGate.Bind(runID, gateBindCandidates(gateHost))
 		if err != nil {
 			dockerRun("network", "rm", extNet)
@@ -119,8 +133,16 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 			return nil, fmt.Errorf("cannot bind MCP gate: %w", err)
 		}
 	}
+	if len(m.A2A.Peers) > 0 {
+		a2aPort, a2aToken, err = d.a2aGate.Bind(runID, gateBindCandidates(gateHost))
+		if err != nil {
+			dockerRun("network", "rm", extNet)
+			dockerRun("network", "rm", intNet)
+			return nil, fmt.Errorf("cannot bind A2A gate: %w", err)
+		}
+	}
 
-	squidConfigPath, err := writeSquidConfig(runID, m.Sandbox.Network.AllowedHosts, gateHost, gatePort)
+	squidConfigPath, err := writeSquidConfig(runID, m.Sandbox.Network.AllowedHosts, gateHost, gatePorts(gatePort, a2aPort))
 	if err != nil {
 		dockerRun("network", "rm", extNet)
 		dockerRun("network", "rm", intNet)
@@ -161,9 +183,13 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 	// Only included when the variable is set on the host; absent key → omitted flag.
 	agentEnv := forwardedHostEnv()
 
-	// Point the agent at the MCP gate. MCP traffic rides the proxy env vars
-	// like all other egress; Squid only lets it through to the gate port.
+	// Point the agent at the MCP and A2A gates. Gate traffic rides the proxy
+	// env vars like all other egress; Squid only lets it through to the gate
+	// ports.
 	for k, v := range mcpGateEnv(m, gateHost, gatePort, gateToken) {
+		agentEnv[k] = v
+	}
+	for k, v := range a2aGateEnv(gateHost, a2aPort, a2aToken) {
 		agentEnv[k] = v
 	}
 
@@ -251,9 +277,21 @@ func (d *DockerBackend) Logs(ctx *RunContext) ([]byte, error) {
 	return out, nil
 }
 
-func writeSquidConfig(runID string, allowedHosts []string, mcpGateHost string, mcpGatePort int) (string, error) {
+// gatePorts collects the non-zero gate ports of a run into the list form
+// buildSquidConfig and installNFTRules consume.
+func gatePorts(ports ...int) []int {
+	var out []int
+	for _, p := range ports {
+		if p > 0 {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func writeSquidConfig(runID string, allowedHosts []string, gateHost string, gatePorts []int) (string, error) {
 	config := buildSquidConfig(runID, allowedHosts, "3128", "/var/log/squid/access.log", "",
-		mcpGateHost, mcpGatePort)
+		gateHost, gatePorts)
 	path := filepath.Join(os.TempDir(), "constle-squid-"+runID+".conf")
 	return path, os.WriteFile(path, []byte(config), 0644)
 }
@@ -264,26 +302,31 @@ func writeSquidConfig(runID string, allowedHosts []string, mcpGateHost string, m
 // on the host and must bind only the per-run TAP gateway address). extra
 // appends backend-specific directives.
 //
-// mcpGatePort > 0 opens exactly one extra route: the MCP gate host on that
-// single port. The rule precedes every deny so the gate stays reachable
-// even with an empty allowlist, and the port scope keeps the rest of the
-// host's services unreachable. The gate host is a hostname on Docker
-// (host.docker.internal) and the TAP gateway IP literal on Firecracker —
-// where the guest reaches the gate directly via nftables, but an MCP
-// client that routes everything through http_proxy must still get through.
-func buildSquidConfig(runID string, allowedHosts []string, httpPort, accessLogPath, extra, mcpGateHost string, mcpGatePort int) string {
+// Each gatePorts entry opens exactly one extra route: the gate host on that
+// single port (one port per constle gate — MCP, A2A). The rule precedes
+// every deny so the gates stay reachable even with an empty allowlist, and
+// the port scope keeps the rest of the host's services unreachable. The
+// gate host is a hostname on Docker (host.docker.internal) and the TAP
+// gateway IP literal on Firecracker — where the guest reaches the gates
+// directly via nftables, but a client that routes everything through
+// http_proxy must still get through.
+func buildSquidConfig(runID string, allowedHosts []string, httpPort, accessLogPath, extra, gateHost string, gatePorts []int) string {
 	gateClause := ""
-	if mcpGatePort > 0 {
+	if len(gatePorts) > 0 {
 		aclType := "dstdomain"
-		if net.ParseIP(mcpGateHost) != nil {
+		if net.ParseIP(gateHost) != nil {
 			aclType = "dst"
 		}
+		portList := make([]string, len(gatePorts))
+		for i, p := range gatePorts {
+			portList[i] = fmt.Sprint(p)
+		}
 		gateClause = fmt.Sprintf(`
-# MCP gate proxy — the only permitted route to the sandbox host.
-acl mcp_gate_dst %s %s
-acl mcp_gate_port port %d
-http_access allow mcp_gate_dst mcp_gate_port
-`, aclType, mcpGateHost, mcpGatePort)
+# Constle gate proxies (MCP, A2A) — the only permitted routes to the sandbox host.
+acl constle_gate_dst %s %s
+acl constle_gate_port port %s
+http_access allow constle_gate_dst constle_gate_port
+`, aclType, gateHost, strings.Join(portList, " "))
 	}
 
 	var config string
@@ -357,6 +400,19 @@ func mcpGateEnv(m *manifest.AgentManifest, gateHost string, gatePort int, gateTo
 // "email-svc" → CONSTLE_MCP_EMAIL_SVC_URL.
 func mcpEnvVarName(serverID string) string {
 	return "CONSTLE_MCP_" + strings.ToUpper(strings.ReplaceAll(serverID, "-", "_")) + "_URL"
+}
+
+// a2aGateEnv builds the CONSTLE_A2A_URL variable pointing the agent at its
+// per-run A2A gate (token included). The agent appends /send/<peer-name>;
+// peers' real endpoints never appear in the sandbox environment. Empty map
+// when no A2A gate is bound.
+func a2aGateEnv(gateHost string, gatePort int, gateToken string) map[string]string {
+	if gatePort == 0 {
+		return map[string]string{}
+	}
+	return map[string]string{
+		"CONSTLE_A2A_URL": fmt.Sprintf("http://%s:%d/%s", gateHost, gatePort, gateToken),
+	}
 }
 
 // forwardedHostEnv collects the host environment variables forwarded into

@@ -32,7 +32,7 @@ func TestTeardownKillsHostSquid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pid, _, err := startHostSquid("sqtest01", runDir, "127.0.0.1", nil, 0)
+	pid, _, err := startHostSquid("sqtest01", runDir, "127.0.0.1", nil, nil)
 	if err != nil {
 		t.Fatalf("startHostSquid: %v", err)
 	}

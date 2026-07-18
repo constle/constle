@@ -112,6 +112,29 @@ func (d *DockerBackend) SetMCPGate(g MCPGateBinder) { d.mcpGate = g }
 // SetMCPGate attaches the MCP gate to the Firecracker backend before Start.
 func (f *FirecrackerBackend) SetMCPGate(g MCPGateBinder) { f.mcpGate = g }
 
+// A2AGateBinder is the sandbox-side handle to the A2A gate (internal/a2a).
+// Same contract as MCPGateBinder — backends call Bind mid-Start once the
+// run's network exists, then open exactly one extra sandbox→host route to
+// the returned port and inject CONSTLE_A2A_URL. Peers' real endpoints never
+// enter the sandbox.
+type A2AGateBinder interface {
+	Bind(runID string, candidateIPs []string) (port int, token string, err error)
+}
+
+// A2AGateSetter is implemented by backends that can route the sandbox's A2A
+// traffic through the gate. The CLI feature-detects it with a type
+// assertion so the SandboxBackend interface stays unchanged — and fails
+// closed when a manifest declares a2a peers on a backend without it.
+type A2AGateSetter interface {
+	SetA2AGate(g A2AGateBinder)
+}
+
+// SetA2AGate attaches the A2A gate to a backend before Start.
+func (d *DockerBackend) SetA2AGate(g A2AGateBinder) { d.a2aGate = g }
+
+// SetA2AGate attaches the A2A gate to the Firecracker backend before Start.
+func (f *FirecrackerBackend) SetA2AGate(g A2AGateBinder) { f.a2aGate = g }
+
 // BackendType is a human-readable backend identifier used in audit logs and CLI output.
 type BackendType string
 

@@ -99,13 +99,13 @@ func nftTableName(runID string) string {
 }
 
 // installNFTRules installs the per-run enforcement table: the guest may
-// reach the gateway's Squid port — plus the MCP gate port when one is bound
-// (mcpGatePort > 0) — and nothing else, in any hook.
-func installNFTRules(runID, tapName, gatewayIP string, mcpGatePort int) error {
+// reach the gateway's Squid port — plus each bound constle gate port (MCP,
+// A2A) — and nothing else, in any hook.
+func installNFTRules(runID, tapName, gatewayIP string, gatePorts []int) error {
 	gateRule := ""
-	if mcpGatePort > 0 {
-		gateRule = fmt.Sprintf("\t\tiifname %q ip daddr %s tcp dport %d accept\n",
-			tapName, gatewayIP, mcpGatePort)
+	for _, p := range gatePorts {
+		gateRule += fmt.Sprintf("\t\tiifname %q ip daddr %s tcp dport %d accept\n",
+			tapName, gatewayIP, p)
 	}
 
 	script := fmt.Sprintf(`table inet %[1]s {
@@ -141,10 +141,10 @@ func deleteNFTRules(runID string) error {
 
 // startHostSquid writes the per-run Squid config and starts a foreground
 // Squid instance bound to the TAP gateway address. Returns the squid PID
-// and the per-run access log path. mcpGatePort > 0 additionally allows
-// proxied requests to the gate itself, for MCP clients that route all
-// traffic through http_proxy instead of honouring NO_PROXY.
-func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, mcpGatePort int) (pid int, accessLogPath string, err error) {
+// and the per-run access log path. Each gatePorts entry additionally allows
+// proxied requests to that gate itself, for clients that route all traffic
+// through http_proxy instead of honouring NO_PROXY.
+func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, gatePorts []int) (pid int, accessLogPath string, err error) {
 	accessLogPath = filepath.Join(runDir, "access.log")
 	configPath := filepath.Join(runDir, "squid.conf")
 
@@ -160,7 +160,7 @@ func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, mcpG
 
 	config := buildSquidConfig(runID, allowedHosts,
 		fmt.Sprintf("%s:%d", gatewayIP, fcSquidPort), accessLogPath, extra,
-		gatewayIP, mcpGatePort)
+		gatewayIP, gatePorts)
 	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 		return 0, "", err
 	}

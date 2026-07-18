@@ -66,6 +66,10 @@ type FirecrackerBackend struct {
 	// mcpGate is attached by the CLI (SetMCPGate) when the manifest declares
 	// MCP servers; Start fails closed if servers are declared without it.
 	mcpGate MCPGateBinder
+
+	// a2aGate is attached by the CLI (SetA2AGate) when the manifest declares
+	// a2a peers; Start fails closed if peers are declared without it.
+	a2aGate A2AGateBinder
 }
 
 // Start provisions the network, the per-run Squid proxy, and the microVM.
@@ -78,6 +82,11 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		// Fail closed: declared MCP servers without a gate would either not
 		// work or, worse, tempt a fallback to direct access.
 		return nil, fmt.Errorf("manifest declares mcp servers but no MCP gate is attached to the backend")
+	}
+	if len(m.A2A.Peers) > 0 && f.a2aGate == nil {
+		// Same fail-closed rule for A2A: declared peers without the signing
+		// gate must never fall back to unsigned direct access.
+		return nil, fmt.Errorf("manifest declares a2a peers but no A2A gate is attached to the backend")
 	}
 
 	// Remove leftovers of runs that ended without a clean Stop() (host crash,
@@ -109,12 +118,14 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		return nil, fmt.Errorf("cannot create TAP device: %w", err)
 	}
 
-	// Bind the MCP gate on the TAP gateway address before installing the
-	// nftables rules, which open exactly guest → gateway on this one port
+	// Bind the gates on the TAP gateway address before installing the
+	// nftables rules, which open exactly guest → gateway on these ports
 	// (alongside the Squid port). Unlike the Docker backend, the guest
-	// reaches the gate directly — constle owns this network namespace.
+	// reaches the gates directly — constle owns this network namespace.
 	gatePort := 0
 	gateToken := ""
+	a2aPort := 0
+	a2aToken := ""
 	if len(m.MCP.Servers) > 0 {
 		gatePort, gateToken, err = f.mcpGate.Bind(runID, []string{gatewayIP})
 		if err != nil {
@@ -123,14 +134,23 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 			return nil, fmt.Errorf("cannot bind MCP gate: %w", err)
 		}
 	}
+	if len(m.A2A.Peers) > 0 {
+		a2aPort, a2aToken, err = f.a2aGate.Bind(runID, []string{gatewayIP})
+		if err != nil {
+			deleteTAP(tapName)
+			os.RemoveAll(runDir)
+			return nil, fmt.Errorf("cannot bind A2A gate: %w", err)
+		}
+	}
+	runGatePorts := gatePorts(gatePort, a2aPort)
 
-	if err := installNFTRules(runID, tapName, gatewayIP, gatePort); err != nil {
+	if err := installNFTRules(runID, tapName, gatewayIP, runGatePorts); err != nil {
 		deleteTAP(tapName)
 		os.RemoveAll(runDir)
 		return nil, fmt.Errorf("cannot install nftables rules: %w", err)
 	}
 
-	squidPID, accessLogPath, err := startHostSquid(runID, runDir, gatewayIP, m.Sandbox.Network.AllowedHosts, gatePort)
+	squidPID, accessLogPath, err := startHostSquid(runID, runDir, gatewayIP, m.Sandbox.Network.AllowedHosts, runGatePorts)
 	if err != nil {
 		deleteNFTRules(runID)
 		deleteTAP(tapName)
@@ -147,16 +167,19 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		os.RemoveAll(runDir)
 	}
 
-	mcpEnv := mcpGateEnv(m, gatewayIP, gatePort, gateToken)
-	if gatePort > 0 {
-		// The guest reaches the gate directly on the TAP gateway; keep MCP
+	gateEnv := mcpGateEnv(m, gatewayIP, gatePort, gateToken)
+	for k, v := range a2aGateEnv(gatewayIP, a2aPort, a2aToken) {
+		gateEnv[k] = v
+	}
+	if len(runGatePorts) > 0 {
+		// The guest reaches the gates directly on the TAP gateway; keep
 		// clients that honour proxy env vars from detouring through Squid.
 		// (Squid also carries a gate allow rule for clients that don't.)
-		mcpEnv["NO_PROXY"] = gatewayIP
-		mcpEnv["no_proxy"] = gatewayIP
+		gateEnv["NO_PROXY"] = gatewayIP
+		gateEnv["no_proxy"] = gatewayIP
 	}
 
-	workspacePath, err := buildWorkspaceImage(runDir, m, gatewayIP, guestIP, mcpEnv)
+	workspacePath, err := buildWorkspaceImage(runDir, m, gatewayIP, guestIP, gateEnv)
 	if err != nil {
 		cleanupNet()
 		return nil, fmt.Errorf("cannot build workspace image: %w", err)
@@ -359,9 +382,10 @@ func fcWorkspacePath(runID string) string {
 
 // buildWorkspaceImage creates the per-run ext4 drive carrying the run's
 // environment and command into the guest. `mkfs.ext4 -d` packs a staging
-// directory without requiring a loop mount. mcpEnv carries the
-// CONSTLE_MCP_<ID>_URL gate addresses (empty when no MCP servers declared).
-func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, guestIP string, mcpEnv map[string]string) (string, error) {
+// directory without requiring a loop mount. gateEnv carries the
+// CONSTLE_MCP_<ID>_URL and CONSTLE_A2A_URL gate addresses (empty when no
+// gates are bound).
+func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, guestIP string, gateEnv map[string]string) (string, error) {
 	staging := filepath.Join(runDir, "ws")
 	if err := os.MkdirAll(staging, 0700); err != nil {
 		return "", err
@@ -380,7 +404,7 @@ func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, gu
 	for k, v := range forwardedHostEnv() {
 		env[k] = v
 	}
-	for k, v := range mcpEnv {
+	for k, v := range gateEnv {
 		env[k] = v
 	}
 
