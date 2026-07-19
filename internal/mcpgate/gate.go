@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/spending"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -102,10 +103,16 @@ type Gate struct {
 	notifier Notifier
 	logger   *audit.Logger
 
+	// tracker enforces the manifest's spending limits against cost metered
+	// from priced servers' responses. Nil when no spending enforcement is
+	// active for this run.
+	tracker *spending.Tracker
+
 	mu        sync.Mutex
 	runID     string
 	agentName string
 	abortRun  func() // set by SetAbortRun after the sandbox starts
+	spendKill func() // set by SetSpendKill after the sandbox starts
 
 	token     string
 	port      int
@@ -122,11 +129,16 @@ type upstream struct {
 	id    string
 	path  string          // the endpoint path of the server URL (e.g. /mcp)
 	tools map[string]bool // empty = every tool allowed
-	proxy *httputil.ReverseProxy
+	// meters is the compiled pricing block; non-empty means every
+	// tools/call response of this server is metered (server-wide pricing).
+	meters []spending.Meter
+	proxy  *httputil.ReverseProxy
 }
 
-// New builds a Gate from the manifest's MCP servers and human_gates policy.
-func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger *audit.Logger) (*Gate, error) {
+// New builds a Gate from the manifest's MCP servers, human_gates policy,
+// and pricing blocks. tracker may be nil when the run has no spending
+// enforcement (no limits declared, or no priced servers to meter them).
+func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger *audit.Logger, tracker *spending.Tracker) (*Gate, error) {
 	g := &Gate{
 		servers:   map[string]*upstream{},
 		gates:     m.HumanGates,
@@ -134,6 +146,7 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 		approver:  approver,
 		notifier:  notifier,
 		logger:    logger,
+		tracker:   tracker,
 		agentName: m.Identity.Name,
 	}
 
@@ -154,6 +167,24 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 			tools[tool] = true
 		}
 
+		var meters []spending.Meter
+		if srv.Pricing != nil {
+			if tracker == nil {
+				return nil, fmt.Errorf("mcp server %q declares pricing but the gate has no spending tracker — refusing to run a priced server unmetered", srv.ID)
+			}
+			for i, pm := range srv.Pricing.Meters {
+				path, err := spending.ParsePath(pm.UsagePath)
+				if err != nil {
+					return nil, fmt.Errorf("mcp server %q pricing meter %d: %w", srv.ID, i, err)
+				}
+				price, err := spending.ParseUSD(pm.USDPerUnit)
+				if err != nil {
+					return nil, fmt.Errorf("mcp server %q pricing meter %d: %w", srv.ID, i, err)
+				}
+				meters = append(meters, spending.Meter{Path: path, Price: price})
+			}
+		}
+
 		// Custom Director instead of NewSingleHostReverseProxy: ServeHTTP has
 		// already computed the exact upstream path (the default path-joining
 		// would turn the endpoint /mcp into /mcp/ and 404 on strict routers),
@@ -167,8 +198,11 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 				req.Host = target.Host
 			},
 		}
+		if len(meters) > 0 {
+			proxy.ModifyResponse = meterResponse
+		}
 
-		g.servers[srv.ID] = &upstream{id: srv.ID, path: target.Path, tools: tools, proxy: proxy}
+		g.servers[srv.ID] = &upstream{id: srv.ID, path: target.Path, tools: tools, meters: meters, proxy: proxy}
 	}
 
 	return g, nil
@@ -267,6 +301,18 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A tripped spending tracker rejects EVERYTHING, all methods, all
+	// servers: the run is being killed, and until the kill lands the agent
+	// must not be able to complete another call. Re-firing the kill here
+	// closes the startup race where a violation beat SetSpendKill.
+	if g.tracker != nil && g.tracker.Tripped() != spending.ViolationNone {
+		g.fireSpendKill()
+		http.Error(w, fmt.Sprintf(
+			"constle: spending limit reached (%s) — run is being terminated", g.tracker.Tripped()),
+			http.StatusForbidden)
+		return
+	}
+
 	// Rewrite the path so the upstream sees exactly its own endpoint path,
 	// plus any sub-path the client appended after the server id.
 	r.URL.Path = up.path
@@ -320,6 +366,13 @@ func (g *Gate) servePOST(w http.ResponseWriter, r *http.Request, up *upstream) {
 	}
 
 	tool := msg.Params.Name
+
+	// Priced server: attach the metering job so this tools/call's response
+	// is captured and charged by the upstream's ModifyResponse hook.
+	if len(up.meters) > 0 {
+		job := &meterJob{gate: g, up: up, tool: tool, reqID: msg.ID}
+		r = r.WithContext(context.WithValue(r.Context(), meterCtxKey{}, job))
+	}
 
 	// Manifest tool allowlist: undeclared tools are rejected outright, no gate.
 	if len(up.tools) > 0 && !up.tools[tool] {

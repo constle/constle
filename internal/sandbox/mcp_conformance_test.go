@@ -174,7 +174,7 @@ func runMCPScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentManif
 	}
 	defer logger.Close()
 
-	gate, err := mcpgate.New(m, approver, nil, logger)
+	gate, err := mcpgate.New(m, approver, nil, logger, nil)
 	if err != nil {
 		t.Fatalf("mcpgate.New: %v", err)
 	}

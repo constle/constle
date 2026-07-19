@@ -165,6 +165,20 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	if m.Limits.MaxDurationSeconds > 0 {
 		printf("     max_duration: %ds\n", m.Limits.MaxDurationSeconds)
 	}
+	if m.Spending.MaxPerRunUSD != "" || m.Spending.MaxPerDayUSD != "" {
+		var caps []string
+		if m.Spending.MaxPerRunUSD != "" {
+			caps = append(caps, "run≤$"+m.Spending.MaxPerRunUSD)
+		}
+		if m.Spending.MaxPerDayUSD != "" {
+			caps = append(caps, "day≤$"+m.Spending.MaxPerDayUSD)
+		}
+		scope := "NOT ENFORCED — no priced MCP servers"
+		if priced := m.PricedMCPServers(); len(priced) > 0 {
+			scope = "metered at the MCP gate: " + strings.Join(priced, ", ")
+		}
+		printf("     spending:  %s (%s)\n", strings.Join(caps, ", "), scope)
+	}
 	if len(m.MCP.Servers) > 0 {
 		ids := make([]string, len(m.MCP.Servers))
 		for i, srv := range m.MCP.Servers {
@@ -182,6 +196,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	printf("\n")
 
 	warnUnenforcedHumanGates(m)
+	warnUnenforcedSpending(m)
 
 	printStep("detecting backend")
 
@@ -228,6 +243,15 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		return fmt.Errorf("internal error: identity.did is declared but the audit logger is not signing — refusing to run")
 	}
 
+	// Spending enforcement: cost is metered at the MCP gate for servers
+	// that declare pricing. When a daily cap exists this also opens the
+	// durable per-DID ledger and refuses to start a run whose budget is
+	// already exhausted — fail closed, before any sandbox resources exist.
+	tracker, err := buildSpendingTracker(m, logger)
+	if err != nil {
+		return err
+	}
+
 	// Human-gate enforcement: every declared MCP server is reachable from
 	// the sandbox only through this gate proxy, which pauses gated tool
 	// calls for approval. The gate lives in this process — it owns the
@@ -241,7 +265,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			notifier = wn
 		}
 
-		gate, err = mcpgate.New(m, approver, notifier, logger)
+		gate, err = mcpgate.New(m, approver, notifier, logger, tracker)
 		if err != nil {
 			return fmt.Errorf("cannot build MCP gate: %w", err)
 		}
@@ -357,6 +381,25 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		})
 	}
 
+	// spendExceeded is closed by the MCP gate when metered spend crosses a
+	// spending limit (or a priced response cannot be metered — fail closed).
+	// The kill goes through the same backend.Kill path as
+	// max_duration_seconds; no parallel kill mechanism exists. The gate has
+	// also tripped itself by this point, so the agent cannot complete
+	// another MCP call even before the kill lands.
+	spendExceeded := make(chan struct{})
+
+	if gate != nil && tracker != nil {
+		var spendOnce sync.Once
+		gate.SetSpendKill(func() {
+			spendOnce.Do(func() {
+				printf("\nconstle: spending limit reached (%s) — stopping agent...\n", tracker.Tripped())
+				close(spendExceeded)
+				backend.Kill(runCtx)
+			})
+		})
+	}
+
 	// The goroutine below is the only place in this process that writes to
 	// stdout from a non-main goroutine. It uses printf (which holds stdoutMu)
 	// for the same reason the main path does: the signal can arrive after the
@@ -423,6 +466,27 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			m.Limits.MaxDurationSeconds, duration)
 		printf("  audit log: %s\n\n", logPath)
 		return fmt.Errorf("agent terminated: duration limit exceeded")
+	default:
+	}
+
+	select {
+	case <-spendExceeded:
+		details := map[string]any{
+			"limit":         string(tracker.Tripped()),
+			"run_total_usd": tracker.RunTotal().USD(),
+			"duration":      duration.String(),
+		}
+		if m.Spending.MaxPerRunUSD != "" {
+			details["max_per_run_usd"] = m.Spending.MaxPerRunUSD
+		}
+		if m.Spending.MaxPerDayUSD != "" {
+			details["max_per_day_usd"] = m.Spending.MaxPerDayUSD
+		}
+		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventTerminatedByLimit, details)
+		printf("⚑ agent terminated: spending limit (%s) exceeded    run_spend=$%s    duration=%s\n",
+			tracker.Tripped(), tracker.RunTotal().USD(), duration)
+		printf("  audit log: %s\n\n", logPath)
+		return fmt.Errorf("agent terminated: spending limit exceeded")
 	default:
 	}
 
@@ -516,6 +580,7 @@ func cmdValidate(agentfilePath string) error {
 
 	printf("\n")
 	warnUnenforcedHumanGates(m)
+	warnUnenforcedSpending(m)
 	warnUnverifiableIdentity(m)
 	return nil
 }
