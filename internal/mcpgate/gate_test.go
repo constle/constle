@@ -85,7 +85,7 @@ func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness 
 		},
 	}
 
-	g, err := New(m, approver, nil, logger)
+	g, err := New(m, approver, nil, logger, nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
