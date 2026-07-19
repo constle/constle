@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/constle/constle/internal/spending"
 	"github.com/constle/constle/pkg/did"
 )
 
@@ -102,7 +103,85 @@ func (m *AgentManifest) Validate() error {
 		return err
 	}
 
+	if err := m.validateSpending(); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// validateSpending checks the spending limits and every mcp.servers pricing
+// block. Amounts must parse exactly (never rounded silently), and a daily
+// cap without a DID fails closed: durable daily tracking is keyed by DID so
+// renaming an agent cannot reset it.
+func (m *AgentManifest) validateSpending() error {
+	s := m.Spending
+
+	for _, f := range []struct{ name, value string }{
+		{"spending.max_per_run_usd", s.MaxPerRunUSD},
+		{"spending.max_per_day_usd", s.MaxPerDayUSD},
+		{"spending.max_per_month_usd", s.MaxPerMonthUSD},
+	} {
+		if f.value == "" {
+			continue
+		}
+		v, err := spending.ParseUSD(f.value)
+		if err != nil {
+			return fmt.Errorf("%s: %v", f.name, err)
+		}
+		if v == 0 {
+			// A zero cap would silently read as "unset" at enforcement time —
+			// ambiguous, so it fails closed here instead.
+			return fmt.Errorf("%s: a cap of 0 is ambiguous — omit the field to leave the limit unset", f.name)
+		}
+	}
+
+	if s.MaxPerDayUSD != "" && m.Identity.DID == "" {
+		return fmt.Errorf(
+			"spending.max_per_day_usd: identity.did is required — daily spend is tracked durably per DID "+
+				"(tracking by name would let a rename reset it); create one with: constle identity create %s",
+			m.Identity.Name)
+	}
+
+	if pct := s.Alerts.WarnAtPctOfDaily; pct != 0 {
+		if pct < 1 || pct > 100 {
+			return fmt.Errorf("spending.alerts.warn_at_pct_of_daily must be between 1 and 100, got %d", pct)
+		}
+		if s.MaxPerDayUSD == "" {
+			return fmt.Errorf("spending.alerts.warn_at_pct_of_daily is set but spending.max_per_day_usd is not — there is no daily cap to warn about")
+		}
+	}
+
+	for _, srv := range m.MCP.Servers {
+		if srv.Pricing == nil {
+			continue
+		}
+		if len(srv.Pricing.Meters) == 0 {
+			return fmt.Errorf("mcp.servers[%s].pricing: meters must not be empty — a pricing block without meters cannot measure anything", srv.ID)
+		}
+		for i, meter := range srv.Pricing.Meters {
+			if _, err := spending.ParsePath(meter.UsagePath); err != nil {
+				return fmt.Errorf("mcp.servers[%s].pricing.meters[%d]: %v", srv.ID, i, err)
+			}
+			if _, err := spending.ParseUSD(meter.USDPerUnit); err != nil {
+				return fmt.Errorf("mcp.servers[%s].pricing.meters[%d].usd_per_unit: %v", srv.ID, i, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// PricedMCPServers returns the ids of MCP servers that declare a pricing
+// block — the servers whose traffic the gate proxy actually meters.
+func (m *AgentManifest) PricedMCPServers() []string {
+	var ids []string
+	for _, srv := range m.MCP.Servers {
+		if srv.Pricing != nil {
+			ids = append(ids, srv.ID)
+		}
+	}
+	return ids
 }
 
 // validateMCP checks the declared MCP servers and, critically, that no

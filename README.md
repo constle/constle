@@ -40,7 +40,7 @@ The result is bespoke, fragile security stitched together per agent — and most
 | **Network isolation** | Agent container has no default gateway. All egress must pass through a proxy that only allows declared hosts. Bypass is architecturally impossible. | ✅ v0.4 |
 | **Max duration** | Agent is forcibly stopped after `max_duration_seconds`. Not a suggestion — the runtime kills it. | ✅ v0.4 |
 | **Audit log** | Every agent run produces a signed JSONL log of actions and network events at `~/.constle/logs/`. | ✅ v0.4 |
-| **Spending limits** | Hard cap per run and per day enforced by the runtime. Agent code cannot exceed them regardless of instructions. | 🔨 v0.5 |
+| **Spending limits** | Hard cap per run and per day enforced by the runtime. Cost is metered at the MCP gate proxy against declared per-server `pricing`; the per-day ledger is durable per DID across runs. Agent code cannot exceed them regardless of instructions. | ✅ v0.5 (priced MCP servers) |
 | **Human gate policies** | Declared MCP servers are reachable only through a protocol-aware gate proxy; tool calls listed in `human_gates.require_approval_for` (exact tool-name match) pause for human approval — deny or timeout provably never reaches the server. | ✅ v0.5 (MCP tool calls) |
 | **Cryptographic identity** | Every agent gets a W3C DID anchored to a human owner. Every action is signed and attributable. | 🔨 v0.5 |
 
@@ -95,8 +95,8 @@ sandbox:
     image: "my-agent:latest"
 
 spending:
-  max_per_run_usd: 0.50
-  max_per_day_usd: 5.00
+  max_per_run_usd: "0.50"
+  max_per_day_usd: "5.00"
 
 limits:
   max_duration_seconds: 300
@@ -143,8 +143,10 @@ capabilities:
     - name: document-reader
 
 spending:
-  max_per_run_usd: 0.50           # enforced by runtime, not agent code
-  max_per_day_usd: 5.00
+  max_per_run_usd: "0.50"         # enforced by runtime, not agent code
+  max_per_day_usd: "5.00"         # durable per-DID ledger across runs
+  # cost is metered at the MCP gate for servers that declare pricing:
+  #   mcp.servers[].pricing.meters: [{usage_path, usd_per_unit}]
 
 limits:
   max_duration_seconds: 300

@@ -124,6 +124,42 @@ type MCPServer struct {
 	// Tools is an optional allowlist of tool names the agent may call on this
 	// server. Empty means every tool passes through (gated tools still gate).
 	Tools []string `yaml:"tools,omitempty"`
+
+	// Pricing declares how much this server's tool calls cost. When set, the
+	// gate proxy meters EVERY tools/call response of this server against the
+	// declared meters and enforces the manifest's spending limits.
+	//
+	// Pricing is deliberately server-wide: a priced server cannot expose an
+	// "unpriced" tool — a tools/call response missing a declared usage value
+	// is a metering failure and kills the run (fail closed), because a server
+	// that could omit its usage field could zero its own bill. To mix free
+	// and priced tools from one upstream, declare its URL twice under two
+	// server ids with disjoint tools allowlists — one priced, one not.
+	Pricing *MCPPricing `yaml:"pricing,omitempty"`
+}
+
+// MCPPricing declares the cost model of one MCP server. Pricing is always
+// declared here by the operator — never guessed or hardcoded per provider —
+// so the metering code stays generic.
+type MCPPricing struct {
+	// Meters is the list of usage counters that make up the cost of one
+	// tools/call response; the response's cost is the sum over all meters.
+	// A list, because real API pricing separates input and output units at
+	// different rates.
+	Meters []PriceMeter `yaml:"meters"`
+}
+
+// PriceMeter prices one usage counter found in the server's responses.
+type PriceMeter struct {
+	// UsagePath locates the usage number inside the full JSON-RPC tools/call
+	// response message: dot-separated segments, a digit segment indexes an
+	// array (e.g. "result.usage.output_tokens"). No wildcards — the path is
+	// an exact, deterministic contract, like human-gate tool-name matching.
+	UsagePath string `yaml:"usage_path"`
+
+	// USDPerUnit is the exact decimal price of one usage unit, as a string
+	// (e.g. "0.000003"). At most 8 decimal places (1e-8 USD resolution).
+	USDPerUnit string `yaml:"usd_per_unit"`
 }
 
 // A2A declares signed agent-to-agent communication with explicitly known
@@ -168,10 +204,35 @@ type A2APeer struct {
 }
 
 // Spending declares cost limits. Empty means the operator sets them at runtime.
+//
+// Enforcement scope: limits are enforced against cost metered at the MCP
+// gate proxy for servers that declare a pricing block. Traffic through
+// generic network.allowed_hosts is NOT metered (Constle refuses to
+// TLS-intercept it), and the CLI warns explicitly whenever limits are
+// declared without priced MCP servers to measure them.
 type Spending struct {
-	MaxPerRunUSD   string `yaml:"max_per_run_usd,omitempty"`
-	MaxPerDayUSD   string `yaml:"max_per_day_usd,omitempty"`
+	// MaxPerRunUSD is the hard cap for a single run. Crossing it trips the
+	// gate and kills the run through the same path as max_duration_seconds.
+	MaxPerRunUSD string `yaml:"max_per_run_usd,omitempty"`
+
+	// MaxPerDayUSD is the hard cap per UTC calendar day, tracked durably
+	// across runs in ~/.constle/spending/<did>/ — it therefore requires
+	// identity.did (keying by name would let a rename reset the tracking).
+	MaxPerDayUSD string `yaml:"max_per_day_usd,omitempty"`
+
+	// MaxPerMonthUSD is parsed but NOT enforced by this version; declaring
+	// it produces an explicit warning.
 	MaxPerMonthUSD string `yaml:"max_per_month_usd,omitempty"`
+
+	Alerts SpendingAlerts `yaml:"alerts,omitempty"`
+}
+
+// SpendingAlerts configures non-blocking spending notifications.
+type SpendingAlerts struct {
+	// WarnAtPctOfDaily writes a one-time spending_limit_reached warning
+	// event to the audit log when the day's total crosses this percentage
+	// of max_per_day_usd. 1–100; requires max_per_day_usd.
+	WarnAtPctOfDaily int `yaml:"warn_at_pct_of_daily,omitempty"`
 }
 
 // Limits defines runtime constraints actively enforced by constle.
