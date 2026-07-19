@@ -105,12 +105,12 @@ _Goal: agents cannot spend more than declared. Limits are enforced by the runtim
 
 - [ ] x402 payment interceptor proxies all outbound HTTP from the sandbox
 - [ ] Per-request cost estimated before the call is allowed through
-- [ ] `max_per_run_usd` hard limit kills the run if exceeded
-- [ ] `max_per_day_usd` tracked persistently across runs
+- [x] `max_per_run_usd` hard limit kills the run if exceeded — cost is metered at the MCP gate proxy against declared per-server `pricing` blocks (no TLS interception of generic `allowed_hosts` traffic, by design); the gate trips so no further call completes, and the run is killed via the same path as `max_duration_seconds`
+- [x] `max_per_day_usd` tracked persistently across runs — append-only, flock-serialized JSONL ledger per DID under `~/.constle/spending/<did>/`, enforced both before start (fail closed) and mid-run
 - [ ] `require_human_approval_above_usd` triggers a human gate
-- [ ] Spending ledger written to `~/.constle/spending.db` (SQLite)
+- [x] Spending ledger (shipped as per-DID JSONL under `~/.constle/spending/`, not SQLite)
 - [ ] `constle spending report` — show spend by agent, day, and month
-- [ ] Alert webhook fired at `warn_at_pct_of_daily` threshold
+- [x] `warn_at_pct_of_daily` threshold — one-time signed `spending_limit_reached` warning event in the audit log (webhook delivery still open)
 
 ---
 
