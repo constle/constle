@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -178,9 +177,9 @@ func teardownFirecrackerRun(st *fcRunState) []string {
 	// alive (its shutdown takes ~2s even with shutdown_lifetime 0):
 	// wait for it to exit, escalate to SIGKILL, and surface survival.
 	if cmdlineMatches(st.SquidPID, "squid", "") {
-		syscall.Kill(st.SquidPID, syscall.SIGTERM)
+		termProcess(st.SquidPID)
 		if !waitProcessGone(st.SquidPID, "squid", 5*time.Second) {
-			syscall.Kill(st.SquidPID, syscall.SIGKILL)
+			killProcess(st.SquidPID)
 			if !waitProcessGone(st.SquidPID, "squid", 2*time.Second) {
 				errs = append(errs, fmt.Sprintf("squid %d still running after SIGKILL", st.SquidPID))
 			}

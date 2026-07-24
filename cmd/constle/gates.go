@@ -40,14 +40,18 @@ func warnUnenforcedHumanGates(m *manifest.AgentManifest) {
 		return
 	}
 
+	lines := []string{
+		"⚠️  warning: some human_gates entries are NOT enforced:",
+		"   these require_approval_for entries match no tool on any declared MCP server",
+		fmt.Sprintf("   and will run WITHOUT approval: %s", strings.Join(unenforced, ", ")),
+	}
+	if len(m.MCP.Servers) == 0 {
+		lines = append(lines,
+			"   (no mcp.servers are declared — gates are enforced on MCP tool calls,",
+			"   matched by exact tool name)")
+	}
+
 	stdoutMu.Lock()
 	defer stdoutMu.Unlock()
-	fmt.Fprintln(gatesWarnOut, "⚠️  warning: some human_gates entries are NOT enforced:")
-	fmt.Fprintln(gatesWarnOut, "   these require_approval_for entries match no tool on any declared MCP server")
-	fmt.Fprintf(gatesWarnOut, "   and will run WITHOUT approval: %s\n", strings.Join(unenforced, ", "))
-	if len(m.MCP.Servers) == 0 {
-		fmt.Fprintln(gatesWarnOut, "   (no mcp.servers are declared — gates are enforced on MCP tool calls,")
-		fmt.Fprintln(gatesWarnOut, "   matched by exact tool name)")
-	}
-	fmt.Fprintln(gatesWarnOut)
+	warnBlock(gatesWarnOut, lines)
 }

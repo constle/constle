@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/constle/constle/internal/homedir"
@@ -19,10 +18,13 @@ import (
 // daily total (like the deliberately per-run A2A replay guard) would reset
 // on every exit and enforce nothing.
 //
-// Concurrency: every read and append holds a flock on the day file, and
-// Append recomputes the day total from the file while still holding the
+// Concurrency: every read and append holds an advisory lock on the day file,
+// and Append recomputes the day total from the file while still holding the
 // lock — so two runs of the same DID charging at the same moment serialize,
-// and both observe a total that includes the other's charges.
+// and both observe a total that includes the other's charges. The lock
+// primitive is OS-specific (flock(2) on unix, LockFileEx on Windows) and lives
+// behind build-tagged files store_unix.go / store_windows.go — never call a
+// platform syscall directly here.
 type DailyStore struct {
 	dir string
 	did string
@@ -96,10 +98,10 @@ func (s *DailyStore) TodayTotal() (MicroCents, error) {
 	}
 	defer f.Close()
 
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_SH); err != nil {
+	if err := lockShared(f); err != nil {
 		return 0, fmt.Errorf("cannot lock spending ledger: %w", err)
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	defer unlockFile(f)
 
 	return sumLedger(f)
 }
@@ -125,10 +127,10 @@ func (s *DailyStore) Append(runID, serverID string, amount MicroCents) (dayTotal
 		return 0, fmt.Errorf("cannot restore spending ledger ownership: %w", err)
 	}
 
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	if err := lockExclusive(f); err != nil {
 		return 0, fmt.Errorf("cannot lock spending ledger: %w", err)
 	}
-	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	defer unlockFile(f)
 
 	line, err := json.Marshal(ledgerRecord{
 		TS:         time.Now().UTC(),

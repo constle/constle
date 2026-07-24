@@ -142,70 +142,60 @@ func parseRunArgs(args []string) (agentfile, backendOverride string, err error) 
 }
 
 func cmdRun(agentfilePath, backendOverride string) error {
-	printf("\nconstle v%s\n\n", constleVersion)
+	printHeader()
 
-	printStep("parsing %s", agentfilePath)
+	// Parsing is transient in styled mode: a self-clearing spinner that leaves
+	// no permanent row before the summary (density). Plain mode keeps its exact
+	// two-line step/ok output for byte-identical piped/captured output.
+	var pSpin *spinner
+	if styled {
+		pSpin = startSpinner("parsing %s", prettyPath(agentfilePath))
+	} else {
+		printStep("parsing %s", agentfilePath)
+	}
 
 	m, err := manifest.ParseFile(agentfilePath)
 	if err != nil {
+		if pSpin != nil {
+			pSpin.stopClear()
+		}
 		return fmt.Errorf("cannot parse Agentfile: %w", err)
 	}
 	if err := m.Validate(); err != nil {
+		if pSpin != nil {
+			pSpin.stopClear()
+		}
 		return fmt.Errorf("invalid Agentfile: %w", err)
 	}
-	printOK("Agentfile valid")
+	if pSpin != nil {
+		pSpin.stopClear()
+	} else {
+		printOK("Agentfile valid")
+	}
 
-	printf("     agent:     %s v%s\n", m.Identity.Name, m.Identity.Version)
-	printf("     isolation: %s\n", m.Sandbox.Isolation)
-	printf("     memory:    %dMB\n", m.Sandbox.MemoryMB)
-	if len(m.Sandbox.Network.AllowedHosts) > 0 {
-		printf("     network:   restricted → %s\n",
-			strings.Join(m.Sandbox.Network.AllowedHosts, ", "))
+	if styled {
+		renderRunSummary(m)
+	} else {
+		printRunSummaryPlain(m)
 	}
-	if m.Limits.MaxDurationSeconds > 0 {
-		printf("     max_duration: %ds\n", m.Limits.MaxDurationSeconds)
-	}
-	if m.Spending.MaxPerRunUSD != "" || m.Spending.MaxPerDayUSD != "" {
-		var caps []string
-		if m.Spending.MaxPerRunUSD != "" {
-			caps = append(caps, "run≤$"+m.Spending.MaxPerRunUSD)
-		}
-		if m.Spending.MaxPerDayUSD != "" {
-			caps = append(caps, "day≤$"+m.Spending.MaxPerDayUSD)
-		}
-		scope := "NOT ENFORCED — no priced MCP servers"
-		if priced := m.PricedMCPServers(); len(priced) > 0 {
-			scope = "metered at the MCP gate: " + strings.Join(priced, ", ")
-		}
-		printf("     spending:  %s (%s)\n", strings.Join(caps, ", "), scope)
-	}
-	if len(m.MCP.Servers) > 0 {
-		ids := make([]string, len(m.MCP.Servers))
-		for i, srv := range m.MCP.Servers {
-			ids[i] = srv.ID
-		}
-		printf("     mcp:       %s (via gate proxy)\n", strings.Join(ids, ", "))
-	}
-	if len(m.A2A.Peers) > 0 {
-		names := make([]string, len(m.A2A.Peers))
-		for i, p := range m.A2A.Peers {
-			names[i] = p.Name
-		}
-		printf("     a2a:       %s (signed via host gate)\n", strings.Join(names, ", "))
-	}
-	printf("\n")
 
 	warnUnenforcedHumanGates(m)
 	warnUnenforcedSpending(m)
 
-	printStep("detecting backend")
+	// Setup phase — collapses to a single settled line in styled mode; in plain
+	// mode each step keeps its own → / ✓ line. fail() (deferred) clears the
+	// collapsing line on any early error return; it is a no-op once settled.
+	setup := newSetup()
+	defer setup.fail()
+
+	setup.step("detecting backend")
 
 	backend, backendType, err := sandbox.DetectBestBackend(m.Sandbox.Isolation, backendOverride)
 	if err != nil {
 		return err
 	}
-	printOK("backend: %s", backendType)
-	printf("\n")
+	setup.ok("backend: %s", backendType)
+	setup.gap()
 
 	logPath := audit.DefaultLogPath(m.Identity.Name)
 
@@ -217,6 +207,11 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	// the A2A gate below.
 	var runIdentity *identity.Identity
 	var logger *audit.Logger
+	// identityNote holds the styled identity line, printed once after the setup
+	// phase settles so it does not interrupt the collapsing line. It is a
+	// security fact (signed, hash-chained audit log), so it stays visible —
+	// just de-emphasized to a single dim line rather than a two-line block.
+	var identityNote string
 	if m.Identity.DID != "" {
 		runIdentity, err = loadRunIdentity(m)
 		if err != nil {
@@ -226,8 +221,12 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		if err != nil {
 			return fmt.Errorf("cannot open signed audit log: %w", err)
 		}
-		printOK("identity: %s", runIdentity.DID())
-		printf("     audit log entries are Ed25519-signed and hash-chained\n\n")
+		if styled {
+			identityNote = fmt.Sprintf("identity %s  ∙  audit log signed (Ed25519, hash-chained)", runIdentity.DID())
+		} else {
+			printOK("identity: %s", runIdentity.DID())
+			printf("     audit log entries are Ed25519-signed and hash-chained\n\n")
+		}
 	} else {
 		var err error
 		logger, err = audit.New(logPath)
@@ -304,22 +303,35 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	}
 
 	// DockerBackend.Start() silently removes any abandoned constle containers
-	// (exited/dead state) before allocating new resources.
-	printStep("starting sandbox...")
+	// (exited/dead state) before allocating new resources. This is the same
+	// collapsing line as the setup steps above (styled) — it settles below.
+	setup.step("starting sandbox...")
 
 	startTime := time.Now()
 
 	runCtx, err := backend.Start(m)
 	if err != nil {
+		// setup.fail() (deferred) clears the collapsing line.
 		logger.Log("", m.Identity.Name, audit.EventRunFailed,
 			map[string]any{"error": err.Error()})
 		return fmt.Errorf("cannot start sandbox: %w", err)
 	}
 
+	// runSucceeded is set true only on the clean exit-0 path (the final success
+	// return, below). The deferred teardown closure reads it to decide how loud
+	// to be: on SUCCESS the teardown collapses (styled self-clearing spinners)
+	// so the outcome pill stays the last word; on any FAILURE it renders the
+	// permanent ✓ lines instead — full visibility is more useful for debugging a
+	// failed run than the compact treatment.
+	var runSucceeded bool
+
 	// Squid logs must be read before Stop() removes the proxy container
-	// (Docker) or the run directory (Firecracker).
+	// (Docker) or the run directory (Firecracker). Teardown is secondary on a
+	// clean run, but diagnostic on a failed one; plain mode always keeps its
+	// permanent ✓ lines, byte-for-byte unchanged. A teardown that itself errors
+	// always surfaces on stderr, regardless of outcome or styling.
 	defer func() {
-		printStep("reading network audit logs...")
+		nlSpin := startSpinner("reading network audit logs...")
 		var flushErr error
 		if runCtx.SquidAccessLog != "" {
 			flushErr = audit.FlushSquidLogFile(runCtx.RunID, m.Identity.Name, runCtx.SquidAccessLog, logger)
@@ -327,17 +339,25 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			flushErr = audit.FlushSquidLogs(runCtx.RunID, m.Identity.Name, runCtx.ProxyContainerID, logger)
 		}
 		if flushErr != nil {
+			nlSpin.stopClear()
 			fmt.Fprintf(os.Stderr, "  warning: could not read network logs: %v\n", flushErr)
+		} else if styled && runSucceeded {
+			nlSpin.stopClear()
 		} else {
-			printOK("network events logged")
+			nlSpin.ok("network events logged")
 		}
 
-		printf("\n")
-		printStep("cleaning up sandbox...")
+		if !styled || !runSucceeded {
+			printf("\n")
+		}
+		cuSpin := startSpinner("cleaning up sandbox...")
 		if err := backend.Stop(runCtx); err != nil {
+			cuSpin.stopClear()
 			fmt.Fprintf(os.Stderr, "  warning: cleanup error: %v\n", err)
+		} else if styled && runSucceeded {
+			cuSpin.stopClear()
 		} else {
-			printOK("sandbox removed")
+			cuSpin.ok("sandbox removed")
 		}
 	}()
 
@@ -351,7 +371,20 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		},
 	)
 
-	printOK("sandbox started (run_id: %s)", runCtx.RunID)
+	// Settle the collapsing setup line to one permanent row (styled), or print
+	// the exact "sandbox started (run_id: …)" ✓ line (plain).
+	// Full run_id on the persistent settled line — this is the live line during
+	// execution, exactly when a second terminal would need it for `constle stop`.
+	// The post-run footer keeps a short handle (correlation only).
+	setup.settle(
+		fmt.Sprintf("sandbox ready  ∙  %s  ∙  run %s", backendType, runCtx.RunID),
+		"sandbox started (run_id: %s)", runCtx.RunID)
+
+	// The signed-identity note (styled) rides just under the settled setup line
+	// as one dim row — security fact kept, de-emphasized.
+	if identityNote != "" {
+		printf("%s%s\n", indent, stVer.Render(identityNote))
+	}
 
 	// The public A2A listener starts only after the sandbox is up: the gate
 	// already carries the run id (set at Bind, mid-Start), so every inbound
@@ -439,19 +472,35 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		}()
 	}
 
-	printf("\n  ┌─ agent output ──────────────────────────\n")
+	// Non-TTY draws the top border before Wait (streaming frame); the styled
+	// path renders one solid panel after logs are collected. Byte output on
+	// the non-TTY path is unchanged.
+	if !styled {
+		printf("\n  ┌─ agent output ──────────────────────────\n")
+	}
 
 	exitCode, waitErr := backend.Wait(runCtx)
 
+	var agentLines []string
 	if logs, logsErr := backend.Logs(runCtx); logsErr == nil && len(logs) > 0 {
 		for _, line := range strings.Split(strings.TrimSpace(string(logs)), "\n") {
 			if line != "" {
-				printf("  │ %s\n", line)
+				if styled {
+					agentLines = append(agentLines, line)
+				} else {
+					printf("  │ %s\n", line)
+				}
 			}
 		}
 	}
 
-	printf("  └─────────────────────────────────────────\n\n")
+	if styled {
+		printf("\n")
+		renderAgentOutput("agent output", agentLines)
+		printf("\n")
+	} else {
+		printf("  └─────────────────────────────────────────\n\n")
+	}
 
 	duration := time.Since(startTime).Round(time.Millisecond)
 
@@ -462,9 +511,11 @@ func cmdRun(agentfilePath, backendOverride string) error {
 				"limit_seconds": m.Limits.MaxDurationSeconds,
 				"duration":      duration.String(),
 			})
-		printf("⚑ agent terminated: duration limit (%ds) exceeded    duration=%s\n",
-			m.Limits.MaxDurationSeconds, duration)
-		printf("  audit log: %s\n\n", logPath)
+		finalStatus(stKindFail,
+			fmt.Sprintf("⚑ agent terminated: duration limit (%ds) exceeded    duration=%s", m.Limits.MaxDurationSeconds, duration),
+			"terminated",
+			fmt.Sprintf("duration limit %ds exceeded", m.Limits.MaxDurationSeconds),
+			logPath, runCtx.RunID, duration)
 		return fmt.Errorf("agent terminated: duration limit exceeded")
 	default:
 	}
@@ -483,9 +534,11 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			details["max_per_day_usd"] = m.Spending.MaxPerDayUSD
 		}
 		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventTerminatedByLimit, details)
-		printf("⚑ agent terminated: spending limit (%s) exceeded    run_spend=$%s    duration=%s\n",
-			tracker.Tripped(), tracker.RunTotal().USD(), duration)
-		printf("  audit log: %s\n\n", logPath)
+		finalStatus(stKindFail,
+			fmt.Sprintf("⚑ agent terminated: spending limit (%s) exceeded    run_spend=$%s    duration=%s", tracker.Tripped(), tracker.RunTotal().USD(), duration),
+			"terminated",
+			fmt.Sprintf("spending cap  ∙  $%s", tracker.RunTotal().USD()),
+			logPath, runCtx.RunID, duration)
 		return fmt.Errorf("agent terminated: spending limit exceeded")
 	default:
 	}
@@ -499,8 +552,11 @@ func cmdRun(agentfilePath, backendOverride string) error {
 				"reason":   "human_gate_timeout_abort",
 				"duration": duration.String(),
 			})
-		printf("⚑ agent terminated: human gate timed out without approval (on_timeout: abort)    duration=%s\n", duration)
-		printf("  audit log: %s\n\n", logPath)
+		finalStatus(stKindFail,
+			fmt.Sprintf("⚑ agent terminated: human gate timed out without approval (on_timeout: abort)    duration=%s", duration),
+			"terminated",
+			"human gate timeout",
+			logPath, runCtx.RunID, duration)
 		return fmt.Errorf("agent terminated: human gate timed out without approval")
 	default:
 	}
@@ -512,8 +568,11 @@ func cmdRun(agentfilePath, backendOverride string) error {
 				"reason":   "stopped_by_user",
 				"duration": duration.String(),
 			})
-		printf("⚑ agent stopped by user    duration=%s\n", duration)
-		printf("  audit log: %s\n\n", logPath)
+		finalStatus(stKindStop,
+			fmt.Sprintf("⚑ agent stopped by user    duration=%s", duration),
+			"stopped",
+			"by user",
+			logPath, runCtx.RunID, duration)
 		return nil
 	default:
 	}
@@ -524,8 +583,11 @@ func cmdRun(agentfilePath, backendOverride string) error {
 				"exit_code": exitCode,
 				"duration":  duration.String(),
 			})
-		printf("✗ run failed    exit=%d    duration=%s\n", exitCode, duration)
-		printf("  audit log: %s\n\n", logPath)
+		finalStatus(stKindFail,
+			fmt.Sprintf("✗ run failed    exit=%d    duration=%s", exitCode, duration),
+			"failed",
+			fmt.Sprintf("exit %d", exitCode),
+			logPath, runCtx.RunID, duration)
 		return fmt.Errorf("agent exited with code %d", exitCode)
 	}
 
@@ -534,10 +596,145 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			"exit_code": 0,
 			"duration":  duration.String(),
 		})
-	printf("✓ run finished    exit=0    duration=%s\n", duration)
-	printf("  audit log: %s\n\n", logPath)
+	finalStatus(stKindOK,
+		fmt.Sprintf("✓ run finished    exit=0    duration=%s", duration),
+		"done",
+		"exit 0",
+		logPath, runCtx.RunID, duration)
 
+	// Clean exit only: lets the deferred teardown collapse/silence on success
+	// while every failure path (which returns above) keeps it visible.
+	runSucceeded = true
 	return nil
+}
+
+// finalStatus prints the run outcome. Styled: the one bold moment — a solid
+// filled pill (high-contrast so it stays visible on any dark theme) with the
+// outcome fact beside it, over a dim dot-separated footer of secondary meta
+// (audit-log path ∙ run id ∙ duration) that is deliberately de-emphasized
+// below the pill (the taste reference's footer-line convention). Non-TTY: the
+// exact two lines (status + audit log) constle has always printed — the `plain`
+// argument is emitted verbatim, so captured output stays byte-identical.
+func finalStatus(kind statusKind, plain, label, meta, auditPath, runID string, dur time.Duration) {
+	if !styled {
+		printf("%s\n", plain)
+		printf("  audit log: %s\n\n", auditPath)
+		return
+	}
+	initStyles()
+	line := indent + pill(strings.ToUpper(label), kind)
+	if meta != "" {
+		line += "  " + stMuted.Render(meta)
+	}
+	printf("%s\n", line)
+
+	foot := []string{"audit " + prettyPath(auditPath)}
+	if runID != "" {
+		foot = append(foot, "run "+shortID(runID))
+	}
+	if dur > 0 {
+		foot = append(foot, dur.Round(100*time.Millisecond).String())
+	}
+	printf("%s%s\n\n", indent, stVer.Render(strings.Join(foot, "  ∙  ")))
+}
+
+// summaryCaps builds the spending-cap string and its enforcement scope,
+// shared by the plain and styled run-summary renderers.
+func summaryCaps(m *manifest.AgentManifest) (capsStr, scope string) {
+	var caps []string
+	if m.Spending.MaxPerRunUSD != "" {
+		caps = append(caps, "run≤$"+m.Spending.MaxPerRunUSD)
+	}
+	if m.Spending.MaxPerDayUSD != "" {
+		caps = append(caps, "day≤$"+m.Spending.MaxPerDayUSD)
+	}
+	scope = "NOT ENFORCED — no priced MCP servers"
+	if priced := m.PricedMCPServers(); len(priced) > 0 {
+		scope = "metered at the MCP gate: " + strings.Join(priced, ", ")
+	}
+	return strings.Join(caps, ", "), scope
+}
+
+func mcpIDs(m *manifest.AgentManifest) []string {
+	ids := make([]string, len(m.MCP.Servers))
+	for i, srv := range m.MCP.Servers {
+		ids[i] = srv.ID
+	}
+	return ids
+}
+
+func a2aNames(m *manifest.AgentManifest) []string {
+	names := make([]string, len(m.A2A.Peers))
+	for i, p := range m.A2A.Peers {
+		names[i] = p.Name
+	}
+	return names
+}
+
+// printRunSummaryPlain is the non-TTY run-summary block. It reproduces the
+// exact bytes constle has always emitted — do not restyle this path.
+func printRunSummaryPlain(m *manifest.AgentManifest) {
+	printf("     agent:     %s v%s\n", m.Identity.Name, m.Identity.Version)
+	printf("     isolation: %s\n", m.Sandbox.Isolation)
+	printf("     memory:    %dMB\n", m.Sandbox.MemoryMB)
+	if len(m.Sandbox.Network.AllowedHosts) > 0 {
+		printf("     network:   restricted → %s\n",
+			strings.Join(m.Sandbox.Network.AllowedHosts, ", "))
+	}
+	if m.Limits.MaxDurationSeconds > 0 {
+		printf("     max_duration: %ds\n", m.Limits.MaxDurationSeconds)
+	}
+	if m.Spending.MaxPerRunUSD != "" || m.Spending.MaxPerDayUSD != "" {
+		capsStr, scope := summaryCaps(m)
+		printf("     spending:  %s (%s)\n", capsStr, scope)
+	}
+	if len(m.MCP.Servers) > 0 {
+		printf("     mcp:       %s (via gate proxy)\n", strings.Join(mcpIDs(m), ", "))
+	}
+	if len(m.A2A.Peers) > 0 {
+		printf("     a2a:       %s (signed via host gate)\n", strings.Join(a2aNames(m), ", "))
+	}
+	printf("\n")
+}
+
+// renderRunSummary draws the styled run summary (TTY only): a focal agent
+// identity line followed by aligned dim-label / bright-value rows. No box — a
+// near-navy fill is invisible on a typical near-black terminal, and flagship
+// CLIs stay typographic here. Long values simply extend; nothing is boxed, so
+// nothing wraps to a naked continuation.
+func renderRunSummary(m *manifest.AgentManifest) {
+	initStyles()
+	printf("\n")
+	subjectLine(m.Identity.Name, m.Identity.Version)
+
+	rows := []kv{
+		{"isolation", stInk.Render(string(m.Sandbox.Isolation))},
+		{"memory", stInk.Render(fmt.Sprintf("%d MB", m.Sandbox.MemoryMB))},
+	}
+	if len(m.Sandbox.Network.AllowedHosts) > 0 {
+		rows = append(rows, kv{"network", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", ")) + stMuted.Render("  ∙  restricted")})
+	}
+	if m.Limits.MaxDurationSeconds > 0 {
+		rows = append(rows, kv{"timeout", stInk.Render(fmt.Sprintf("%ds", m.Limits.MaxDurationSeconds))})
+	}
+	if m.Spending.MaxPerRunUSD != "" || m.Spending.MaxPerDayUSD != "" {
+		capsStr, scope := summaryCaps(m)
+		val := stInk.Render(capsStr)
+		if strings.HasPrefix(scope, "NOT ENFORCED") {
+			val += stAmber.Render("  ∙  not enforced")
+		} else {
+			val += stMuted.Render("  ∙  metered")
+		}
+		rows = append(rows, kv{"spending", val})
+	}
+	if len(m.MCP.Servers) > 0 {
+		rows = append(rows, kv{"mcp", stInk.Render(strings.Join(mcpIDs(m), ", ")) + stMuted.Render("  ∙  via gate")})
+	}
+	if len(m.A2A.Peers) > 0 {
+		rows = append(rows, kv{"a2a", stInk.Render(strings.Join(a2aNames(m), ", ")) + stMuted.Render("  ∙  signed")})
+	}
+	renderSummaryRows(rows)
+	printf("\n")
 }
 
 func cmdValidate(agentfilePath string) error {
@@ -549,6 +746,20 @@ func cmdValidate(agentfilePath string) error {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
+	if styled {
+		renderValidateStyled(agentfilePath, m)
+	} else {
+		printValidatePlain(agentfilePath, m)
+	}
+
+	warnUnenforcedHumanGates(m)
+	warnUnenforcedSpending(m)
+	warnUnverifiableIdentity(m)
+	return nil
+}
+
+// printValidatePlain is the non-TTY validate output — exact bytes, unchanged.
+func printValidatePlain(agentfilePath string, m *manifest.AgentManifest) {
 	printf("✓ %s is valid\n\n", agentfilePath)
 	printf("  name:        %s\n", m.Identity.Name)
 	printf("  version:     %s\n", m.Identity.Version)
@@ -579,10 +790,36 @@ func cmdValidate(agentfilePath string) error {
 	}
 
 	printf("\n")
-	warnUnenforcedHumanGates(m)
-	warnUnenforcedSpending(m)
-	warnUnverifiableIdentity(m)
-	return nil
+}
+
+// renderValidateStyled is the TTY validate output, matching the run aesthetic:
+// a green confirmation, the agent identity, then aligned detail rows.
+func renderValidateStyled(agentfilePath string, m *manifest.AgentManifest) {
+	initStyles()
+	printf("\n%s%s %s%s\n\n", indent, stGreen.Render("✓"),
+		stInk.Render(prettyPath(agentfilePath)), stMuted.Render(" is valid"))
+	subjectLine(m.Identity.Name, m.Identity.Version)
+
+	var rows []kv
+	if m.Identity.DID != "" {
+		rows = append(rows, kv{"did", stInk.Render(m.Identity.DID)})
+	}
+	rows = append(rows,
+		kv{"isolation", stInk.Render(string(m.Sandbox.Isolation)) + stMuted.Render("  ∙  inferred")},
+		kv{"image", stInk.Render(m.Sandbox.Image)},
+		kv{"memory", stInk.Render(fmt.Sprintf("%d MB", m.Sandbox.MemoryMB))},
+	)
+	if len(m.Sandbox.Network.AllowedHosts) > 0 {
+		rows = append(rows, kv{"allowed", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", "))})
+	}
+	if gates := manifest.InferRequiredGates(m.Capabilities); len(gates) > 0 {
+		rows = append(rows, kv{"human gates", stInk.Render(strings.Join(gates, ", ")) + stMuted.Render("  ∙  by spec")})
+	}
+	if enforced, _ := m.EnforcedGateEntries(); len(enforced) > 0 {
+		rows = append(rows, kv{"enforced", stInk.Render(strings.Join(enforced, ", ")) + stMuted.Render("  ∙  at gate")})
+	}
+	renderSummaryRows(rows)
+	printf("\n")
 }
 
 // ============================================================
@@ -590,6 +827,10 @@ func cmdValidate(agentfilePath string) error {
 // ============================================================
 
 func printHelp() {
+	if styled {
+		printStyledHelp()
+		return
+	}
 	fmt.Printf(`constle v%s — AI agent runtime
 
 usage:
@@ -618,11 +859,23 @@ docs: https://constle.dev
 }
 
 func printStep(format string, args ...any) {
-	printf("  → "+format+"\n", args...)
+	msg := fmt.Sprintf(format, args...)
+	if !styled {
+		printf("  → %s\n", msg)
+		return
+	}
+	initStyles()
+	printf("%s%s %s\n", indent, stMuted.Render("→"), stMuted.Render(msg))
 }
 
 func printOK(format string, args ...any) {
-	printf("  ✓ "+format+"\n", args...)
+	msg := fmt.Sprintf(format, args...)
+	if !styled {
+		printf("  ✓ %s\n", msg)
+		return
+	}
+	initStyles()
+	printf("%s%s %s\n", indent, stGreen.Render("✓"), stInk.Render(msg))
 }
 
 func die(format string, args ...any) {
