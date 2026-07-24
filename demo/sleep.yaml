@@ -1,0 +1,5 @@
+apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity: { name: worker, version: "1.0.0" }
+sandbox: { image: alpine:latest, command: ["sh","-c","echo working; sleep 120"], network: { egress: none } }
+capabilities: []

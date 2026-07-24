@@ -73,10 +73,7 @@ func warnUnenforcedSpending(m *manifest.AgentManifest) {
 
 	stdoutMu.Lock()
 	defer stdoutMu.Unlock()
-	for _, l := range lines {
-		fmt.Fprintln(spendingWarnOut, l)
-	}
-	fmt.Fprintln(spendingWarnOut)
+	warnBlock(spendingWarnOut, lines)
 }
 
 // buildSpendingTracker builds the run's spending tracker, or nil when no
