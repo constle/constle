@@ -149,13 +149,16 @@ func warnUnverifiableIdentity(m *manifest.AgentManifest) {
 		return
 	}
 
+	lines := []string{
+		"⚠️  warning: identity.did is declared but NOT usable on this machine:",
+		fmt.Sprintf("   no matching local private key for agent %q — audit log signing would", m.Identity.Name),
+		"   silently be a lie, so 'constle run' will refuse to start this agent here.",
+		fmt.Sprintf("   create the identity with: constle identity create %s", m.Identity.Name),
+	}
+
 	stdoutMu.Lock()
 	defer stdoutMu.Unlock()
-	fmt.Fprintln(identityWarnOut, "⚠️  warning: identity.did is declared but NOT usable on this machine:")
-	fmt.Fprintf(identityWarnOut, "   no matching local private key for agent %q — audit log signing would\n", m.Identity.Name)
-	fmt.Fprintln(identityWarnOut, "   silently be a lie, so 'constle run' will refuse to start this agent here.")
-	fmt.Fprintf(identityWarnOut, "   create the identity with: constle identity create %s\n", m.Identity.Name)
-	fmt.Fprintln(identityWarnOut)
+	warnBlock(identityWarnOut, lines)
 }
 
 // cmdAuditVerify implements `constle audit verify <logfile>`: it checks every
