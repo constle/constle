@@ -1,0 +1,5 @@
+apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity: { name: fail-demo, version: "0.1.0" }
+sandbox: { image: alpine:latest, command: ["sh","-c","echo 'starting work'; echo 'oops' >&2; exit 1"], network: { egress: none } }
+capabilities: []

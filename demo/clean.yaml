@@ -1,0 +1,8 @@
+apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity: { name: clean-demo, version: "1.0.0" }
+sandbox:
+  image: alpine:latest
+  command: ["sh","-c","echo 'fetching data from api'; echo 'analysis complete: 3 findings'; echo 'writing report'"]
+  network: { egress: restricted, allowed_hosts: ["api.groq.com","arxiv.org"] }
+capabilities: [external_api]

@@ -36,9 +36,19 @@ func runPS() error {
 	rows := append(dockerPSRows(), firecrackerPSRows()...)
 
 	if len(rows) == 0 {
+		if styled {
+			initStyles()
+			printf("\n%s%s\n", indent, stMuted.Render("no agents running"))
+			printf("%s%s\n\n", indent, stVer.Render("constle run <agentfile>   to start one"))
+			return nil
+		}
 		fmt.Println("No agents found.")
 		fmt.Println("Tip: constle run <agentfile>")
 		return nil
+	}
+
+	if styled {
+		return renderPSStyled(rows)
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
@@ -55,6 +65,50 @@ func runPS() error {
 	}
 
 	return w.Flush()
+}
+
+// renderPSStyled prints the `ps` table with aligned columns, a dim header, and
+// a status coloured by liveness (TTY only). run IDs are shortened to 12 chars.
+func renderPSStyled(rows []psRow) error {
+	initStyles()
+	// Truncated run IDs get an ellipsis so a shortened ID never *looks* like a
+	// complete one — copy-pasting a silently-cut ID into `constle stop` would
+	// target nothing. This mirrors the plain path's "..." convention.
+	shortID := func(id string) string {
+		if len(id) > 12 {
+			return id[:12] + "…"
+		}
+		return id
+	}
+	// Widths are measured in runes (not bytes): the "…" is one column but three
+	// UTF-8 bytes, and padr() pads by rune count — so a byte-based width would
+	// over-pad the RUN ID column. status/agent may also hold non-ASCII.
+	runeLen := func(s string) int { return len([]rune(s)) }
+	idW, nameW, stW := len("RUN ID"), len("AGENT"), len("STATUS")
+	for _, r := range rows {
+		if l := runeLen(shortID(r.runID)); l > idW {
+			idW = l
+		}
+		if l := runeLen(r.agentName); l > nameW {
+			nameW = l
+		}
+		if l := runeLen(r.status); l > stW {
+			stW = l
+		}
+	}
+	const gap = "   "
+	printf("\n%s%s\n", indent, stMuted.Render(
+		padr("RUN ID", idW)+gap+padr("AGENT", nameW)+gap+padr("STATUS", stW)+gap+"DURATION"))
+	for _, r := range rows {
+		status := styledStatus(r.status) + strings.Repeat(" ", stW-runeLen(r.status))
+		printf("%s%s%s%s%s%s%s%s\n", indent,
+			stInk.Render(padr(shortID(r.runID), idW)), gap,
+			stInk.Render(padr(r.agentName, nameW)), gap,
+			status, gap,
+			stMuted.Render(r.duration))
+	}
+	printf("\n")
+	return nil
 }
 
 // dockerPSRows lists constle-managed Docker containers. An unreachable

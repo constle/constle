@@ -3,7 +3,6 @@ package sandbox
 import (
 	"os"
 	"os/exec"
-	"syscall"
 	"testing"
 )
 
@@ -36,7 +35,7 @@ func TestTeardownKillsHostSquid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("startHostSquid: %v", err)
 	}
-	defer syscall.Kill(pid, syscall.SIGKILL) // last-resort cleanup on failure
+	defer killProcess(pid) // last-resort cleanup on failure
 
 	if !cmdlineMatches(pid, "squid", "") {
 		t.Fatalf("freshly started squid (pid %d) not recognized by cmdlineMatches", pid)
