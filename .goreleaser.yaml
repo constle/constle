@@ -109,7 +109,7 @@ checksum:
 # ---------------------------------------------------------------------------
 # goreleaser release --snapshot --clean
 snapshot:
-  version_template: "{{ .Tag }}-dev"
+  version_template: "{{ .Version }}-dev"
 
 # ---------------------------------------------------------------------------
 # Changelog — auto-generated from git commits
