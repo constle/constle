@@ -2,30 +2,29 @@
 
 **An open enforcement standard for AI agents.**
 
-Constle sits between your infrastructure and your agent's code. It doesn't ask an agent to behave — it makes certain things physically impossible, and cuts the run the moment a declared limit is crossed, no matter what the agent was told to do.
+Constle sits between your infrastructure and your agent's code. It doesn't ask an agent to behave - it makes certain things physically impossible, and cuts the run the moment a declared limit is crossed, no matter what the agent was told to do.
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go 1.26+](https://img.shields.io/badge/go-1.26+-00ADD8.svg)](https://golang.org)
 [![Release](https://img.shields.io/github/v/release/constle/constle)](https://github.com/constle/constle/releases)
 [![Build](https://github.com/constle/constle/actions/workflows/release.yaml/badge.svg)](https://github.com/constle/constle/actions)
 
-This is real output, not a mockup:
 
 ```
 $ constle run invoice-processor.yaml
 ...
-constle: spending limit reached (max_per_run_usd) — stopping agent...
+constle: spending limit reached (max_per_run_usd) - stopping agent...
 ⚑ agent terminated: spending limit (max_per_run_usd) exceeded    run_spend=$0.52    duration=41s
   audit log: ~/.constle/logs/2026-07-26-invoice-processor.jsonl
 ```
 
-The agent didn't choose to stop. The runtime stopped it, at the exact moment the ledger crossed the cap declared in the manifest — regardless of what the agent's own code, prompt, or model output said to do next.
+The agent didn't choose to stop. The runtime stopped it, at the exact moment the ledger crossed the cap declared in the manifest - regardless of what the agent's own code, prompt, or model output said to do next.
 
 ---
 
 ## Why this exists
 
-An agent that reads email, calls APIs, or moves money is running code you didn't fully audit, on inputs you don't control. By default it inherits every permission the process around it has: every file, every credential, unlimited spend on any connected account. If a document it reads contains a hidden instruction, it has no way to know that — following instructions is the whole job.
+An agent that reads email, calls APIs, or moves money is running code you didn't fully audit, on inputs you don't control. By default it inherits every permission the process around it has: every file, every credential, unlimited spend on any connected account. If a document it reads contains a hidden instruction, it has no way to know that - following instructions is the whole job.
 
 Constle exists to make four things true regardless of what the agent decides to do:
 
@@ -48,12 +47,12 @@ Constle exists to make four things true regardless of what the agent decides to 
 | **Cryptographic identity** | A W3C `did:key` identity (Ed25519) binds an agent to a human owner and signs its audit trail. `constle run` fails closed if a declared DID has no matching local key. | Shipped |
 | **Agent-to-agent messaging** | Agents exchange signed messages with declared peers only; anything outside the allowlist is rejected before it's sent. | Shipped |
 
-Constle is **not** a framework — it doesn't decide how an agent reasons or plans. LangGraph, CrewAI, or hand-rolled code all run inside Constle unchanged.
+Constle is **not** a framework - it doesn't decide how an agent reasons or plans. LangGraph, CrewAI, or hand-rolled code all run inside Constle unchanged.
 
-Here's the same enforcement on the approval side — an agent tries something the manifest requires a human to sign off on, nobody answers in time:
+Here's the same enforcement on the approval side - an agent tries something the manifest requires a human to sign off on, nobody answers in time:
 
 ```
-constle: human gate timed out (on_timeout: abort) — stopping agent...
+constle: human gate timed out (on_timeout: abort) - stopping agent...
 ⚑ agent terminated: human gate timed out without approval (on_timeout: abort)    duration=312s
   audit log: ~/.constle/logs/2026-07-26-invoice-processor.jsonl
 ```
@@ -165,24 +164,24 @@ Three layers, each shipped and tested today:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Layer 3 — Communication                                    │
+│  Layer 3 - Communication                                    │
 │  Signed agent-to-agent messaging · declared peer allowlists │
 ├─────────────────────────────────────────────────────────────┤
-│  Layer 2 — Identity & Governance                             │
+│  Layer 2 - Identity & Governance                             │
 │  W3C DID (Ed25519) · human gates · spending limits          │
 ├─────────────────────────────────────────────────────────────┤
-│  Layer 1 — Secure Runtime & Sandbox                          │
+│  Layer 1 - Secure Runtime & Sandbox                          │
 │  Firecracker microVM or Docker · network isolation · audit   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### How network isolation actually works
 
-The agent process has no default gateway. Every outbound connection passes through a proxy that checks it against the manifest's `network.allowed` list — this holds regardless of which sandbox backend is running:
+The agent process has no default gateway. Every outbound connection passes through a proxy that checks it against the manifest's `network.allowed` list - this holds regardless of which sandbox backend is running:
 
 ```
 [Agent Process]
-      │  no default gateway — there is nowhere else to send a packet
+      │  no default gateway - there is nowhere else to send a packet
       ▼
 [Allowlisting Proxy]  →  declared hosts only
       ✗  →  everything else, silently dropped
@@ -220,9 +219,9 @@ constle run examples/basic-agent/agent.yaml --env AGENT_TASK="What is 2+2?"
 
 ## What Constle is not
 
-**Not an agent framework.** Constle doesn't define how an agent reasons or uses tools. LangGraph, CrewAI, or anything else run inside it unchanged — Constle governs the environment, not the logic.
+**Not an agent framework.** Constle doesn't define how an agent reasons or uses tools. LangGraph, CrewAI, or anything else run inside it unchanged - Constle governs the environment, not the logic.
 
-**Not a cloud provider.** It installs on your infrastructure — any cloud or on-premise. Software, not servers.
+**Not a cloud provider.** It installs on your infrastructure - any cloud or on-premise. Software, not servers.
 
 **Not a monitoring overlay.** Isolation stops exfiltration even if the model itself is fully compromised, because enforcement sits below the agent, not inside it. There's nothing for a compromised agent to disable.
 
@@ -261,7 +260,7 @@ constle/
 
 ## Contributing
 
-Early, solo-maintained, moving fast. See [CONTRIBUTING.md](CONTRIBUTING.md) — bug reports and a gVisor sandbox backend are the most useful contributions right now.
+Early, solo-maintained, moving fast. See [CONTRIBUTING.md](CONTRIBUTING.md) - bug reports and a gVisor sandbox backend are the most useful contributions right now.
 
 ---
 
