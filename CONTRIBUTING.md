@@ -1,6 +1,8 @@
 # Contributing to Constle
 
-## Getting Started
+Constle is early and maintained by one person right now, so response times won't always be fast — but every issue and PR gets read.
+
+## Getting started
 
 ```bash
 git clone https://github.com/constle/constle
@@ -9,20 +11,19 @@ go build ./...
 go test ./...
 ```
 
-## What We Need
+## What's most useful right now
 
-- Bug reports with clear reproduction steps
-- New sandbox backends (gVisor, Firecracker)
-- Additional example agents
-- Documentation improvements
+- Bug reports with clear reproduction steps (a failing test is even better)
+- A gVisor sandbox backend, alongside the existing Firecracker and Docker ones
+- More example agents in `examples/`
+- Gaps between `spec/agent-manifest.md` and what the parser actually accepts
 
-## Pull Requests
+## Before a PR
 
-Open an issue first before starting significant work.
-Keep PRs focused — one change per PR.
+Open an issue first for anything beyond a small fix — it's a quick way to confirm the approach before you spend time on it. Keep PRs scoped to one change.
 
-## Code Style
+## Code style
 
-- English comments only
-- Follow standard Go conventions (`gofmt`)
-- Tests for new functionality
+- English only, including comments — no exceptions
+- Standard Go conventions (`gofmt`, `go vet`)
+- New behavior needs a test
