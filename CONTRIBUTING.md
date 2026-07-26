@@ -1,6 +1,6 @@
 # Contributing to Constle
 
-Constle is early and maintained by one person right now, so response times won't always be fast — but every issue and PR gets read.
+Constle is early and maintained by one person right now, so response times won't always be fast - but every issue and PR gets read.
 
 ## Getting started
 
@@ -20,10 +20,10 @@ go test ./...
 
 ## Before a PR
 
-Open an issue first for anything beyond a small fix — it's a quick way to confirm the approach before you spend time on it. Keep PRs scoped to one change.
+Open an issue first for anything beyond a small fix - it's a quick way to confirm the approach before you spend time on it. Keep PRs scoped to one change.
 
 ## Code style
 
-- English only, including comments — no exceptions
+- English only, including comments - no exceptions
 - Standard Go conventions (`gofmt`, `go vet`)
 - New behavior needs a test
