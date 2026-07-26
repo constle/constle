@@ -8,25 +8,19 @@ on:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Lint & test the Go CLI.
-  # Skipped entirely when no Go source files are present.
+  # Lint & test the Go module.
   # ---------------------------------------------------------------------------
   lint-and-test:
     name: Lint & Test (Go)
     runs-on: ubuntu-latest
-    if: hashFiles('cli/**/*.go') != ''
-    defaults:
-      run:
-        working-directory: cli
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
           cache: true
-          cache-dependency-path: cli/go.sum
 
       - name: Tidy modules
         run: go mod tidy
@@ -35,7 +29,6 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: latest
-          working-directory: cli
           args: --timeout=5m
 
       - name: Test
@@ -66,34 +59,28 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Cross-platform build of the CLI binary.
-  # Only runs when Go source files exist. Generates go.sum if absent.
   # ---------------------------------------------------------------------------
   build:
     name: Build CLI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    if: hashFiles('cli/**/*.go') != ''
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    defaults:
-      run:
-        working-directory: cli
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version-file: go.mod
           cache: true
-          cache-dependency-path: cli/go.sum
 
       - name: Tidy modules
         run: go mod tidy
 
       - name: Build
-        run: go build -v .
+        run: go build -v ./...
 
       - name: Verify binary runs
-        run: go run . --version
+        run: go run ./cmd/constle version
