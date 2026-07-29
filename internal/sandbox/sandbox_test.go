@@ -11,7 +11,7 @@ func TestWriteSquidConfigWithHosts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeSquidConfig() error: %v", err)
 	}
-	defer os.Remove(path)
+	defer func() { _ = os.Remove(path) }()
 
 	content, err := os.ReadFile(path)
 	if err != nil {
@@ -48,7 +48,7 @@ func TestWriteSquidConfigEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("writeSquidConfig() error: %v", err)
 	}
-	defer os.Remove(path)
+	defer func() { _ = os.Remove(path) }()
 
 	content, err := os.ReadFile(path)
 	if err != nil {

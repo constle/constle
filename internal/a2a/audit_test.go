@@ -29,7 +29,7 @@ func newSignedLogger(t *testing.T, signer *testSigner) (*audit.Logger, string) {
 	if err != nil {
 		t.Fatalf("NewSigned: %v", err)
 	}
-	t.Cleanup(func() { l.Close() })
+	t.Cleanup(func() { _ = l.Close() })
 	return l, path
 }
 
@@ -115,14 +115,14 @@ func startInboundBob(t *testing.T, bob, alice *testSigner) (g *Gate, logPath, pu
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { g.Close() })
+	t.Cleanup(func() { _ = g.Close() })
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 	if err := g.StartListener(addr); err != nil {
 		t.Fatalf("StartListener: %v", err)
 	}
@@ -149,16 +149,16 @@ func TestAuditSymmetricRoundTrip(t *testing.T) {
 			}
 			if resp.StatusCode == http.StatusOK {
 				msgID := resp.Header.Get("X-Constle-A2A-Msg-Id")
-				io.ReadAll(resp.Body)
-				resp.Body.Close()
+				_, _ = io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
 				rr, err := http.Post(bobSandbox+"/reply/"+msgID, "application/json",
 					strings.NewReader(`{"pong":true}`))
 				if err == nil {
-					rr.Body.Close()
+					_ = rr.Body.Close()
 				}
 				return
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}()
 
@@ -174,7 +174,7 @@ func TestAuditSymmetricRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New alice: %v", err)
 	}
-	t.Cleanup(func() { gA.Close() })
+	t.Cleanup(func() { _ = gA.Close() })
 	port, token, err := gA.Bind("alicerun01", []string{"127.0.0.1"})
 	if err != nil {
 		t.Fatalf("Bind alice: %v", err)
@@ -186,7 +186,7 @@ func TestAuditSymmetricRoundTrip(t *testing.T) {
 		t.Fatalf("send: %v", err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("send = HTTP %d: %s", resp.StatusCode, body)
 	}
@@ -228,7 +228,7 @@ func TestAuditInboundRejectionReasons(t *testing.T) {
 		if err != nil {
 			t.Fatalf("POST: %v", err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return resp.StatusCode
 	}
 
@@ -309,7 +309,7 @@ func TestAuditTransportFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
-		t.Cleanup(func() { g.Close() })
+		t.Cleanup(func() { _ = g.Close() })
 		port, token, err := g.Bind("alicerun02", []string{"127.0.0.1"})
 		if err != nil {
 			t.Fatalf("Bind: %v", err)
@@ -319,7 +319,7 @@ func TestAuditTransportFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("send: %v", err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("send to dead peer = HTTP %d, want 502", resp.StatusCode)
 		}
@@ -348,7 +348,7 @@ func TestAuditTransportFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
-		t.Cleanup(func() { g.Close() })
+		t.Cleanup(func() { _ = g.Close() })
 		port, token, err := g.Bind("alicerun03", []string{"127.0.0.1"})
 		if err != nil {
 			t.Fatalf("Bind: %v", err)
@@ -358,7 +358,7 @@ func TestAuditTransportFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("send: %v", err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		events := a2aEvents(t, logPath)
 		assertSeq(t, events,

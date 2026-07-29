@@ -73,11 +73,11 @@ func createTAP(runID, tapName string) (gatewayIP, guestIP string, err error) {
 		return "", "", err
 	}
 	if err := ipRun("addr", "add", gatewayIP+"/30", "dev", tapName); err != nil {
-		deleteTAP(tapName)
+		_ = deleteTAP(tapName)
 		return "", "", err
 	}
 	if err := ipRun("link", "set", tapName, "up"); err != nil {
-		deleteTAP(tapName)
+		_ = deleteTAP(tapName)
 		return "", "", err
 	}
 	return gatewayIP, guestIP, nil
@@ -171,20 +171,31 @@ func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, gate
 	if err != nil {
 		return 0, "", err
 	}
-	logFile.Close()
+	// Nothing was written — the file exists purely so Squid can open it —
+	// so there is no data a failed close could cost.
+	_ = logFile.Close()
+	// Best effort: if the chown does not take, Squid falls back to its own
+	// error handling and the run continues without an access log rather
+	// than not at all. A missing log is already visible downstream, where
+	// the flush reports that network events were not fully recorded.
 	if uid, gid, err := lookupSquidUser(); err == nil {
-		os.Chown(accessLogPath, uid, gid)
+		_ = os.Chown(accessLogPath, uid, gid)
 	}
 
 	cmd := exec.Command("squid", "-N", "-f", configPath)
 	if err := cmd.Start(); err != nil {
 		return 0, "", fmt.Errorf("squid start: %w", err)
 	}
-	// Reap in the background so no zombie remains when Stop kills it.
-	go cmd.Wait()
+	// Reap in the background so no zombie remains when Stop kills it. The
+	// exit status is meaningless here: the expected end for this process is
+	// the SIGKILL that Stop sends it.
+	go func() { _ = cmd.Wait() }()
 
 	if err := waitForHostSquid(gatewayIP); err != nil {
-		killPID(cmd.Process.Pid)
+		// Rollback: the readiness error below is what the caller needs, and
+		// a Squid that survives this kill is reported by Stop's own
+		// "still running after SIGKILL" check.
+		_ = killPID(cmd.Process.Pid)
 		return 0, "", err
 	}
 	return cmd.Process.Pid, accessLogPath, nil
@@ -196,7 +207,7 @@ func waitForHostSquid(gatewayIP string) error {
 	for i := 0; i < 30; i++ {
 		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)

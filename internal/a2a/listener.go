@@ -1,9 +1,11 @@
 package a2a
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/constle/constle/internal/audit"
@@ -88,7 +90,16 @@ func (g *Gate) StartListener(addr string) error {
 		WriteTimeout:      replyTimeout + 30*time.Second,
 		MaxHeaderBytes:    publicMaxHeaderBytes,
 	}
-	go g.public.Serve(ln)
+	go func() {
+		// The public listener is the only externally reachable surface in
+		// the project, so it dying early is the one failure an operator must
+		// never learn about from a peer instead: from the outside it looks
+		// identical to this agent refusing calls. ErrServerClosed is the
+		// ordinary end-of-run exit via Close.
+		if err := g.public.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintf(os.Stderr, "constle: A2A public listener on %s stopped: %v\n", addr, err)
+		}
+	}()
 	return nil
 }
 
@@ -182,7 +193,10 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 	select {
 	case respWire := <-call.respCh:
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(respWire)
+		// serveReply already logged this envelope as sent — it is signed and
+		// leaving the host either way. A peer that hangs up mid-write is
+		// already covered by the r.Context().Done() branch below.
+		_, _ = w.Write(respWire)
 	case <-time.After(timeout):
 		// The round trip died on the response leg: our agent never
 		// answered. Recorded so this log alone tells the whole story.
@@ -220,7 +234,10 @@ func (g *Gate) serveInbox(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Constle-A2A-From", call.env.From)
 		w.Header().Set("X-Constle-A2A-Peer", call.peerName)
 		w.Header().Set("X-Constle-A2A-Msg-Id", call.env.MsgID)
-		w.Write(call.env.Body)
+		// The call is already recorded as received and moved to pending; if
+		// the agent drops this long-poll it simply never replies, and the
+		// peer-side reply timeout takes over.
+		_, _ = w.Write(call.env.Body)
 
 	case <-time.After(poll):
 		w.WriteHeader(http.StatusNoContent)

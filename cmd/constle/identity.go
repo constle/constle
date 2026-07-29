@@ -110,12 +110,12 @@ func loadRunIdentity(m *manifest.AgentManifest) (*identity.Identity, error) {
 	if err != nil {
 		if _, ok := err.(*identity.NotFoundError); ok {
 			return nil, fmt.Errorf(
-				"Agentfile declares identity.did but no local identity exists for agent %q — "+
+				"the Agentfile declares identity.did but no local identity exists for agent %q — "+
 					"refusing to run unsigned; create one with: constle identity create %s",
 				m.Identity.Name, m.Identity.Name,
 			)
 		}
-		return nil, fmt.Errorf("Agentfile declares identity.did but the local identity cannot be used: %w", err)
+		return nil, fmt.Errorf("the Agentfile declares identity.did but the local identity cannot be used: %w", err)
 	}
 
 	if id.DID() != m.Identity.DID {

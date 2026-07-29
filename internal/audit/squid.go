@@ -91,12 +91,19 @@ func parseAndLog(r io.Reader, runID, agentName string, logger *Logger) error {
 			eventType = EventNetworkBlocked
 		}
 
-		logger.Log(runID, agentName, eventType, map[string]any{
+		// Every line here is a network access the agent actually made, so a
+		// dropped entry is a missing network event — exactly what the log
+		// exists to record. Stop at the first failure and report it: the
+		// remaining lines would almost certainly fail the same way, and the
+		// caller must not be told the network log was flushed intact.
+		if err := logger.Log(runID, agentName, eventType, map[string]any{
 			"host":        host,
 			"method":      method,
 			"http_status": status,
 			"bytes":       bytes,
-		})
+		}); err != nil {
+			return fmt.Errorf("cannot record network event for %s: %w", host, err)
+		}
 	}
 
 	return scanner.Err()

@@ -41,7 +41,7 @@ func newMeterHarness(t *testing.T, limits spending.Limits, store *spending.Daily
 	h := &meterHarness{calls: &atomic.Int64{}}
 	h.respond.Store(func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true,"usage":{"in":10,"out":20}}}`)
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true,"usage":{"in":10,"out":20}}}`)
 	})
 
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -55,7 +55,7 @@ func newMeterHarness(t *testing.T, limits spending.Limits, store *spending.Daily
 	if err != nil {
 		t.Fatalf("audit.New: %v", err)
 	}
-	t.Cleanup(func() { logger.Close() })
+	t.Cleanup(func() { _ = logger.Close() })
 
 	tracker, err := spending.NewTracker(limits, store)
 	if err != nil {
@@ -87,7 +87,7 @@ func newMeterHarness(t *testing.T, limits spending.Limits, store *spending.Daily
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	t.Cleanup(func() { g.Close() })
+	t.Cleanup(func() { _ = g.Close() })
 
 	h.gate = g
 	h.tracker = tracker
@@ -162,7 +162,7 @@ func TestMeterInflatedUsageTripsAndBlocks(t *testing.T) {
 	h.respond.Store(func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
 		// 10^9 output units × 15 µ¢ = 1.5e10 µ¢ = $150 — wildly over cap.
-		fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true,"usage":{"in":1,"out":1000000000}}}`)
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true,"usage":{"in":1,"out":1000000000}}}`)
 	})
 
 	if code, _ := postJSON(t, h.baseURL, toolCallBody("ask")); code != 200 {
@@ -215,7 +215,7 @@ func TestMeterMissingUsageFailsClosed(t *testing.T) {
 
 	h.respond.Store(func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`) // no usage at all
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}`) // no usage at all
 	})
 
 	postJSON(t, h.baseURL, toolCallBody("supposedly_free_tool"))
@@ -248,7 +248,7 @@ func TestMeterErrorResponseNotCharged(t *testing.T) {
 
 	h.respond.Store(func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"tool exploded"}}`)
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"tool exploded"}}`)
 	})
 
 	postJSON(t, h.baseURL, toolCallBody("ask"))
@@ -269,8 +269,8 @@ func TestMeterSSEResponse(t *testing.T) {
 
 	h.respond.Store(func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n")
-		fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true,\"usage\":{\"in\":100,\"out\":200}}}\n\n")
+		_, _ = fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n")
+		_, _ = fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true,\"usage\":{\"in\":100,\"out\":200}}}\n\n")
 	})
 
 	code, _ := postJSON(t, h.baseURL, toolCallBody("ask"))
@@ -289,7 +289,7 @@ func TestMeterPrecisionManySmallCharges(t *testing.T) {
 
 	h.respond.Store(func(w http.ResponseWriter) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true,"usage":{"in":1,"out":2}}}`)
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"ok":true,"usage":{"in":1,"out":2}}}`)
 	})
 
 	const n = 200
