@@ -117,13 +117,19 @@ func buildSpendingTracker(m *manifest.AgentManifest, logger *audit.Logger) (*spe
 			return nil, fmt.Errorf("cannot read today's spending ledger: %w", err)
 		}
 		if prior >= limits.PerDay {
-			logger.Log("", m.Identity.Name, audit.EventSpendingLimit, map[string]any{
+			// The refusal below stands either way — it is enforced from the
+			// ledger, not from the log — so a failed write must not turn a
+			// budget-exhausted run into a started one. It is announced and
+			// the run is still refused.
+			if err := logger.Log("", m.Identity.Name, audit.EventSpendingLimit, map[string]any{
 				"severity":        "limit",
 				"limit":           string(spending.ViolationPerDay),
 				"action":          "run_refused",
 				"day_total_usd":   prior.USD(),
 				"max_per_day_usd": limits.PerDay.USD(),
-			})
+			}); err != nil {
+				audit.WarnWriteFailure(audit.EventSpendingLimit, err)
+			}
 			return nil, fmt.Errorf(
 				"refusing to start: today's accumulated spend ($%s) already meets or exceeds spending.max_per_day_usd ($%s)",
 				prior.USD(), limits.PerDay.USD())

@@ -30,7 +30,10 @@ jobs:
         with:
           version: latest
           install-mode: goinstall
-          only-new-issues: true
+          # The tree is clean, so the whole module is linted rather than only
+          # the lines a PR touches. only-new-issues was hiding a backlog that
+          # had grown to 263 findings; with a zero baseline, linting
+          # everything is what keeps it at zero.
           args: --timeout=5m
 
       - name: Test

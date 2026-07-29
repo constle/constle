@@ -16,7 +16,7 @@ func TestLogWritesJSONL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	err = logger.Log("run-123", "test-agent", EventRunStarted, map[string]any{
 		"backend": "docker",
@@ -32,7 +32,7 @@ func TestLogWritesJSONL(t *testing.T) {
 		t.Fatalf("Log() error: %v", err)
 	}
 
-	logger.Close()
+	_ = logger.Close()
 
 	data, err := os.ReadFile(logPath)
 	if err != nil {
@@ -53,7 +53,7 @@ func TestLogWritesJSONL(t *testing.T) {
 	}
 
 	var first Entry
-	json.Unmarshal([]byte(lines[0]), &first)
+	_ = json.Unmarshal([]byte(lines[0]), &first)
 	if first.Event != EventRunStarted {
 		t.Errorf("first event = %q, want %q", first.Event, EventRunStarted)
 	}
@@ -77,7 +77,7 @@ func TestLogCreatesDirectories(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() should create missing dirs, got error: %v", err)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	if _, err := os.Stat(logPath); os.IsNotExist(err) {
 		t.Error("log file was not created")
@@ -89,17 +89,61 @@ func TestLogWithIsolation(t *testing.T) {
 	logPath := filepath.Join(dir, "test.jsonl")
 
 	logger, _ := New(logPath)
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
-	logger.LogWithIsolation("run-456", "secure-agent", EventRunStarted, "kernel", nil)
-	logger.Close()
+	_ = logger.LogWithIsolation("run-456", "secure-agent", EventRunStarted, "kernel", nil)
+	_ = logger.Close()
 
 	data, _ := os.ReadFile(logPath)
 	var entry Entry
-	json.Unmarshal(data, &entry)
+	_ = json.Unmarshal(data, &entry)
 
 	if entry.IsolationLevel != "kernel" {
 		t.Errorf("isolation_level = %q, want \"kernel\"", entry.IsolationLevel)
+	}
+}
+
+// A dropped entry is invisible to every later reader — verification proves
+// the lines present are authentic, never that none is missing — so Err is the
+// only way a caller learns the log is holed. It must report the FIRST failure
+// and keep reporting it, since that is the entry whose loss is unrecoverable.
+func TestErrRetainsFirstWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "test.jsonl")
+
+	logger, err := New(logPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	if err := logger.Log("run-1", "agent", EventRunStarted, nil); err != nil {
+		t.Fatalf("Log() error: %v", err)
+	}
+	if err := logger.Err(); err != nil {
+		t.Fatalf("Err() = %v after a successful write, want nil", err)
+	}
+
+	// Closing the file makes every later write fail, standing in for the
+	// real causes (a full disk, a revoked mount).
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	firstFailure := logger.Log("run-1", "agent", EventGateDenied, nil)
+	if firstFailure == nil {
+		t.Fatal("Log() on a closed file returned nil, want an error")
+	}
+	if got := logger.Err(); got == nil {
+		t.Fatal("Err() = nil after a failed write, want the failure")
+	}
+
+	// A second failure must not displace the first: the run is already
+	// known-incomplete, and the earliest loss is the one worth naming.
+	if err := logger.Log("run-1", "agent", EventRunFinished, nil); err == nil {
+		t.Fatal("second Log() returned nil, want an error")
+	}
+	if got := logger.Err(); got.Error() != firstFailure.Error() {
+		t.Errorf("Err() = %v, want the first failure %v", got, firstFailure)
 	}
 }
 

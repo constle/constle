@@ -96,12 +96,16 @@ func (s *DailyStore) TodayTotal() (MicroCents, error) {
 		}
 		return 0, fmt.Errorf("cannot open spending ledger: %w", err)
 	}
-	defer f.Close()
+	// Read-only: closing cannot lose data, and any read failure has already
+	// been reported by sumLedger.
+	defer func() { _ = f.Close() }()
 
 	if err := lockShared(f); err != nil {
 		return 0, fmt.Errorf("cannot lock spending ledger: %w", err)
 	}
-	defer unlockFile(f)
+	// Unlocking cannot meaningfully fail here: the deferred Close below runs
+	// straight after and releases the flock regardless.
+	defer func() { _ = unlockFile(f) }()
 
 	return sumLedger(f)
 }
@@ -119,7 +123,18 @@ func (s *DailyStore) Append(runID, serverID string, amount MicroCents) (dayTotal
 	if err != nil {
 		return 0, fmt.Errorf("cannot open spending ledger: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		// Unlike TodayTotal, this handle was written to, and the ledger is
+		// the durable half of spending enforcement: a charge that never
+		// reached disk is budget the next run silently hands out again.
+		// Close is where a deferred write failure (full disk, dropped
+		// network filesystem) finally surfaces, so it is promoted to the
+		// call's error rather than dropped — unless something worse already
+		// failed, which stays the reported cause.
+		if cerr := f.Close(); cerr != nil && err == nil {
+			dayTotal, err = 0, fmt.Errorf("cannot flush spending ledger: %w", cerr)
+		}
+	}()
 
 	// Hand a freshly created (or historically root-owned) ledger back to
 	// the invoking user — same healing behavior as audit.New.
@@ -130,7 +145,9 @@ func (s *DailyStore) Append(runID, serverID string, amount MicroCents) (dayTotal
 	if err := lockExclusive(f); err != nil {
 		return 0, fmt.Errorf("cannot lock spending ledger: %w", err)
 	}
-	defer unlockFile(f)
+	// As in TodayTotal: the Close deferred above runs after this and drops
+	// the flock anyway, so a failed unlock changes nothing.
+	defer func() { _ = unlockFile(f) }()
 
 	line, err := json.Marshal(ledgerRecord{
 		TS:         time.Now().UTC(),

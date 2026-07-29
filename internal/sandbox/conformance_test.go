@@ -176,23 +176,23 @@ func runConformanceScenario(t *testing.T, backend SandboxBackend, m *manifest.Ag
 	if err != nil {
 		t.Fatalf("cannot create audit logger: %v", err)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	runCtx, err := backend.Start(m)
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer backend.Stop(runCtx)
+	defer func() { _ = backend.Stop(runCtx) }()
 
 	done := make(chan struct{})
 	go func() {
-		backend.Wait(runCtx)
+		_, _ = backend.Wait(runCtx)
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Minute):
-		backend.Kill(runCtx)
+		_ = backend.Kill(runCtx)
 		t.Fatalf("scenario did not finish within 3 minutes")
 	}
 

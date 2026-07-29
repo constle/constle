@@ -75,11 +75,11 @@ func startMCPStub(t *testing.T) *mcpStub {
 			stub.mu.Unlock()
 		}
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"done"}]}}`)
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"done"}]}}`)
 	})
 	stub.srv = &http.Server{Handler: mux}
-	go stub.srv.Serve(ln)
-	t.Cleanup(func() { stub.srv.Close() })
+	go func() { _ = stub.srv.Serve(ln) }()
+	t.Cleanup(func() { _ = stub.srv.Close() })
 	return stub
 }
 
@@ -172,13 +172,13 @@ func runMCPScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentManif
 	if err != nil {
 		t.Fatalf("cannot create audit logger: %v", err)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	gate, err := mcpgate.New(m, approver, nil, logger, nil)
 	if err != nil {
 		t.Fatalf("mcpgate.New: %v", err)
 	}
-	defer gate.Close()
+	defer func() { _ = gate.Close() }()
 
 	setter, ok := backend.(MCPGateSetter)
 	if !ok {
@@ -190,7 +190,7 @@ func runMCPScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentManif
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer backend.Stop(runCtx)
+	defer func() { _ = backend.Stop(runCtx) }()
 
 	// on_timeout: abort must terminate the run, exactly as the CLI wires it.
 	gate.SetAbortRun(func() {
@@ -206,13 +206,13 @@ func runMCPScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentManif
 
 	done := make(chan struct{})
 	go func() {
-		backend.Wait(runCtx)
+		_, _ = backend.Wait(runCtx)
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Minute):
-		backend.Kill(runCtx)
+		_ = backend.Kill(runCtx)
 		t.Fatalf("scenario did not finish within 3 minutes")
 	}
 
@@ -459,7 +459,7 @@ echo "$RESP2" | grep -q '"result"' && echo "GATE_DEAD: RECONNECTED" || echo "GAT
 				go func() {
 					select {
 					case <-approver.triggered:
-						gate.Close()
+						_ = gate.Close()
 					case <-time.After(2 * time.Minute):
 					}
 				}()

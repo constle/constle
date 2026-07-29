@@ -241,7 +241,9 @@ func writeFileExclusive(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		// The write failure is the one worth reporting; the close only
+		// releases a handle to a file that is already incomplete.
+		_ = f.Close()
 		return err
 	}
 	return f.Close()

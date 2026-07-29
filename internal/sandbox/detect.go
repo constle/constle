@@ -75,10 +75,12 @@ func DetectBestBackend(required manifest.IsolationLevel, override string) (Sandb
 // being used (Firecracker unavailable, or an explicit --backend=docker
 // override). Both the automatic and the override paths route through here so
 // the downgrade is never silent.
+// Write errors are discarded: detectOut is how this downgrade gets reported
+// in the first place, so a failure to write it has nowhere left to go.
 func warnKernelIsolationOnDocker(reason string) {
-	fmt.Fprintln(detectOut, "⚠️  warning: kernel isolation requested but running on Docker:")
-	fmt.Fprintln(detectOut, "   "+reason)
-	fmt.Fprintln(detectOut, "   Docker provides network isolation only, NOT kernel-level isolation")
+	_, _ = fmt.Fprintln(detectOut, "⚠️  warning: kernel isolation requested but running on Docker:")
+	_, _ = fmt.Fprintln(detectOut, "   "+reason)
+	_, _ = fmt.Fprintln(detectOut, "   Docker provides network isolation only, NOT kernel-level isolation")
 }
 
 // dockerAvailable reports whether the Docker daemon is reachable. It is a
