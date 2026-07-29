@@ -3,7 +3,6 @@ package mcpgate
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -40,7 +39,7 @@ func NewWebhookNotifier(gates manifest.HumanGates, out io.Writer) *WebhookNotifi
 		}
 		url := os.Getenv(n.URLSecretRef)
 		if url == "" {
-			fmt.Fprintf(out, "⚠️  warning: human_gates.notify webhook env %s is not set — "+
+			outf(out, "⚠️  warning: human_gates.notify webhook env %s is not set — "+
 				"gate events will only be visible on this terminal\n", n.URLSecretRef)
 			continue
 		}
@@ -80,7 +79,7 @@ func (n *WebhookNotifier) NotifyTriggered(req Request) {
 		TriggeredAt:    time.Now().UTC(),
 	})
 	if err != nil {
-		fmt.Fprintf(n.Out, "⚠️  warning: cannot marshal gate webhook payload: %v\n", err)
+		outf(n.Out, "⚠️  warning: cannot marshal gate webhook payload: %v\n", err)
 		return
 	}
 
@@ -93,12 +92,12 @@ func (n *WebhookNotifier) NotifyTriggered(req Request) {
 		go func(url string) {
 			resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
 			if err != nil {
-				fmt.Fprintf(n.Out, "⚠️  warning: gate webhook delivery to %s failed: %v\n", url, err)
+				outf(n.Out, "⚠️  warning: gate webhook delivery to %s failed: %v\n", url, err)
 				return
 			}
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode >= 300 {
-				fmt.Fprintf(n.Out, "⚠️  warning: gate webhook %s answered %s\n", url, resp.Status)
+				outf(n.Out, "⚠️  warning: gate webhook %s answered %s\n", url, resp.Status)
 			}
 		}(url)
 	}

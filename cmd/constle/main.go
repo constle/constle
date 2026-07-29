@@ -49,6 +49,37 @@ func (lockedStdout) Write(p []byte) (int, error) {
 	return os.Stdout.Write(p)
 }
 
+// auditLog records one run-lifecycle event.
+//
+// Unlike the gates, cmdRun has an error path — but not a useful place to
+// stop: every event written here describes something that has already
+// happened (the sandbox started, the run was terminated, the agent exited),
+// so abandoning the run on a failed write would discard the outcome
+// reporting without un-doing anything. The loss is announced immediately
+// instead, and cmdRun consults logger.Err() before it reports a run as
+// cleanly finished.
+func auditLog(logger *audit.Logger, runID, agentName string, event audit.EventType, details map[string]any) {
+	if err := logger.Log(runID, agentName, event, details); err != nil {
+		audit.WarnWriteFailure(event, err)
+	}
+}
+
+// killAgent stops the agent sandbox for one of the run-terminating reasons
+// (human-gate abort, spending cap, operator signal, duration limit).
+//
+// A kill that fails is precisely the case the operator must not be left
+// guessing about: constle has just announced that it is stopping the agent,
+// and if that did not take effect the agent is still running with whatever
+// access the run granted it. Callers are goroutines with no error path, so
+// the failure goes to stderr.
+func killAgent(backend sandbox.SandboxBackend, runCtx *sandbox.RunContext, reason string) {
+	if err := backend.Kill(runCtx); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"  warning: %s: could not stop the agent: %v\n"+
+				"           the sandbox may still be running — check `constle ps`\n", reason, err)
+	}
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printHelp()
@@ -234,7 +265,14 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			return fmt.Errorf("cannot open audit log: %w", err)
 		}
 	}
-	defer logger.Close()
+	defer func() {
+		// A close failure can be the first sight of an I/O problem that also
+		// cost the run entries (a full disk surfaces at close as often as at
+		// write), so it is reported rather than dropped.
+		if err := logger.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: could not close the audit log %s: %v\n", logPath, err)
+		}
+	}()
 
 	if m.Identity.DID != "" && !logger.Signed() {
 		// Unreachable by construction; guards against future refactors ever
@@ -268,7 +306,10 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		if err != nil {
 			return fmt.Errorf("cannot build MCP gate: %w", err)
 		}
-		defer gate.Close()
+		// Close only shuts the listener down as the process exits; there is
+		// no state to lose and nothing an operator could do about a listener
+		// that would not close, so its error is deliberately dropped.
+		defer func() { _ = gate.Close() }()
 
 		if setter, ok := backend.(sandbox.MCPGateSetter); ok {
 			setter.SetMCPGate(gate)
@@ -292,7 +333,9 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		if err != nil {
 			return fmt.Errorf("cannot build A2A gate: %w", err)
 		}
-		defer a2aGate.Close()
+		// Same as the MCP gate: process-exit listener teardown, nothing
+		// actionable in a failure.
+		defer func() { _ = a2aGate.Close() }()
 
 		if setter, ok := backend.(sandbox.A2AGateSetter); ok {
 			setter.SetA2AGate(a2aGate)
@@ -312,7 +355,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	runCtx, err := backend.Start(m)
 	if err != nil {
 		// setup.fail() (deferred) clears the collapsing line.
-		logger.Log("", m.Identity.Name, audit.EventRunFailed,
+		auditLog(logger, "", m.Identity.Name, audit.EventRunFailed,
 			map[string]any{"error": err.Error()})
 		return fmt.Errorf("cannot start sandbox: %w", err)
 	}
@@ -339,8 +382,11 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			flushErr = audit.FlushSquidLogs(runCtx.RunID, m.Identity.Name, runCtx.ProxyContainerID, logger)
 		}
 		if flushErr != nil {
+			// Covers both halves of the flush: reading Squid's access log,
+			// and recording what it contained as audit events. Either way
+			// the run's network activity is not fully in the audit log.
 			nlSpin.stopClear()
-			fmt.Fprintf(os.Stderr, "  warning: could not read network logs: %v\n", flushErr)
+			fmt.Fprintf(os.Stderr, "  warning: network events were not fully logged: %v\n", flushErr)
 		} else if styled && runSucceeded {
 			nlSpin.stopClear()
 		} else {
@@ -361,7 +407,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		}
 	}()
 
-	logger.LogWithIsolation(
+	if err := logger.LogWithIsolation(
 		runCtx.RunID, m.Identity.Name,
 		audit.EventRunStarted,
 		string(m.Sandbox.Isolation),
@@ -369,7 +415,9 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			"backend": string(backendType),
 			"image":   m.Sandbox.Image,
 		},
-	)
+	); err != nil {
+		audit.WarnWriteFailure(audit.EventRunStarted, err)
+	}
 
 	// Settle the collapsing setup line to one permanent row (styled), or print
 	// the exact "sandbox started (run_id: …)" ✓ line (plain).
@@ -409,7 +457,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			abortOnce.Do(func() {
 				printf("\nconstle: human gate timed out (on_timeout: abort) — stopping agent...\n")
 				close(gateAborted)
-				backend.Kill(runCtx)
+				killAgent(backend, runCtx, "human gate timeout")
 			})
 		})
 	}
@@ -428,7 +476,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			spendOnce.Do(func() {
 				printf("\nconstle: spending limit reached (%s) — stopping agent...\n", tracker.Tripped())
 				close(spendExceeded)
-				backend.Kill(runCtx)
+				killAgent(backend, runCtx, "spending limit reached")
 			})
 		})
 	}
@@ -448,7 +496,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		sig := <-sigCh
 		printf("\nconstle: received %s — stopping agent...\n", sig)
 		close(userStopped)
-		backend.Kill(runCtx)
+		killAgent(backend, runCtx, fmt.Sprintf("received %s", sig))
 	}()
 
 	// limitReached is closed by the timer goroutine when MaxDurationSeconds
@@ -465,7 +513,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 			select {
 			case <-time.After(time.Duration(m.Limits.MaxDurationSeconds) * time.Second):
 				close(limitReached)
-				backend.Kill(runCtx)
+				killAgent(backend, runCtx, "duration limit exceeded")
 			case <-userStopped:
 				// User stopped first; let the signal goroutine handle cleanup.
 			}
@@ -506,7 +554,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 
 	select {
 	case <-limitReached:
-		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventTerminatedByLimit,
+		auditLog(logger, runCtx.RunID, m.Identity.Name, audit.EventTerminatedByLimit,
 			map[string]any{
 				"limit_seconds": m.Limits.MaxDurationSeconds,
 				"duration":      duration.String(),
@@ -533,7 +581,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		if m.Spending.MaxPerDayUSD != "" {
 			details["max_per_day_usd"] = m.Spending.MaxPerDayUSD
 		}
-		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventTerminatedByLimit, details)
+		auditLog(logger, runCtx.RunID, m.Identity.Name, audit.EventTerminatedByLimit, details)
 		finalStatus(stKindFail,
 			fmt.Sprintf("⚑ agent terminated: spending limit (%s) exceeded    run_spend=$%s    duration=%s", tracker.Tripped(), tracker.RunTotal().USD(), duration),
 			"terminated",
@@ -547,7 +595,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	case <-gateAborted:
 		// The gate itself already logged the gate_timeout event; this entry
 		// records the run-level consequence.
-		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventRunFailed,
+		auditLog(logger, runCtx.RunID, m.Identity.Name, audit.EventRunFailed,
 			map[string]any{
 				"reason":   "human_gate_timeout_abort",
 				"duration": duration.String(),
@@ -563,7 +611,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 
 	select {
 	case <-userStopped:
-		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventRunFailed,
+		auditLog(logger, runCtx.RunID, m.Identity.Name, audit.EventRunFailed,
 			map[string]any{
 				"reason":   "stopped_by_user",
 				"duration": duration.String(),
@@ -578,7 +626,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	}
 
 	if waitErr != nil || exitCode != 0 {
-		logger.Log(runCtx.RunID, m.Identity.Name, audit.EventRunFailed,
+		auditLog(logger, runCtx.RunID, m.Identity.Name, audit.EventRunFailed,
 			map[string]any{
 				"exit_code": exitCode,
 				"duration":  duration.String(),
@@ -591,11 +639,29 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		return fmt.Errorf("agent exited with code %d", exitCode)
 	}
 
-	logger.Log(runCtx.RunID, m.Identity.Name, audit.EventRunFinished,
+	auditLog(logger, runCtx.RunID, m.Identity.Name, audit.EventRunFinished,
 		map[string]any{
 			"exit_code": 0,
 			"duration":  duration.String(),
 		})
+
+	// The agent exited 0 — but a clean run also means a complete record of
+	// it. An entry that failed to write is simply gone, and no reader can
+	// recover it: `constle audit verify` proves that the lines PRESENT are
+	// signed and their chain unbroken, which is exactly why it cannot notice
+	// one that was never written. Printing the success pill here would put
+	// constle's own word behind a log it knows is holed, so the run reports
+	// the gap instead. Every other outcome below already returns an error,
+	// and each dropped entry was announced on stderr as it happened.
+	if auditErr := logger.Err(); auditErr != nil {
+		finalStatus(stKindFail,
+			fmt.Sprintf("⚑ agent exited 0 but the audit log is incomplete    duration=%s", duration),
+			"incomplete",
+			"audit log incomplete",
+			logPath, runCtx.RunID, duration)
+		return fmt.Errorf("agent exited 0 but this run's audit log is incomplete: %w", auditErr)
+	}
+
 	finalStatus(stKindOK,
 		fmt.Sprintf("✓ run finished    exit=0    duration=%s", duration),
 		"done",

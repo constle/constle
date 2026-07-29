@@ -2,10 +2,12 @@ package a2a
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -135,7 +137,14 @@ func (g *Gate) Bind(runID string, candidateIPs []string) (port int, token string
 	g.listeners = listeners
 	g.server = &http.Server{Handler: g}
 	for _, ln := range listeners {
-		go g.server.Serve(ln)
+		go func() {
+			// As in mcpgate.Bind: ErrServerClosed is the ordinary end-of-run
+			// exit; anything else is this listener dying early, which the
+			// agent sees only as its A2A calls failing.
+			if err := g.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Fprintf(os.Stderr, "constle: A2A gate listener on %s stopped: %v\n", ln.Addr(), err)
+			}
+		}()
 	}
 
 	return port, g.token, nil
@@ -225,7 +234,7 @@ func (g *Gate) serveSend(w http.ResponseWriter, r *http.Request, peerName string
 		http.Error(w, fmt.Sprintf("constle a2a gate: cannot reach peer %q: %v", peerName, err), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respWire, err := readCapped(resp.Body)
 	if err != nil {
@@ -266,7 +275,10 @@ func (g *Gate) serveSend(w http.ResponseWriter, r *http.Request, peerName string
 	// sender as a header — the sandbox never sees the raw envelope.
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Constle-A2A-From", respEnv.From)
-	w.Write(respEnv.Body)
+	// The audit entry above is the durable record that this round trip
+	// completed; a write failure here only means the sandbox hung up before
+	// collecting its answer, which it will observe as its own read error.
+	_, _ = w.Write(respEnv.Body)
 }
 
 // verifyResponse checks a peer's signed response envelope: valid signature
@@ -307,6 +319,14 @@ func readCapped(r io.Reader) ([]byte, error) {
 
 // log writes one audit entry attributed to this run. Nil logger (unit
 // tests) is a no-op.
+//
+// As in mcpgate, the write cannot change the outcome it describes: by the
+// time an envelope is logged as sent it has left the host, and a rejected
+// call has already been refused. A failure is announced immediately instead,
+// and the CLI declines to report the run as cleanly audited (Logger.Err).
+// This matters more here than anywhere else in the codebase: an A2A log is
+// the only record that a signed envelope crossed between two agents, and the
+// peer's own log is the other half of a story that must agree.
 func (g *Gate) log(event audit.EventType, details map[string]any) {
 	if g.logger == nil {
 		return
@@ -314,5 +334,7 @@ func (g *Gate) log(event audit.EventType, details map[string]any) {
 	g.mu.Lock()
 	runID, agentName := g.runID, g.agentName
 	g.mu.Unlock()
-	g.logger.Log(runID, agentName, event, details)
+	if err := g.logger.Log(runID, agentName, event, details); err != nil {
+		audit.WarnWriteFailure(event, err)
+	}
 }

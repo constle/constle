@@ -46,7 +46,7 @@ func writeSignedLog(t *testing.T, signer *testSigner, n int) string {
 	if err != nil {
 		t.Fatalf("NewSigned() error: %v", err)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	events := []EventType{
 		EventRunStarted, EventNetworkBlocked, EventNetworkAllowed,
@@ -141,7 +141,7 @@ func TestVerifyChainResumesAcrossLoggerSessions(t *testing.T) {
 	if err := logger.Log("run-def", "test-agent", EventRunStarted, nil); err != nil {
 		t.Fatalf("Log() error: %v", err)
 	}
-	logger.Close()
+	_ = logger.Close()
 
 	report, err := VerifyFile(path, "")
 	if err != nil {
@@ -214,7 +214,7 @@ func TestVerifyRejectsUnsignedLog(t *testing.T) {
 	if err := logger.Log("run-abc", "test-agent", EventRunStarted, nil); err != nil {
 		t.Fatalf("Log() error: %v", err)
 	}
-	logger.Close()
+	_ = logger.Close()
 
 	tamperKindAt(t, path, TamperMalformed, 1)
 }

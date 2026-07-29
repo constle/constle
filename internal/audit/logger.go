@@ -89,6 +89,11 @@ type Logger struct {
 	path     string
 	signer   Signer
 	lastHash string
+
+	// writeErr is the first Write failure this logger suffered, kept so a
+	// caller that could not act on the error at the call site can still
+	// discover, later, that the log is incomplete. See Err.
+	writeErr error
 }
 
 // New creates a Logger that writes to path, creating the directory if needed.
@@ -111,7 +116,9 @@ func New(path string) (*Logger, error) {
 	// Chown the directory too (not only created levels): it heals a dir left
 	// root-owned by runs that predate this ownership restoration.
 	if err := homedir.ChownToInvokingUser(dir, path); err != nil {
-		f.Close()
+		// Nothing was written yet, so a failed close of the file we are
+		// abandoning adds nothing to the ownership error being returned.
+		_ = f.Close()
 		return nil, fmt.Errorf("cannot restore log ownership to the invoking user: %w", err)
 	}
 
@@ -134,7 +141,9 @@ func NewSigned(path string, signer Signer) (*Logger, error) {
 
 	lastHash, err := lastLineHash(path)
 	if err != nil {
-		l.file.Close()
+		// Same as in New: the logger is being abandoned unused, so only the
+		// chain-resume failure is worth reporting.
+		_ = l.file.Close()
 		return nil, fmt.Errorf("cannot resume hash chain from %q: %w", path, err)
 	}
 
@@ -150,10 +159,23 @@ func (l *Logger) Signed() bool {
 
 // Write appends one Entry to the log file, signing and chaining it when the
 // logger has a signer.
+//
+// A failure is also retained (see Err): a dropped entry leaves a hole no
+// later reader can detect, so the failure must stay discoverable even when
+// the immediate caller has nowhere to report it.
 func (l *Logger) Write(entry Entry) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	err := l.writeLocked(entry)
+	if err != nil && l.writeErr == nil {
+		l.writeErr = err
+	}
+	return err
+}
+
+// writeLocked is Write's body; callers must hold l.mu.
+func (l *Logger) writeLocked(entry Entry) error {
 	if l.signer != nil {
 		entry.DID = l.signer.DID()
 		entry.PrevHash = l.lastHash
@@ -184,6 +206,22 @@ func (l *Logger) Write(entry Entry) error {
 		l.lastHash = hex.EncodeToString(sum[:])
 	}
 	return nil
+}
+
+// Err returns the first Write failure this logger suffered, or nil if every
+// entry it was given reached the file.
+//
+// This is what makes a dropped audit entry detectable at all. Verification
+// (constle audit verify) proves that the lines PRESENT are authentic and
+// their chain unbroken — it cannot prove that no line is missing, because a
+// line that was never written leaves nothing behind to notice. So a run that
+// reports success while Err is non-nil would be claiming a complete audit
+// record it does not have; callers must consult Err before saying the run's
+// log is whole.
+func (l *Logger) Err() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.writeErr
 }
 
 // lastLineHash returns the SHA-256 hex of the last non-empty line of the
@@ -231,6 +269,23 @@ func (l *Logger) LogWithIsolation(runID, agentName string, event EventType, isol
 		IsolationLevel: isolation,
 		Details:        details,
 	})
+}
+
+// WarnWriteFailure announces a dropped audit entry on stderr.
+//
+// It exists for the callers that genuinely cannot do anything else: the gate
+// proxies write their entries from HTTP handler goroutines, which have no
+// error return, and must not stop enforcing a policy just because they could
+// not record having enforced it. Announcing the loss the moment it happens is
+// what keeps it from being silent; the run-level consequence (a run that does
+// not claim success on an incomplete log) is applied by the CLI via
+// Logger.Err.
+//
+// Stderr, not stdout: stdout is the CLI's styled output channel and is
+// serialised behind its own lock, which this package has no access to.
+func WarnWriteFailure(event EventType, err error) {
+	fmt.Fprintf(os.Stderr, "constle: AUDIT WRITE FAILED for %s: %v\n", event, err)
+	fmt.Fprintf(os.Stderr, "         this run's audit log is incomplete — the event above was not recorded\n")
 }
 
 // Close closes the underlying log file.

@@ -26,7 +26,7 @@ func TestTeardownKillsHostSquid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(runDir)
+	defer func() { _ = os.RemoveAll(runDir) }()
 	if err := os.Chmod(runDir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestTeardownKillsHostSquid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("startHostSquid: %v", err)
 	}
-	defer killProcess(pid) // last-resort cleanup on failure
+	defer func() { _ = killProcess(pid) }() // last-resort cleanup on failure
 
 	if !cmdlineMatches(pid, "squid", "") {
 		t.Fatalf("freshly started squid (pid %d) not recognized by cmdlineMatches", pid)

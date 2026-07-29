@@ -30,7 +30,7 @@ func TestSubnetForRunDeterministicAndAligned(t *testing.T) {
 	}
 
 	var guestLast int
-	fmt.Sscanf(guest1, "172.30.%d.%d", &third, &guestLast)
+	_, _ = fmt.Sscanf(guest1, "172.30.%d.%d", &third, &guestLast)
 	if guestLast != last+1 {
 		t.Errorf("guest %q should be gateway+1 (%d)", guest1, last+1)
 	}

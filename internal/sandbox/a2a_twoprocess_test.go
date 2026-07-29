@@ -74,7 +74,7 @@ func waitForTCPUp(t *testing.T, addr string, within time.Duration) {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		if c, err := net.DialTimeout("tcp", addr, 300*time.Millisecond); err == nil {
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -163,8 +163,8 @@ human_gates:
 				t.Fatalf("start B: %v", err)
 			}
 			defer func() {
-				bCmd.Process.Kill()
-				bCmd.Wait()
+				_ = bCmd.Process.Kill()
+				_ = bCmd.Wait()
 			}()
 
 			waitForTCPUp(t, listenAddr, 90*time.Second)
@@ -182,7 +182,7 @@ human_gates:
 			select {
 			case <-bDone:
 			case <-time.After(60 * time.Second):
-				bCmd.Process.Kill()
+				_ = bCmd.Process.Kill()
 			}
 
 			aText, bText := aOut.String(), bOut.String()
@@ -254,8 +254,8 @@ human_gates:
 				t.Fatalf("start B: %v", err)
 			}
 			defer func() {
-				bCmd.Process.Kill()
-				bCmd.Wait()
+				_ = bCmd.Process.Kill()
+				_ = bCmd.Wait()
 			}()
 
 			waitForTCPUp(t, listenAddr, 90*time.Second)
@@ -286,7 +286,7 @@ human_gates:
 			select {
 			case <-bDone:
 			case <-time.After(60 * time.Second):
-				bCmd.Process.Kill()
+				_ = bCmd.Process.Kill()
 				<-bDone
 			}
 

@@ -73,11 +73,11 @@ func startPricedStub(t *testing.T, units int64) *pricedStub {
 		if len(msg.ID) > 0 {
 			id = string(msg.ID)
 		}
-		fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}],"usage":{"units":%d}}}`+"\n", id, stub.units)
+		_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}],"usage":{"units":%d}}}`+"\n", id, stub.units)
 	})
 	stub.srv = &http.Server{Handler: mux}
-	go stub.srv.Serve(ln)
-	t.Cleanup(func() { stub.srv.Close() })
+	go func() { _ = stub.srv.Serve(ln) }()
+	t.Cleanup(func() { _ = stub.srv.Close() })
 	return stub
 }
 
@@ -127,7 +127,7 @@ func runSpendScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentMan
 	if err != nil {
 		t.Fatalf("audit.New: %v", err)
 	}
-	defer logger.Close()
+	defer func() { _ = logger.Close() }()
 
 	tracker, err := spending.NewTracker(limits, store)
 	if err != nil {
@@ -138,7 +138,7 @@ func runSpendScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentMan
 	if err != nil {
 		t.Fatalf("mcpgate.New: %v", err)
 	}
-	defer gate.Close()
+	defer func() { _ = gate.Close() }()
 
 	setter, ok := backend.(MCPGateSetter)
 	if !ok {
@@ -150,7 +150,7 @@ func runSpendScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentMan
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer backend.Stop(runCtx)
+	defer func() { _ = backend.Stop(runCtx) }()
 
 	var killOnce sync.Once
 	gate.SetSpendKill(func() {
@@ -164,13 +164,13 @@ func runSpendScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentMan
 
 	done := make(chan struct{})
 	go func() {
-		backend.Wait(runCtx)
+		_, _ = backend.Wait(runCtx)
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Minute):
-		backend.Kill(runCtx)
+		_ = backend.Kill(runCtx)
 		t.Fatalf("scenario did not finish within 3 minutes")
 	}
 

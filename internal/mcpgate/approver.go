@@ -3,7 +3,6 @@ package mcpgate
 import (
 	"bufio"
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -87,15 +86,15 @@ func (a *TerminalApprover) Decide(ctx context.Context, req Request) Decision {
 		args = args[:500] + "…"
 	}
 
-	fmt.Fprintf(a.Out, "\n⏸  human gate: agent %q wants to call MCP tool %q on server %q\n",
+	outf(a.Out, "\n⏸  human gate: agent %q wants to call MCP tool %q on server %q\n",
 		req.AgentName, req.Tool, req.ServerID)
 	if args != "" {
-		fmt.Fprintf(a.Out, "   arguments: %s\n", args)
+		outf(a.Out, "   arguments: %s\n", args)
 	}
 
 	if !a.Interactive {
-		fmt.Fprintf(a.Out, "   stdin is not a terminal — cannot prompt for approval\n")
-		fmt.Fprintf(a.Out, "   applying on_timeout=%q in %ds\n", req.OnTimeout, req.TimeoutSeconds)
+		outf(a.Out, "   stdin is not a terminal — cannot prompt for approval\n")
+		outf(a.Out, "   applying on_timeout=%q in %ds\n", req.OnTimeout, req.TimeoutSeconds)
 		<-ctx.Done()
 		return DecisionNone
 	}
@@ -117,7 +116,7 @@ drain:
 		}
 	}
 
-	fmt.Fprintf(a.Out, "   approve? [a]pprove / [d]eny (timeout %ds → %s): ",
+	outf(a.Out, "   approve? [a]pprove / [d]eny (timeout %ds → %s): ",
 		req.TimeoutSeconds, req.OnTimeout)
 
 	for {
@@ -134,10 +133,10 @@ drain:
 			case "d", "deny", "n", "no":
 				return DecisionDenied
 			default:
-				fmt.Fprintf(a.Out, "   please answer [a]pprove or [d]eny: ")
+				outf(a.Out, "   please answer [a]pprove or [d]eny: ")
 			}
 		case <-ctx.Done():
-			fmt.Fprintf(a.Out, "\n   gate timed out waiting for input\n")
+			outf(a.Out, "\n   gate timed out waiting for input\n")
 			return DecisionNone
 		}
 	}

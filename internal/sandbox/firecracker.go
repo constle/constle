@@ -111,10 +111,16 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		return nil, fmt.Errorf("cannot create run directory: %w", err)
 	}
 
+	// As in DockerBackend.Start, every rollback step from here on discards
+	// its error deliberately: the returned error explains the failure, one
+	// failing step must not mask it or stop the steps after it, and the
+	// leftovers are swept up by cleanupAbandonedFirecracker(). Host state
+	// here is heavier than Docker's (TAP device, nftables rules, a Squid
+	// process, the jailer chroot), which is why the steps accumulate.
 	tapName := fcTAPName(runID)
 	gatewayIP, guestIP, err := createTAP(runID, tapName)
 	if err != nil {
-		os.RemoveAll(runDir)
+		_ = os.RemoveAll(runDir)
 		return nil, fmt.Errorf("cannot create TAP device: %w", err)
 	}
 
@@ -129,42 +135,42 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 	if len(m.MCP.Servers) > 0 {
 		gatePort, gateToken, err = f.mcpGate.Bind(runID, []string{gatewayIP})
 		if err != nil {
-			deleteTAP(tapName)
-			os.RemoveAll(runDir)
+			_ = deleteTAP(tapName)
+			_ = os.RemoveAll(runDir)
 			return nil, fmt.Errorf("cannot bind MCP gate: %w", err)
 		}
 	}
 	if len(m.A2A.Peers) > 0 {
 		a2aPort, a2aToken, err = f.a2aGate.Bind(runID, []string{gatewayIP})
 		if err != nil {
-			deleteTAP(tapName)
-			os.RemoveAll(runDir)
+			_ = deleteTAP(tapName)
+			_ = os.RemoveAll(runDir)
 			return nil, fmt.Errorf("cannot bind A2A gate: %w", err)
 		}
 	}
 	runGatePorts := gatePorts(gatePort, a2aPort)
 
 	if err := installNFTRules(runID, tapName, gatewayIP, runGatePorts); err != nil {
-		deleteTAP(tapName)
-		os.RemoveAll(runDir)
+		_ = deleteTAP(tapName)
+		_ = os.RemoveAll(runDir)
 		return nil, fmt.Errorf("cannot install nftables rules: %w", err)
 	}
 
 	squidPID, accessLogPath, err := startHostSquid(runID, runDir, gatewayIP, m.Sandbox.Network.AllowedHosts, runGatePorts)
 	if err != nil {
-		deleteNFTRules(runID)
-		deleteTAP(tapName)
-		os.RemoveAll(runDir)
+		_ = deleteNFTRules(runID)
+		_ = deleteTAP(tapName)
+		_ = os.RemoveAll(runDir)
 		return nil, fmt.Errorf("cannot start proxy: %w", err)
 	}
 
 	startTime := time.Now().UTC()
 
 	cleanupNet := func() {
-		killPID(squidPID)
-		deleteNFTRules(runID)
-		deleteTAP(tapName)
-		os.RemoveAll(runDir)
+		_ = killPID(squidPID)
+		_ = deleteNFTRules(runID)
+		_ = deleteTAP(tapName)
+		_ = os.RemoveAll(runDir)
 	}
 
 	gateEnv := mcpGateEnv(m, gatewayIP, gatePort, gateToken)
@@ -193,15 +199,15 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 
 	vmCmd, err := launchVM(runID, runDir)
 	if err != nil {
-		os.RemoveAll(filepath.Dir(chrootDir))
+		_ = os.RemoveAll(filepath.Dir(chrootDir))
 		cleanupNet()
 		return nil, fmt.Errorf("cannot launch microVM: %w", err)
 	}
 
 	if err := configureAndBootVM(runID, m.Sandbox.MemoryMB, tapName); err != nil {
-		vmCmd.Process.Kill()
-		vmCmd.Wait()
-		os.RemoveAll(filepath.Dir(chrootDir))
+		_ = vmCmd.Process.Kill()
+		_ = vmCmd.Wait()
+		_ = os.RemoveAll(filepath.Dir(chrootDir))
 		cleanupNet()
 		return nil, fmt.Errorf("cannot boot microVM: %w", err)
 	}
@@ -217,9 +223,9 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		IsolationLevel: string(m.Sandbox.Isolation),
 	}
 	if err := writeFCState(state); err != nil {
-		vmCmd.Process.Kill()
-		vmCmd.Wait()
-		os.RemoveAll(filepath.Dir(chrootDir))
+		_ = vmCmd.Process.Kill()
+		_ = vmCmd.Wait()
+		_ = os.RemoveAll(filepath.Dir(chrootDir))
 		cleanupNet()
 		return nil, fmt.Errorf("cannot write run state: %w", err)
 	}
@@ -251,7 +257,7 @@ func (f *FirecrackerBackend) Wait(ctx *RunContext) (int, error) {
 		// The error is deliberately ignored: a force-killed VM returns
 		// "signal: killed" here, but the authoritative agent exit code
 		// lives in the workspace image (or is absent, meaning killed).
-		cmd.Wait()
+		_ = cmd.Wait()
 	} else {
 		for fcProcessAlive(ctx.VMPid, ctx.RunID) {
 			time.Sleep(200 * time.Millisecond)
@@ -305,7 +311,7 @@ func (f *FirecrackerBackend) Stop(ctx *RunContext) error {
 
 	// Reap the child if this process started it, so no zombie remains.
 	if cmd, ok := f.vmCmds[ctx.RunID]; ok {
-		cmd.Wait()
+		_ = cmd.Wait()
 		delete(f.vmCmds, ctx.RunID)
 	}
 
@@ -390,7 +396,7 @@ func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, gu
 	if err := os.MkdirAll(staging, 0700); err != nil {
 		return "", err
 	}
-	defer os.RemoveAll(staging)
+	defer func() { _ = os.RemoveAll(staging) }()
 
 	proxyURL := fmt.Sprintf("http://%s:%d", gatewayIP, fcSquidPort)
 	env := map[string]string{
@@ -437,10 +443,16 @@ func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, gu
 	}
 	// 256 MB: room for the agent log alongside env+cmd.
 	if err := f.Truncate(256 * 1024 * 1024); err != nil {
-		f.Close()
+		// The truncate error is the one that explains the failure; this
+		// close only releases a handle to an image already being abandoned.
+		_ = f.Close()
 		return "", err
 	}
-	f.Close()
+	// mkfs.ext4 below reads this file back from disk, so the image must
+	// actually be there — a close that failed means it may not be.
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("cannot finalize workspace image: %w", err)
+	}
 
 	if out, err := exec.Command("mkfs.ext4", "-q", "-F", "-d", staging, workspacePath).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("mkfs.ext4: %s", strings.TrimSpace(string(out)))

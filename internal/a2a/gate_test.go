@@ -36,14 +36,14 @@ func (p *stubPeer) handler() http.HandlerFunc {
 		p.received = append(p.received, env)
 
 		if p.respond != nil {
-			w.Write(p.respond(env))
+			_, _ = w.Write(p.respond(env))
 			return
 		}
 		respWire, _, err := Seal(p.signer, env.From, env.MsgID, []byte(`{"pong":true}`))
 		if err != nil {
 			p.t.Fatalf("stub peer cannot seal response: %v", err)
 		}
-		w.Write(respWire)
+		_, _ = w.Write(respWire)
 	}
 }
 
@@ -61,7 +61,7 @@ func newBoundGate(t *testing.T, alice, bob *testSigner, endpoint string) (*Gate,
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { g.Close() })
+	t.Cleanup(func() { _ = g.Close() })
 
 	port, token, err := g.Bind("testrun01", []string{"127.0.0.1"})
 	if err != nil {
@@ -91,7 +91,7 @@ func TestGateOutboundRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST send: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
@@ -126,7 +126,7 @@ func TestGateRejectsUndeclaredPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("undeclared peer = HTTP %d, want 403", resp.StatusCode)
 	}
@@ -143,7 +143,7 @@ func TestGateRejectsWrongToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("wrong token = HTTP %d, want 404", resp.StatusCode)
 	}
@@ -158,7 +158,7 @@ func TestGateRejectsNonJSONBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("non-JSON body = HTTP %d, want 400", resp.StatusCode)
 	}
@@ -187,7 +187,7 @@ func TestGateRejectsResponseFromWrongIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("wrong-identity response = HTTP %d (%s), want 502", resp.StatusCode, body)
@@ -219,7 +219,7 @@ func TestGateRejectsResponseNotBoundToRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("unbound response = HTTP %d, want 502", resp.StatusCode)
 	}

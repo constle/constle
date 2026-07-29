@@ -44,6 +44,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -253,7 +254,17 @@ func (g *Gate) Bind(runID string, candidateIPs []string) (port int, token string
 	g.listeners = listeners
 	g.server = &http.Server{Handler: g}
 	for _, ln := range listeners {
-		go g.server.Serve(ln)
+		go func() {
+			// Serve never returns nil. ErrServerClosed is the ordinary exit
+			// (Close, at the end of the run); anything else means this
+			// listener died on its own. The gate fails closed either way —
+			// the agent's MCP calls start erroring — so the value of the
+			// error is telling the operator why, instead of leaving them to
+			// debug an agent that suddenly cannot reach a declared server.
+			if err := g.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				fmt.Fprintf(os.Stderr, "constle: MCP gate listener on %s stopped: %v\n", ln.Addr(), err)
+			}
+		}()
 	}
 
 	return port, g.token, nil
@@ -486,6 +497,14 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 
 // log writes one audit entry attributed to this run. Nil logger (unit tests)
 // is a no-op.
+//
+// Every event that reaches here is a decision the gate has already made and
+// acted on — a call blocked, approved, denied, or timed out. The write is
+// therefore deliberately NOT allowed to change that outcome: refusing an
+// already-approved call because the record of it could not be written would
+// make an unwritable disk a second, undeclared enforcement policy. What must
+// not happen is the loss going unnoticed, so a failure is announced at once
+// and the CLI refuses to report the run as cleanly audited (Logger.Err).
 func (g *Gate) log(event audit.EventType, details map[string]any) {
 	if g.logger == nil {
 		return
@@ -493,7 +512,21 @@ func (g *Gate) log(event audit.EventType, details map[string]any) {
 	g.mu.Lock()
 	runID, agentName := g.runID, g.agentName
 	g.mu.Unlock()
-	g.logger.Log(runID, agentName, event, details)
+	if err := g.logger.Log(runID, agentName, event, details); err != nil {
+		audit.WarnWriteFailure(event, err)
+	}
+}
+
+// outf writes one piece of operator-facing text — an approval prompt, a
+// webhook warning — to a caller-supplied writer.
+//
+// The dropped error is justified once here rather than at a dozen call
+// sites: this writer IS the channel constle reports problems on, so a
+// failure to write to it has nowhere left to be reported. Nothing the gate
+// enforces depends on it either — a gated call is decided and audited
+// whether or not the human ever saw the prompt.
+func outf(w io.Writer, format string, args ...any) {
+	_, _ = fmt.Fprintf(w, format, args...)
 }
 
 // jsonRPCMessage is the subset of a JSON-RPC request the gate inspects.
@@ -537,7 +570,11 @@ func writeJSONRPCError(w http.ResponseWriter, id json.RawMessage, message string
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	// A failed encode means the agent's connection is already gone, which is
+	// itself a denial of the call — the outcome this function exists to
+	// produce. There is no second channel to report it on and nothing to
+	// retry, so the error is dropped.
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      json.RawMessage(id),
 		"error": map[string]any{

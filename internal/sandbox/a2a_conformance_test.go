@@ -77,7 +77,7 @@ func freeLoopbackAddr(t *testing.T) string {
 		t.Fatalf("free port: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 	return addr
 }
 
@@ -144,37 +144,37 @@ func startA2AGate(t *testing.T, backend SandboxBackend, m *manifest.AgentManifes
 
 	gate, err := a2a.New(m, signer, logger)
 	if err != nil {
-		logger.Close()
+		_ = logger.Close()
 		t.Fatalf("a2a.New: %v", err)
 	}
 
 	setter, ok := backend.(A2AGateSetter)
 	if !ok {
-		gate.Close()
-		logger.Close()
+		_ = gate.Close()
+		_ = logger.Close()
 		t.Fatalf("backend %T does not implement A2AGateSetter", backend)
 	}
 	setter.SetA2AGate(gate)
 
 	runCtx, err := backend.Start(m)
 	if err != nil {
-		gate.Close()
-		logger.Close()
+		_ = gate.Close()
+		_ = logger.Close()
 		t.Fatalf("Start: %v", err)
 	}
 
 	if err := gate.StartListener(m.A2A.Listen); err != nil {
-		backend.Stop(runCtx)
-		gate.Close()
-		logger.Close()
+		_ = backend.Stop(runCtx)
+		_ = gate.Close()
+		_ = logger.Close()
 		t.Fatalf("StartListener: %v", err)
 	}
 	waitForTCP(t, m.A2A.Listen, 5*time.Second)
 
 	cleanup := func() {
-		backend.Stop(runCtx)
-		gate.Close()
-		logger.Close()
+		_ = backend.Stop(runCtx)
+		_ = gate.Close()
+		_ = logger.Close()
 	}
 	return runCtx, gate, logPath, cleanup
 }
@@ -184,7 +184,7 @@ func waitForTCP(t *testing.T, addr string, within time.Duration) {
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		if c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond); err == nil {
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -198,7 +198,7 @@ func postWire(t *testing.T, url string, wire []byte) (int, []byte) {
 	if err != nil {
 		t.Fatalf("POST %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	return resp.StatusCode, body
 }
@@ -266,11 +266,11 @@ func TestA2AInboundRejectionNeverReachesSandbox(t *testing.T) {
 			}
 
 			done := make(chan struct{})
-			go func() { backend.Wait(runCtx); close(done) }()
+			go func() { _, _ = backend.Wait(runCtx); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(3 * time.Minute):
-				backend.Kill(runCtx)
+				_ = backend.Kill(runCtx)
 				t.Fatalf("[%s] B did not finish in time", name)
 			}
 
@@ -482,14 +482,14 @@ func TestA2ADirectSandboxAccessFailsAtNetwork(t *testing.T) {
 			if err != nil {
 				t.Fatalf("attacker Start: %v", err)
 			}
-			defer attacker.Stop(aCtx)
+			defer func() { _ = attacker.Stop(aCtx) }()
 
 			done := make(chan struct{})
-			go func() { attacker.Wait(aCtx); close(done) }()
+			go func() { _, _ = attacker.Wait(aCtx); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(3 * time.Minute):
-				attacker.Kill(aCtx)
+				_ = attacker.Kill(aCtx)
 				t.Fatalf("[%s] attacker did not finish", name)
 			}
 
@@ -507,11 +507,11 @@ func TestA2ADirectSandboxAccessFailsAtNetwork(t *testing.T) {
 
 			// Let B finish and confirm its sandbox never saw the attacker.
 			bDone := make(chan struct{})
-			go func() { backend.Wait(bCtx); close(bDone) }()
+			go func() { _, _ = backend.Wait(bCtx); close(bDone) }()
 			select {
 			case <-bDone:
 			case <-time.After(3 * time.Minute):
-				backend.Kill(bCtx)
+				_ = backend.Kill(bCtx)
 				t.Fatalf("[%s] B did not finish", name)
 			}
 			bLogs, err := backend.Logs(bCtx)

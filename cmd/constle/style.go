@@ -53,6 +53,13 @@ import (
 //
 // TODO(brand): colDanger is a PLACEHOLDER (Tailwind red-500). Replace with the
 // exact brand danger/error red once the brand guide pins a value.
+//
+// colDanger is deliberately used ONLY as the failure pill's fill (see pill).
+// It has no foreground-text style, because the design language above puts
+// every warning in amber and reserves red for that single filled moment; and
+// the obvious other candidate — die()'s message — writes to stderr, which
+// `styled` (a check on stdout) is the wrong gate for. Restore a text style
+// here only alongside a real caller.
 const (
 	colInk        = "#F3F4F6" // primary text (brand Soft Gray)
 	colMuted      = "#8B95A5" // secondary text / labels (readable dim)
@@ -84,14 +91,16 @@ var (
 	styleOnce sync.Once
 	rndr      *lipgloss.Renderer
 
-	stWord    lipgloss.Style // wordmark
-	stVer     lipgloss.Style // version / faint meta
-	stMuted   lipgloss.Style // labels, secondary
-	stInk     lipgloss.Style // primary values
-	stAccent  lipgloss.Style // accent text (spinner, marks)
-	stGreen   lipgloss.Style
-	stAmber   lipgloss.Style
-	stDanger  lipgloss.Style
+	stWord   lipgloss.Style // wordmark
+	stVer    lipgloss.Style // version / faint meta
+	stMuted  lipgloss.Style // labels, secondary
+	stInk    lipgloss.Style // primary values
+	stAccent lipgloss.Style // accent text (spinner, marks)
+	stGreen  lipgloss.Style
+	stAmber  lipgloss.Style
+	// No stDanger: the palette's danger red is a FILL, never foreground text
+	// — see colDanger's note. pill() applies it directly as a background, so
+	// a red text style would have no caller.
 	stMark    lipgloss.Style // mascot mark (help screen only)
 	stAgtHead lipgloss.Style // AGENT OUTPUT heading (accent, bold)
 	stSpine   lipgloss.Style // the ▎ accent spine beside agent output
@@ -109,7 +118,6 @@ func initStyles() {
 		stAccent = rndr.NewStyle().Foreground(c(colAccent))
 		stGreen = rndr.NewStyle().Foreground(c(colGreen))
 		stAmber = rndr.NewStyle().Foreground(c(colAmber))
-		stDanger = rndr.NewStyle().Foreground(c(colDanger))
 		stMark = rndr.NewStyle().Foreground(c(colAccent))
 		stAgtHead = rndr.NewStyle().Bold(true).Foreground(c(colAccent))
 		stSpine = rndr.NewStyle().Foreground(c(colAccent))
@@ -298,20 +306,37 @@ func pill(label string, kind statusKind) string {
 func warnBlock(w io.Writer, lines []string) {
 	if !styled || !isStdout(w) {
 		for _, ln := range lines {
-			fmt.Fprintln(w, ln)
+			fprintln(w, ln)
 		}
-		fmt.Fprintln(w)
+		fprintln(w)
 		return
 	}
 	initStyles()
 	// lines[0] is the headline (may start with the plain "⚠️  warning:"
 	// prefix); the rest are continuation detail. Restyle without emoji.
 	head := stripWarnPrefix(lines[0])
-	fmt.Fprintf(w, "%s%s %s\n", indent, stAmber.Bold(true).Render("!"), stAmber.Render(head))
+	fprintf(w, "%s%s %s\n", indent, stAmber.Bold(true).Render("!"), stAmber.Render(head))
 	for _, ln := range lines[1:] {
-		fmt.Fprintf(w, "%s  %s\n", indent, stMuted.Render(strings.TrimLeft(ln, " ")))
+		fprintf(w, "%s  %s\n", indent, stMuted.Render(strings.TrimLeft(ln, " ")))
 	}
-	fmt.Fprintln(w)
+	fprintln(w)
+}
+
+// fprintf and fprintln write operator-facing text to a caller-supplied
+// writer — stdout in production, a capture buffer in tests.
+//
+// Their errors are dropped, deliberately and in one place rather than at
+// every call site: this writer is the channel constle reports problems on,
+// so a write that fails has nowhere left to report itself, and nothing the
+// CLI decides depends on the text having landed. Writes that DO carry a
+// consequence (the audit log, the spending ledger) go through their own
+// packages, never through here.
+func fprintf(w io.Writer, format string, args ...any) {
+	_, _ = fmt.Fprintf(w, format, args...)
+}
+
+func fprintln(w io.Writer, args ...any) {
+	_, _ = fmt.Fprintln(w, args...)
 }
 
 // stripWarnPrefix removes the plain "⚠️  warning:" lead-in so the styled
