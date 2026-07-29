@@ -53,7 +53,7 @@ func launchVM(runID, runDir string) (*exec.Cmd, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer console.Close()
+	defer func() { _ = console.Close() }()
 
 	cmd := exec.Command("jailer",
 		"--id", runID,
@@ -77,14 +77,18 @@ func launchVM(runID, runDir string) (*exec.Cmd, error) {
 		}
 		// If the VMM died during startup, surface its console output.
 		if cmd.ProcessState != nil || !processExists(cmd.Process.Pid) {
-			cmd.Wait()
+			_ = cmd.Wait()
 			tail, _ := os.ReadFile(fcConsoleLogPath(runDir))
 			return nil, fmt.Errorf("firecracker exited during startup: %s", lastLines(tail, 5))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	cmd.Process.Kill()
-	cmd.Wait()
+	// The VMM never came up; kill and reap it so no orphan survives this
+	// failed launch. Both errors are discarded because the timeout below is
+	// the failure worth reporting, and a process that resists the kill is
+	// caught by cleanupAbandonedFirecracker() on the next run.
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
 	return nil, fmt.Errorf("firecracker API socket did not appear at %s", socket)
 }
 
@@ -189,7 +193,7 @@ func (c *fcClient) put(path string, body any) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(resp.Body)

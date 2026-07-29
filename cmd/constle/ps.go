@@ -51,16 +51,19 @@ func runPS() error {
 		return renderPSStyled(rows)
 	}
 
+	// These writes only fill the tabwriter's internal buffer — nothing
+	// reaches stdout until Flush, whose error is the one returned below. So
+	// the per-row errors are dropped because Flush already carries them.
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "RUN ID\tAGENT\tSTATUS\tDURATION")
-	fmt.Fprintln(w, "------\t-----\t------\t--------")
+	fprintln(w, "RUN ID\tAGENT\tSTATUS\tDURATION")
+	fprintln(w, "------\t-----\t------\t--------")
 
 	for _, row := range rows {
 		displayID := row.runID
 		if len(displayID) > 12 {
 			displayID = displayID[:12] + "..."
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+		fprintf(w, "%s\t%s\t%s\t%s\n",
 			displayID, row.agentName, row.status, row.duration)
 	}
 

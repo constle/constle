@@ -61,7 +61,7 @@ func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness 
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"sent"}]}}`)
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"sent"}]}}`)
 	}))
 	t.Cleanup(up.Close)
 
@@ -70,7 +70,7 @@ func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness 
 	if err != nil {
 		t.Fatalf("audit.New: %v", err)
 	}
-	t.Cleanup(func() { logger.Close() })
+	t.Cleanup(func() { _ = logger.Close() })
 
 	m := &manifest.AgentManifest{
 		Identity: manifest.Identity{Name: "test-agent"},
@@ -95,7 +95,7 @@ func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness 
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	t.Cleanup(func() { g.Close() })
+	t.Cleanup(func() { _ = g.Close() })
 
 	return &gateHarness{
 		gate:     g,
@@ -117,7 +117,7 @@ func postJSON(t *testing.T, url, body string) (int, string) {
 	if err != nil {
 		t.Fatalf("POST %s: %v", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	data, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(data)
 }
@@ -302,7 +302,7 @@ func TestFailClosedInputs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gzip request: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusUnsupportedMediaType {
 		t.Errorf("gzip body: status=%d, want 415", resp.StatusCode)
 	}
@@ -390,8 +390,8 @@ func TestInteractiveApproveAndDeny(t *testing.T) {
 		w := bufio.NewWriter(inW)
 		for _, answer := range answers {
 			<-out.prompts
-			fmt.Fprint(w, answer)
-			w.Flush()
+			_, _ = fmt.Fprint(w, answer)
+			_ = w.Flush()
 		}
 	}()
 
@@ -436,7 +436,7 @@ func TestApproveVersusTimeoutRace(t *testing.T) {
 			t.Fatalf("round %d: upstream called=%v but approved=%d — enforcement and audit disagree",
 				i, upstreamCalled, approved)
 		}
-		h.gate.Close()
+		_ = h.gate.Close()
 	}
 }
 
@@ -456,7 +456,7 @@ func TestGateKilledMidFlightFailsClosed(t *testing.T) {
 		defer wg.Done()
 		resp, err := http.Post(h.baseURL, "application/json", strings.NewReader(toolCallBody("send_email")))
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			// A response is only acceptable if it is a gate-side error,
 			// never a success that implies the upstream answered.
 			if resp.StatusCode == 200 && h.calls.Load() > 0 {
@@ -496,7 +496,7 @@ func TestStaleKeystrokeDoesNotApproveNextGate(t *testing.T) {
 	approver.readOnce.Do(approver.startReader)
 
 	// Type "a" with no prompt waiting; give the reader a moment to park it.
-	go fmt.Fprintln(inW, "a")
+	go func() { _, _ = fmt.Fprintln(inW, "a") }()
 	time.Sleep(100 * time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)

@@ -176,10 +176,15 @@ func teardownFirecrackerRun(st *fcRunState) []string {
 	// flush its access log, but never report success while it is still
 	// alive (its shutdown takes ~2s even with shutdown_lifetime 0):
 	// wait for it to exit, escalate to SIGKILL, and surface survival.
+	//
+	// The signal errors themselves are discarded on purpose: what matters
+	// is not whether the signal was accepted but whether the process is
+	// gone, and waitProcessGone answers that directly — a signal that
+	// silently failed still ends up reported below as "still running".
 	if cmdlineMatches(st.SquidPID, "squid", "") {
-		termProcess(st.SquidPID)
+		_ = termProcess(st.SquidPID)
 		if !waitProcessGone(st.SquidPID, "squid", 5*time.Second) {
-			killProcess(st.SquidPID)
+			_ = killProcess(st.SquidPID)
 			if !waitProcessGone(st.SquidPID, "squid", 2*time.Second) {
 				errs = append(errs, fmt.Sprintf("squid %d still running after SIGKILL", st.SquidPID))
 			}
@@ -234,7 +239,7 @@ func cleanupAbandonedFirecracker() {
 			// State never written or corrupt — remove the debris but keep
 			// directories that are too young to judge (Start may be racing).
 			if info, statErr := entry.Info(); statErr == nil && time.Since(info.ModTime()) > time.Minute {
-				os.RemoveAll(filepath.Join(fcRunsDir, entry.Name()))
+				_ = os.RemoveAll(filepath.Join(fcRunsDir, entry.Name()))
 			}
 			continue
 		}

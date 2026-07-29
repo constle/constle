@@ -102,8 +102,14 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 		return nil, fmt.Errorf("cannot create external network: %w", err)
 	}
 
+	// Every rollback step below unwinds resources this Start() already
+	// created, and every one of them discards its error on purpose: the
+	// error being returned is the one that explains why the run could not
+	// start, a rollback step must not mask it or stop the steps after it,
+	// and whatever a failed step leaves behind is swept up by
+	// cleanupAbandoned() at the top of the next run.
 	if err := dockerRun("network", "create", "--internal", intNet); err != nil {
-		dockerRun("network", "rm", extNet)
+		_ = dockerRun("network", "rm", extNet)
 		return nil, fmt.Errorf("cannot create internal network: %w", err)
 	}
 
@@ -120,49 +126,49 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 	if len(m.MCP.Servers) > 0 || len(m.A2A.Peers) > 0 {
 		gateHost, err = resolveMCPGateIPv4()
 		if err != nil {
-			dockerRun("network", "rm", extNet)
-			dockerRun("network", "rm", intNet)
+			_ = dockerRun("network", "rm", extNet)
+			_ = dockerRun("network", "rm", intNet)
 			return nil, fmt.Errorf("cannot set up gate route: %w", err)
 		}
 	}
 	if len(m.MCP.Servers) > 0 {
 		gatePort, gateToken, err = d.mcpGate.Bind(runID, gateBindCandidates(gateHost))
 		if err != nil {
-			dockerRun("network", "rm", extNet)
-			dockerRun("network", "rm", intNet)
+			_ = dockerRun("network", "rm", extNet)
+			_ = dockerRun("network", "rm", intNet)
 			return nil, fmt.Errorf("cannot bind MCP gate: %w", err)
 		}
 	}
 	if len(m.A2A.Peers) > 0 {
 		a2aPort, a2aToken, err = d.a2aGate.Bind(runID, gateBindCandidates(gateHost))
 		if err != nil {
-			dockerRun("network", "rm", extNet)
-			dockerRun("network", "rm", intNet)
+			_ = dockerRun("network", "rm", extNet)
+			_ = dockerRun("network", "rm", intNet)
 			return nil, fmt.Errorf("cannot bind A2A gate: %w", err)
 		}
 	}
 
 	squidConfigPath, err := writeSquidConfig(runID, m.Sandbox.Network.AllowedHosts, gateHost, gatePorts(gatePort, a2aPort))
 	if err != nil {
-		dockerRun("network", "rm", extNet)
-		dockerRun("network", "rm", intNet)
+		_ = dockerRun("network", "rm", extNet)
+		_ = dockerRun("network", "rm", intNet)
 		return nil, fmt.Errorf("cannot write Squid config: %w", err)
 	}
 
 	proxyID, err := startProxyContainer(proxyName, extNet, intNet, squidConfigPath)
 	if err != nil {
-		dockerRun("network", "rm", extNet)
-		dockerRun("network", "rm", intNet)
-		os.Remove(squidConfigPath)
+		_ = dockerRun("network", "rm", extNet)
+		_ = dockerRun("network", "rm", intNet)
+		_ = os.Remove(squidConfigPath)
 		return nil, fmt.Errorf("cannot start proxy: %w", err)
 	}
 
 	if err := waitForSquid(proxyName); err != nil {
-		dockerRun("stop", proxyName)
-		dockerRun("rm", "-f", proxyName)
-		dockerRun("network", "rm", extNet)
-		dockerRun("network", "rm", intNet)
-		os.Remove(squidConfigPath)
+		_ = dockerRun("stop", proxyName)
+		_ = dockerRun("rm", "-f", proxyName)
+		_ = dockerRun("network", "rm", extNet)
+		_ = dockerRun("network", "rm", intNet)
+		_ = os.Remove(squidConfigPath)
 		return nil, fmt.Errorf("proxy did not start: %w", err)
 	}
 
@@ -195,11 +201,11 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 
 	agentID, err := startAgentContainer(agentName, intNet, image, m.Sandbox.MemoryMB, m.Sandbox.Command, agentLabels, agentEnv)
 	if err != nil {
-		dockerRun("stop", proxyName)
-		dockerRun("rm", "-f", proxyName)
-		dockerRun("network", "rm", extNet)
-		dockerRun("network", "rm", intNet)
-		os.Remove(squidConfigPath)
+		_ = dockerRun("stop", proxyName)
+		_ = dockerRun("rm", "-f", proxyName)
+		_ = dockerRun("network", "rm", extNet)
+		_ = dockerRun("network", "rm", intNet)
+		_ = os.Remove(squidConfigPath)
 		return nil, fmt.Errorf("cannot start agent: %w", err)
 	}
 
@@ -259,7 +265,7 @@ func (d *DockerBackend) Stop(ctx *RunContext) error {
 	}
 
 	if ctx.SquidConfigPath != "" {
-		os.Remove(ctx.SquidConfigPath)
+		_ = os.Remove(ctx.SquidConfigPath)
 	}
 
 	if len(errs) > 0 {
@@ -563,10 +569,10 @@ func cleanupAbandoned() {
 		seen[runID] = true
 
 		for _, name := range []string{"constle-agent-" + runID, "constle-proxy-" + runID} {
-			exec.Command("docker", "rm", "-f", name).Run()
+			_ = exec.Command("docker", "rm", "-f", name).Run()
 		}
 		for _, net := range []string{"constle-int-" + runID, "constle-ext-" + runID} {
-			exec.Command("docker", "network", "rm", net).Run()
+			_ = exec.Command("docker", "network", "rm", net).Run()
 		}
 	}
 }

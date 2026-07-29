@@ -51,9 +51,9 @@ func freshSpendIdentity(t *testing.T, tag string) (name, did string) {
 	did = id.DID()
 
 	t.Cleanup(func() {
-		os.RemoveAll(filepath.Join(identity.Root(), name))
-		os.RemoveAll(ledgerDirFor(did))
-		os.Remove(audit.DefaultLogPath(name))
+		_ = os.RemoveAll(filepath.Join(identity.Root(), name))
+		_ = os.RemoveAll(ledgerDirFor(did))
+		_ = os.Remove(audit.DefaultLogPath(name))
 	})
 	return name, did
 }

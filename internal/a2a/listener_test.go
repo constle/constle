@@ -29,7 +29,7 @@ func newInboundGate(t *testing.T, bob, alice *testSigner) (*Gate, string, string
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { g.Close() })
+	t.Cleanup(func() { _ = g.Close() })
 	g.replyTimeoutOverride = 2 * time.Second
 	g.pollTimeoutOverride = 200 * time.Millisecond
 
@@ -39,7 +39,7 @@ func newInboundGate(t *testing.T, bob, alice *testSigner) (*Gate, string, string
 		t.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 	if err := g.StartListener(addr); err != nil {
 		t.Fatalf("StartListener: %v", err)
 	}
@@ -57,7 +57,7 @@ func waitForListener(t *testing.T, addr string) {
 	t.Helper()
 	for i := 0; i < 50; i++ {
 		if c, err := net.Dial("tcp", addr); err == nil {
-			c.Close()
+			_ = c.Close()
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -73,7 +73,7 @@ func assertInboxEmpty(t *testing.T, g *Gate, sandboxURL string) {
 	if err != nil {
 		t.Fatalf("GET inbox: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("inbox = HTTP %d, want 204 (empty)", resp.StatusCode)
 	}
@@ -101,12 +101,12 @@ func TestInboundFullFlow(t *testing.T) {
 				if resp.StatusCode == http.StatusOK {
 					break
 				}
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 			if resp.StatusCode != http.StatusOK {
 				return fmt.Errorf("inbox never delivered (last HTTP %d)", resp.StatusCode)
 			}
-			defer resp.Body.Close()
+			defer func() { _ = resp.Body.Close() }()
 			body, _ := io.ReadAll(resp.Body)
 			if string(body) != `{"task":"ping"}` {
 				return fmt.Errorf("delivered body = %s", body)
@@ -124,7 +124,7 @@ func TestInboundFullFlow(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			rr.Body.Close()
+			_ = rr.Body.Close()
 			if rr.StatusCode != http.StatusNoContent {
 				return fmt.Errorf("reply = HTTP %d", rr.StatusCode)
 			}
@@ -141,7 +141,7 @@ func TestInboundFullFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST public: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respWire, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("public call = HTTP %d: %s", resp.StatusCode, respWire)
@@ -180,7 +180,7 @@ func TestInboundUnknownPeerNeverReachesInbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST public: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("unknown peer = HTTP %d, want 403", resp.StatusCode)
 	}
@@ -214,7 +214,7 @@ func TestInboundForgedAndTamperedRejected(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: POST: %v", name, err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("%s = HTTP %d, want 403", name, resp.StatusCode)
 		}
@@ -232,7 +232,7 @@ func TestInboundGarbageLeavesListenerAlive(t *testing.T) {
 		if err != nil {
 			t.Fatalf("garbage POST failed at transport level: %v", err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("garbage %q = HTTP %d, want 403", garbage[:min(len(garbage), 12)], resp.StatusCode)
 		}
@@ -243,7 +243,7 @@ func TestInboundGarbageLeavesListenerAlive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET on call path = HTTP %d, want 404", resp.StatusCode)
 	}
@@ -262,7 +262,7 @@ func TestInboundGarbageLeavesListenerAlive(t *testing.T) {
 			done <- -1
 			return
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		done <- resp.StatusCode
 	}()
 	// No agent replies — expect the reply timeout (504), which proves the
@@ -289,7 +289,7 @@ func TestInboundOversizedBodyCappedBeforeParse(t *testing.T) {
 		// crash is not.
 		t.Logf("oversized upload ended with transport error (acceptable): %v", err)
 	} else {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusRequestEntityTooLarge {
 			t.Fatalf("oversized body = HTTP %d, want 413", resp.StatusCode)
 		}
@@ -333,7 +333,7 @@ func TestInboundReplayRejected(t *testing.T) {
 			first <- -1
 			return
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		first <- resp.StatusCode
 	}()
 
@@ -351,7 +351,7 @@ func TestInboundReplayRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("replayed envelope = HTTP %d, want 403", resp.StatusCode)
 	}
@@ -364,7 +364,7 @@ func TestInboundReplayRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET inbox: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("inbox = HTTP %d, want 200", resp.StatusCode)
 	}
@@ -386,7 +386,7 @@ func fillPeerQuota(t *testing.T, g *Gate, publicURL string, from *testSigner, to
 		go func() {
 			resp, err := http.Post(publicURL, "application/json", bytes.NewReader(wire))
 			if err == nil {
-				resp.Body.Close()
+				_ = resp.Body.Close()
 			}
 		}()
 	}
@@ -415,7 +415,7 @@ func TestInboundInboxFullShedsLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("overflow POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("overflow call = HTTP %d, want 503", resp.StatusCode)
 	}
@@ -444,7 +444,7 @@ func TestInboxQuotaFreesAfterDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("call at quota = HTTP %d, want 503", resp.StatusCode)
 	}
@@ -454,7 +454,7 @@ func TestInboxQuotaFreesAfterDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET inbox: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("inbox = HTTP %d, want 200", resp.StatusCode)
 	}
@@ -469,7 +469,7 @@ func TestInboxQuotaFreesAfterDelivery(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST after release: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		t.Fatal("same peer still shed after a delivery freed a slot — quota never released")
 	}
@@ -503,7 +503,7 @@ func TestInboxIsolationBetweenPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { g.Close() })
+	t.Cleanup(func() { _ = g.Close() })
 	g.replyTimeoutOverride = 500 * time.Millisecond
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -511,7 +511,7 @@ func TestInboxIsolationBetweenPeers(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close()
+	_ = ln.Close()
 	if err := g.StartListener(addr); err != nil {
 		t.Fatalf("StartListener: %v", err)
 	}
@@ -530,7 +530,7 @@ func TestInboxIsolationBetweenPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("alice over quota = HTTP %d, want 503", resp.StatusCode)
 	}
@@ -545,7 +545,7 @@ func TestInboxIsolationBetweenPeers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("carol POST: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusServiceUnavailable {
 		t.Fatal("carol was shed because of alice's noise — quota is not per-peer")
 	}
@@ -567,7 +567,7 @@ func TestReplyToUnknownMsgID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST reply: %v", err)
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("reply to unknown msg_id = HTTP %d, want 404", resp.StatusCode)
 	}
