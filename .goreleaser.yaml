@@ -105,6 +105,55 @@ checksum:
   algorithm: sha256
 
 # ---------------------------------------------------------------------------
+# Signing — cosign keyless signature over checksums.txt
+# ---------------------------------------------------------------------------
+# We sign only checksums.txt, not each archive. That file already contains the
+# SHA-256 of every archive, so one signature transitively covers all six:
+# verify the signature on checksums.txt, then sha256sum --check your download.
+#
+# "Keyless" means there is no private key to store or rotate. cosign exchanges
+# the GitHub Actions OIDC token for a short-lived (10 minute) certificate from
+# Fulcio, signs with it, and records the signature in the Rekor public
+# transparency log. The certificate embeds the identity that signed - the
+# workflow file and the ref - which is what users check at verify time.
+#
+# This requires `id-token: write` permission in the workflow and an OIDC token,
+# so it only works in CI. Local `goreleaser release --snapshot` skips signing.
+signs:
+  - id: checksums-keyless
+    cmd: cosign
+
+    # Sign the checksum file only.
+    artifacts: checksum
+
+    # ${artifact} is the file being signed; ${signature} and ${certificate} are
+    # the output paths GoReleaser expects back. Both outputs are uploaded to
+    # the release alongside checksums.txt.
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+
+    # -y answers "yes" to the transparency-log upload prompt, which would
+    # otherwise block forever on a non-interactive CI runner.
+    args:
+      - "sign-blob"
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+      - "-y"
+
+    output: true
+
+# ---------------------------------------------------------------------------
+# Release — how the GitHub Release itself is published
+# ---------------------------------------------------------------------------
+# "auto" marks the release as a prerelease when the tag contains a hyphenated
+# suffix (v0.5.1-rc1, v1.0.0-beta.2). GitHub does not hand the "Latest" badge
+# to a prerelease, so test tags never become the download the repo page points
+# people at. Plain tags (v0.5.1) are published as normal releases.
+release:
+  prerelease: auto
+
+# ---------------------------------------------------------------------------
 # Snapshot — settings for local "dry run" builds (no real tag required)
 # ---------------------------------------------------------------------------
 # goreleaser release --snapshot --clean
