@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/mattn/go-isatty"
 )
 
 // TerminalApprover collects approve/deny decisions from the operator's
@@ -52,21 +54,22 @@ func NewTerminalApprover(out io.Writer) *TerminalApprover {
 
 // stdinIsTerminal reports whether os.Stdin is a terminal a human can answer
 // on. Pipes and files are not (reading a prompt answer from those blocks
-// forever or returns garbage), and neither is /dev/null — it is a character
-// device like a tty, but delivers only instant EOF, the standard stdin of
-// daemonized runs.
+// forever or returns garbage), and neither is /dev/null or Windows NUL — a
+// character device like a tty, but one that delivers only instant EOF, the
+// standard stdin of daemonized runs.
+//
+// This uses mattn/go-isatty (ioctl on unix, GetConsoleMode on Windows) rather
+// than a hand-rolled os.Stat + SameFile(os.DevNull) check, because SameFile is
+// not correct on Windows: Stat fills the volume/file-index identity fields
+// only for real files, so every character device — a live console just as much
+// as NUL — carries the same all-zero identity and compares equal. That made
+// this function return false on every Windows console, silently downgrading
+// interactive human gates to "resolve by timeout" for all Windows users.
+// cmd/constle/style.go's detectStyled() gates stdout on isatty for exactly
+// this reason; stdin now matches.
 func stdinIsTerminal() bool {
-	info, err := os.Stdin.Stat()
-	if err != nil {
-		return false
-	}
-	if info.Mode()&os.ModeCharDevice == 0 {
-		return false
-	}
-	if nullInfo, err := os.Stat(os.DevNull); err == nil && os.SameFile(info, nullInfo) {
-		return false
-	}
-	return true
+	fd := os.Stdin.Fd()
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 }
 
 // Decide prompts for a decision, or — when non-interactive — announces that
