@@ -777,6 +777,21 @@ func renderRunSummary(m *manifest.AgentManifest) {
 		{"isolation", stInk.Render(string(m.Sandbox.Isolation))},
 		{"memory", stInk.Render(fmt.Sprintf("%d MB", m.Sandbox.MemoryMB))},
 	}
+	// KNOWN GAP (stated rather than implied, as elsewhere): the "restricted"
+	// qualifier below is hardcoded, and it is accurate only because
+	// network.egress is not enforced anywhere. The field is declared on
+	// manifest.Network and defaulted to "restricted" by the parser, but it has
+	// no consumer: egress is derived solely from network.allowed_hosts, which
+	// becomes the Squid dstdomain allowlist (an empty list denies everything).
+	// So `egress: open` and `egress: none` parse cleanly, change nothing, and
+	// still render as "restricted" here — a declared policy that looks real and
+	// is not, which is exactly what warnUnenforcedHumanGates and
+	// warnUnverifiableIdentity exist to prevent elsewhere.
+	//
+	// Fixing this means deciding what egress: open should DO, not just what it
+	// should print; until that decision is made, this label must not be derived
+	// from the field, because deriving it would make the display honest about a
+	// value the runtime still ignores.
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		rows = append(rows, kv{"network", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", ")) + stMuted.Render("  ∙  restricted")})
 	}
