@@ -6,7 +6,9 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: write      # create the GitHub Release and upload assets
+  id-token: write      # mint the OIDC token cosign trades for a Fulcio cert
+  attestations: write  # write the build-provenance attestation to the repo
 
 jobs:
   goreleaser:
@@ -23,6 +25,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Puts the `cosign` binary on PATH. GoReleaser's signs block shells out to
+      # it, so this must run before GoReleaser, not after.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
@@ -30,3 +37,17 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build provenance is separate from, and complementary to, the cosign
+      # signature. cosign proves "this checksums.txt came out of this workflow";
+      # the attestation is a signed SLSA statement about how each archive was
+      # built, verifiable with `gh attestation verify <file> --repo constle/constle`.
+      #
+      # GoReleaser leaves the archives in dist/, so we point at them by glob.
+      # Both patterns are needed: tar.gz for linux/darwin, zip for windows.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip

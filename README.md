@@ -73,6 +73,43 @@ go build -o constle ./cmd/constle
 
 Requires Go 1.26+. Pre-built binaries for Linux, macOS, and Windows are on the [releases page](https://github.com/constle/constle/releases).
 
+### Verify your download
+
+Every release ships a `checksums.txt` covering all six archives, signed with
+[cosign](https://docs.sigstore.dev/) keyless signing from the release workflow.
+Download `checksums.txt`, `checksums.txt.sig`, and `checksums.txt.pem` from the
+release page next to your archive, then:
+
+```bash
+cosign verify-blob \
+  --certificate checksums.txt.pem \
+  --signature checksums.txt.sig \
+  --certificate-identity-regexp '^https://github\.com/constle/constle/\.github/workflows/release\.yaml@refs/tags/v' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  checksums.txt
+```
+
+Expect `Verified OK`. Then check your archive against the now-trusted checksum file:
+
+```bash
+sha256sum --check --ignore-missing checksums.txt
+```
+
+The two `--certificate-*` flags are **not optional**. Keyless signing has no
+fixed public key: anyone can obtain a valid Fulcio certificate and sign
+anything. What makes the signature mean something is *which identity* it binds
+to. Without `--certificate-identity-regexp` and `--certificate-oidc-issuer`,
+cosign will happily report `Verified OK` for a file signed by a complete
+stranger - all it proves is that *somebody* signed it. Pinning the identity to
+`constle/constle`'s `release.yaml` on a `v*` tag, issued by GitHub's OIDC
+issuer, is what turns that into "this came from the Constle release workflow."
+
+Each archive additionally carries a SLSA build-provenance attestation:
+
+```bash
+gh attestation verify constle_0.5.0_linux_amd64.tar.gz --repo constle/constle
+```
+
 ### Write an AgentManifest
 
 ```yaml
