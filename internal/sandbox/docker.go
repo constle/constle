@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -155,7 +156,17 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 		return nil, fmt.Errorf("cannot write Squid config: %w", err)
 	}
 
-	proxyID, err := startProxyContainer(proxyName, extNet, intNet, squidConfigPath)
+	// Identity labels shared by both containers of the run. The proxy must
+	// carry them too: cleanupAbandoned locates containers by label, so an
+	// unlabelled proxy is invisible to the sweeper forever — and a proxy is
+	// precisely what is left over when the agent never got started.
+	runLabels := map[string]string{
+		"constle.managed":    "true",
+		"constle.run-id":     runID,
+		"constle.agent-name": m.Identity.Name,
+	}
+
+	proxyID, err := startProxyContainer(proxyName, extNet, intNet, squidConfigPath, runLabels)
 	if err != nil {
 		_ = dockerRun("network", "rm", extNet)
 		_ = dockerRun("network", "rm", intNet)
@@ -178,11 +189,9 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 	}
 
 	startTime := time.Now().UTC()
-	agentLabels := map[string]string{
-		"constle.managed":    "true",
-		"constle.run-id":     runID,
-		"constle.agent-name": m.Identity.Name,
-		"constle.started-at": startTime.Format(time.RFC3339),
+	agentLabels := map[string]string{"constle.started-at": startTime.Format(time.RFC3339)}
+	for k, v := range runLabels {
+		agentLabels[k] = v
 	}
 
 	// Forward API keys from the host environment into the agent container.
@@ -434,19 +443,48 @@ func forwardedHostEnv() map[string]string {
 	return env
 }
 
-func startProxyContainer(name, extNet, intNet, configPath string) (string, error) {
-	out, err := exec.Command("docker", "run", "-d",
+// proxyRunArgs builds the `docker run` argv for the Squid proxy. It is split
+// out from startProxyContainer so the labelling invariant cleanupAbandoned
+// depends on can be asserted by a unit test, with no Docker daemon involved.
+//
+// Labels are sorted so the argv is deterministic: Go randomises map iteration
+// order, which would otherwise make any assertion on this slice flaky.
+func proxyRunArgs(name, extNet, configPath string, labels map[string]string) []string {
+	args := []string{"run", "-d",
 		"--name", name,
 		"--network", extNet,
-		"-v", configPath+":/etc/squid/squid.conf:ro",
-		"ubuntu/squid:latest",
-	).Output()
+		"-v", configPath + ":/etc/squid/squid.conf:ro",
+	}
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		args = append(args, "--label", k+"="+labels[k])
+	}
+	return append(args, "ubuntu/squid:latest")
+}
+
+// startProxyContainer starts the Squid container on the external network and
+// joins it to the internal one. labels must carry the constle.managed and
+// constle.run-id pair: without them cleanupAbandoned cannot see this container
+// at all, since it finds proxies only by label.
+//
+// On any failure after `docker run` succeeded, this removes the container it
+// created before returning. That rollback belongs here rather than in the
+// caller because the caller is handed "" as the ID on error and so has nothing
+// to remove — which is exactly how running constle-proxy-* containers used to
+// be orphaned, permanently, whenever `network connect` failed.
+func startProxyContainer(name, extNet, intNet, configPath string, labels map[string]string) (string, error) {
+	out, err := exec.Command("docker", proxyRunArgs(name, extNet, configPath, labels)...).Output()
 	if err != nil {
 		return "", fmt.Errorf("docker run proxy: %w", err)
 	}
 	proxyID := strings.TrimSpace(string(out))
 
 	if err := dockerRun("network", "connect", "--alias", "squid", intNet, proxyID); err != nil {
+		_ = dockerRun("rm", "-f", proxyID)
 		return "", fmt.Errorf("cannot connect proxy to internal network: %w", err)
 	}
 	return proxyID, nil
@@ -536,13 +574,19 @@ func newRunID() (string, error) {
 // ended without a clean Stop() — e.g. host reboot, process kill, or a crash
 // after the container exited but before the defer ran.
 //
-// Strategy: list all constle-labelled containers in exited or dead state, group
-// by run_id (both agent and proxy share the same label), then rm -f the pair
-// and their two networks. Silent on all errors — this is housekeeping, not a
-// critical path.
+// Strategy: list all constle-labelled containers in a non-live state, group by
+// run_id (both agent and proxy carry constle.run-id — see runLabels in Start),
+// then rm -f the pair and their two networks. Silent on all errors — this is
+// housekeeping, not a critical path.
+//
+// The status filters are an OR and are deliberately not exhaustive: "created"
+// catches a container that `docker run` made but never started, while running
+// and paused states are left alone on purpose, because a live container may
+// belong to a concurrent run of another agent rather than to an abandoned one.
 func cleanupAbandoned() {
 	out, err := exec.Command("docker", "ps", "-a",
 		"--filter", "label=constle.managed=true",
+		"--filter", "status=created",
 		"--filter", "status=exited",
 		"--filter", "status=dead",
 		"--format", "{{json .}}",

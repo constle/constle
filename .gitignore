@@ -29,3 +29,8 @@ constle.exe
 
 demo/out.txt
 dist/
+
+# Long-form internal documents. These are working material, not part of the
+# public repository, and are kept outside the working tree entirely. The rule
+# is a safety net so a future `git add -A` cannot commit one by accident.
+docs/*.docx
