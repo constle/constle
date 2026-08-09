@@ -109,7 +109,13 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 	// start, a rollback step must not mask it or stop the steps after it,
 	// and whatever a failed step leaves behind is swept up by
 	// cleanupAbandoned() at the top of the next run.
-	if err := dockerRun("network", "create", "--internal", intNet); err != nil {
+	// --ipv6=false is explicit rather than inherited: the sandbox's "no route
+	// off this network" property is a guarantee constle publishes, so it must
+	// not depend on how the operator's daemon happens to be configured. A
+	// daemon defaulting new networks to IPv6 would otherwise hand the agent an
+	// address family that buildSquidConfig's ip_only ACL does not cover.
+	// (--internal already blocks external routing; this pins the second half.)
+	if err := dockerRun("network", "create", "--internal", "--ipv6=false", intNet); err != nil {
 		_ = dockerRun("network", "rm", extNet)
 		return nil, fmt.Errorf("cannot create internal network: %w", err)
 	}
@@ -325,6 +331,14 @@ func writeSquidConfig(runID string, allowedHosts []string, gateHost string, gate
 // gateway IP literal on Firecracker — where the guest reaches the gates
 // directly via nftables, but a client that routes everything through
 // http_proxy must still get through.
+// KNOWN GAP (inert today, recorded so it stays visible): the ip_only ACL below
+// is IPv4-only — there is no ::/0 counterpart. Nothing currently rides on that,
+// because an IPv6 literal is still refused by the trailing `http_access deny
+// all`, and no sandbox has an IPv6 route to reach this proxy with (the Docker
+// internal network is created --ipv6=false; the Firecracker guest gets only a
+// link-local address, and the per-run nft table drops the tap in the
+// dual-family `inet` table). It turns into a real hole only if someone later
+// gives a sandbox an IPv6 route without adding the matching ACL here.
 func buildSquidConfig(runID string, allowedHosts []string, httpPort, accessLogPath, extra, gateHost string, gatePorts []int) string {
 	gateClause := ""
 	if len(gatePorts) > 0 {
