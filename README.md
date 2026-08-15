@@ -294,7 +294,7 @@ compliance:
 
 `constle init` scaffolds a starter file with these defaults. Full field reference: [`spec/agent-manifest.md`](spec/agent-manifest.md), plus [`spec/a2a.md`](spec/a2a.md) and [`spec/identity.md`](spec/identity.md).
 
-> **Note:** `spec/agent-manifest.yaml` in this repo does not currently parse (it uses map-valued fields where the runtime expects strings and lists). It is being fixed separately. Use `examples/basic-agent/agent.yaml` or `constle init` as your working starting point.
+[`spec/agent-manifest.yaml`](spec/agent-manifest.yaml) is an annotated reference file covering every supported field. It is executable, not aspirational — `constle validate spec/agent-manifest.yaml` passes, and fields that are parsed but not yet enforced are labelled as such inline.
 
 ---
 
