@@ -1,4 +1,4 @@
-# Constle Agent Manifest Specification
+# Constle Agent Manifest — annotated reference file
 # Version: 0.1.0-draft
 # https://constle.dev/spec/agent-manifest
 #
@@ -7,218 +7,376 @@
 # compliance requirements. Constle runtimes use this file to securely schedule,
 # sandbox, and audit agents — just as a Dockerfile defines how to build an image.
 #
+# THIS FILE IS EXECUTABLE, NOT ASPIRATIONAL.
+# It parses and validates against the current runtime:
+#
+#   constle validate spec/agent-manifest.yaml
+#
+# Every field below exists in pkg/manifest/manifest.go today. Fields that are
+# parsed but not yet enforced are labelled NOT ENFORCED inline — nothing here
+# is documented as working unless the runtime actually does it. Planned fields
+# live in the "Roadmap" comment at the bottom, deliberately outside the
+# document body so they can never be mistaken for supported syntax.
+#
 # Status: DRAFT — not yet stable. Field names and semantics may change.
 
 apiVersion: constle.dev/v1alpha1
 kind: AgentManifest
 
 # ---------------------------------------------------------------------------
-# Identity
+# identity — who the agent is
 # ---------------------------------------------------------------------------
 identity:
-  # Decentralized Identifier for this agent (W3C DID spec).
-  # Supported methods: did:web, did:key, did:constle
-  did: "did:constle:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
-
-  # Human-readable name and version (semver).
+  # REQUIRED. Human-readable name.
   name: "my-research-agent"
+
   version: "1.0.0"
 
-  # Optional: parent agent that spawned or governs this one (for agent trees).
-  parent_did: null
+  # Optional. Email of the person responsible for this agent.
+  owner: "research@example.com"
 
-  # Verification method: public key used to sign agent payloads.
-  verification_method:
-    id: "did:constle:z6Mk...#key-1"
-    type: "Ed25519VerificationKey2020"
-    public_key_multibase: "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"
+  # Optional. The agent's cryptographic identity.
+  #
+  # SUPPORTED TODAY: did:key only — and specifically did:key with an Ed25519
+  # public key, base58btc-encoded ("did:key:z..."). The identifier is
+  # self-describing: the verification key is recovered from this string
+  # alone, so there is no resolution step and no separate key material to
+  # declare. Anything else is rejected at validate time.
+  #
+  # Create one with:  constle identity create my-research-agent
+  #
+  # Only the PUBLIC did appears here. The private key stays under
+  # ~/.constle/identities/<name>/ and never enters the manifest. When this
+  # field is set, every audit log entry is signed and hash-chained with the
+  # identity, and `constle run` refuses to start unless the matching private
+  # key exists locally (fail closed — a declared identity must never look
+  # real when it isn't).
+  #
+  # Required by: spending.max_per_day_usd, and any a2a configuration.
+  did: "did:key:z6MkeTG3bFFSLYVU7VqhgZxqr6YzpaGrQtFMh1uvqGy1vDnP"
 
 # ---------------------------------------------------------------------------
-# Runtime / Sandbox
+# sandbox — how the agent is executed in isolation
 # ---------------------------------------------------------------------------
 sandbox:
-  # Isolation backend. Options: firecracker | gvisor | wasm | none (dev only).
-  backend: firecracker
+  # Optional. Required isolation level, weakest to strongest:
+  #
+  #   none      no isolation; development only, never production
+  #   process   process-level separation; file read/write agents
+  #   network   network + process isolation; agents that reach the internet
+  #   kernel    full hardware isolation (Firecracker); money, deletion, sub-agents
+  #
+  # When omitted — as here — Constle INFERS the level from `capabilities`
+  # below and always picks the strongest one any declared capability requires.
+  # The capabilities in this file infer "network". `constle validate` prints
+  # the level it resolved.
+  #
+  # isolation: network
 
-  # Resource limits enforced by the runtime.
-  resources:
-    cpu_millicores: 1000       # 1 vCPU
-    memory_mb: 512
-    disk_mb: 2048
-    max_run_seconds: 300       # hard wall-clock timeout
+  # Container image to run.
+  image: "python:3.11-slim"
 
-  # Network policy.
+  # Optional. Overrides the image CMD.
+  command: ["python", "/workspace/agent.py"]
+
+  # Resource limits. Defaults apply when omitted: 512 and 2048 respectively.
+  memory_mb: 512
+  disk_mb: 2048
+
   network:
-    egress: restricted         # restricted | open | none
+    # Defaults to "restricted" when omitted. Accepted: restricted | open | none.
+    #
+    # NOT ENFORCED. This value is parsed and defaulted, but no code path reads
+    # it. Egress is governed entirely by `allowed_hosts` below: the sandbox has
+    # no default gateway and every outbound connection must pass the proxy
+    # allowlist. Setting `egress: open` does NOT open the network. The field is
+    # retained because the enforcement split (policy mode vs. allowlist) is
+    # expected to become real, and removing it would break existing files.
+    egress: restricted
+
+    # ENFORCED. The allowlist the egress proxy is built from — this is the
+    # field that actually constrains the network. Everything not listed here
+    # is refused. An entry starting with "." matches all subdomains.
+    #
+    # Two entries are rejected at validate time rather than silently accepted:
+    #   - any host that also appears under mcp.servers[].url or
+    #     a2a.peers[].endpoint — that would let the agent reach the server
+    #     directly and bypass the gate proxy entirely;
+    #   - localhost / 127.0.0.1 / ::1 / host.docker.internal, when mcp or a2a
+    #     are declared — that would expose the gate transport and every other
+    #     host service to the sandbox.
     allowed_hosts:
-      - "api.openai.com"
+      - "api.anthropic.com"
       - "arxiv.org"
-    allowed_ports: [443]
-
-  # Filesystem mounts visible inside the sandbox.
-  mounts:
-    - name: workspace
-      host_path: "./workspace"
-      container_path: "/workspace"
-      read_only: false
-    - name: secrets
-      host_path: "./secrets"
-      container_path: "/run/secrets"
-      read_only: true
 
 # ---------------------------------------------------------------------------
-# Capabilities
+# capabilities — what the agent is permitted to do
 # ---------------------------------------------------------------------------
-# Explicit declaration of what protocols and tools this agent may use.
-# Constle enforces these at runtime; undeclared capabilities are denied.
+# A flat list of strings. This is the complete set of recognised values; an
+# unrecognised entry is a validation error, not a warning.
+#
+#   read_file          write_file         web_search        external_api
+#   send_email         spawn_subagent     external_transfer delete_records
+#
+# The list drives two things, and only these two:
+#
+#   1. Isolation inference (sandbox.isolation above):
+#        read_file, write_file                              -> process
+#        web_search, external_api, send_email               -> network
+#        spawn_subagent, external_transfer, delete_records  -> kernel
+#
+#   2. Advisory gate reporting. Capabilities that name an irreversible action
+#      (send_email, spawn_subagent, external_transfer, delete_records) are
+#      reported by `constle validate` as requiring approval. This is ADVICE,
+#      not enforcement — declaring `send_email` here gates nothing on its own.
+#      Enforcement happens only through human_gates.require_approval_for
+#      below, which matches MCP tool names.
+#
+# Note the structure: `capabilities` is a list of strings, and `mcp:` / `a2a:`
+# are separate top-level keys — they are NOT nested under this one. They are
+# independent wiring with their own validators, and nothing reads them through
+# this list.
 capabilities:
+  - read_file
+  - write_file
+  - web_search
+  - external_api
+  - send_email
 
-  # Model Context Protocol (MCP) servers this agent may connect to.
-  mcp:
-    - id: "filesystem"
-      version: "2025-03-26"
-      tools: ["read_file", "write_file", "list_directory"]
-    - id: "web-search"
-      version: "2025-03-26"
+# ---------------------------------------------------------------------------
+# mcp — Model Context Protocol servers the agent may call
+# ---------------------------------------------------------------------------
+# Every declared server is reachable ONLY through the constle gate proxy — a
+# protocol-aware chokepoint, the MCP analogue of the HTTP egress proxy. The
+# agent receives CONSTLE_MCP_<ID>_URL pointing at the gate; the real URL below
+# never enters the sandbox, and the sandbox network blocks every direct path
+# to it.
+mcp:
+  servers:
+      # Unique id. Also names the env var: web-search -> CONSTLE_MCP_WEB_SEARCH_URL
+      # ("-" becomes "_", uppercased). Lowercase letters, digits, "-", "_" only.
+    - id: web-search
+      # The real streamable-HTTP endpoint. Host side only. http/https only —
+      # streamable HTTP is the sole supported MCP transport.
+      url: "https://mcp-search.example.com/mcp"
+      # Optional tool allowlist. Omit to let every tool through (gated tools
+      # still gate).
       tools: ["search"]
 
-  # Agent-to-Agent (A2A / ACP) peers this agent may call.
+      # Optional. When present, the gate proxy meters EVERY tools/call response
+      # from this server and enforces the spending limits below against it.
+      #
+      # Pricing is deliberately server-wide: a priced server cannot expose an
+      # "unpriced" tool. A response missing a declared usage value is a metering
+      # failure and kills the run (fail closed) — a server that could omit its
+      # usage field could zero its own bill. To mix free and priced tools from
+      # one upstream, declare its URL twice under two ids with disjoint tool
+      # allowlists, one priced and one not.
+      pricing:
+        # The cost of one response is the sum over all meters. A list, because
+        # real API pricing rates input and output units differently.
+        meters:
+            # Dot-separated path into the full JSON-RPC response. A digit
+            # segment indexes an array. No wildcards — the path is an exact,
+            # deterministic contract, like gate tool-name matching.
+          - usage_path: "result.usage.input_tokens"
+            # Exact decimal price per unit, as a string. Max 8 decimal places.
+            usd_per_unit: "0.00000300"
+          - usage_path: "result.usage.output_tokens"
+            usd_per_unit: "0.00001500"
+
+    - id: email
+      url: "https://mcp-email.example.com/mcp"
+      tools: ["send_email", "list_inbox"]
+
+# ---------------------------------------------------------------------------
+# a2a — signed agent-to-agent communication with explicitly known peers
+# ---------------------------------------------------------------------------
+# Every peer is declared here by the operator, with its DID and endpoint
+# exchanged out of band. There is deliberately NO discovery mechanism: an
+# agent can only ever exchange A2A calls with peers written into this file.
+#
+# All A2A traffic is signed and verified in the HOST constle process using
+# this agent's identity — identity.did above is therefore required. The
+# sandbox never signs, never verifies, and never learns a peer's real
+# endpoint: it talks only to the per-run gate at CONSTLE_A2A_URL.
+a2a:
+  # Optional host-side listen address ("host:port" or ":port") for inbound
+  # calls. The listener runs on the host, never in the sandbox, and relays
+  # only calls that pass signature verification AND appear in peers below.
+  # Omit for outbound-only agents. Declaring it without peers is an error —
+  # no sender could ever be authorized, so the listener could only reject.
+  listen: ":9443"
+
   peers:
-    - did: "did:constle:z6MkSummarizerAgent"
-      protocols: [a2a, acp]
-      max_calls_per_run: 10
-
-  # External APIs beyond MCP (freeform, for documentation and enforcement).
-  external_apis:
-    - name: "OpenAI Chat Completions"
-      base_url: "https://api.openai.com/v1"
-      auth: bearer_token
-      secret_ref: "OPENAI_API_KEY"
-
-  # Human interaction gates (see human_gates section for policies).
-  human_interaction: true
+      # Local alias, used in gate URLs and audit events. Same charset as
+      # mcp.servers[].id.
+    - name: summarizer
+      # The peer's did:key. The verification key for every message to and
+      # from this peer is recovered from this string alone. Must be unique
+      # across peers, and must not equal this agent's own identity.did.
+      did: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
+      # The peer's public A2A URL — its host process's a2a.listen address.
+      # Host side only; never forwarded into the sandbox.
+      endpoint: "https://summarizer.example.net/a2a"
 
 # ---------------------------------------------------------------------------
-# Spending Limits
+# spending — cost guardrails
 # ---------------------------------------------------------------------------
-# Agent commerce controls: x402 micropayments and AP2 budget policies.
+# ENFORCEMENT SCOPE, precisely: limits are enforced against cost metered at
+# the MCP gate proxy, for servers that declare a `pricing` block. Traffic
+# through sandbox.network.allowed_hosts is NOT metered — Constle refuses to
+# TLS-intercept it — so a limit declared without a priced MCP server measures
+# nothing. The CLI warns explicitly when that is the case.
+#
+# All amounts are exact decimal strings, never floats. A cap of "0" is
+# rejected as ambiguous: omit the field to leave a limit unset.
 spending:
-  # Hard cap per single run.
+  # ENFORCED. Hard cap for a single run. Crossing it trips the gate and kills
+  # the run through the same path as limits.max_duration_seconds.
   max_per_run_usd: "0.50"
 
-  # Hard cap per calendar day (UTC).
+  # ENFORCED. Hard cap per UTC calendar day, tracked durably across runs in
+  # ~/.constle/spending/<did>/. Requires identity.did — keying the ledger by
+  # name would let a rename reset the tracking, so it fails closed without one.
   max_per_day_usd: "5.00"
 
-  # Hard cap per calendar month.
+  # NOT ENFORCED by this version. Parsed and validated, but no monthly ledger
+  # exists; declaring it produces an explicit warning rather than silent
+  # false assurance.
   max_per_month_usd: "50.00"
 
-  # Currency for all limits.
-  currency: USD
-
-  # Payment protocol. Options: x402 | none
-  payment_protocol: x402
-
-  # Payment channel configuration (x402).
-  x402:
-    receiver: "did:constle:z6MkPaymentReceiver"
-    max_single_payment_usd: "0.10"
-    require_human_approval_above_usd: "0.25"
-
-  # Alert thresholds (send notification, do not block).
   alerts:
+    # ENFORCED. Writes a one-time spending_limit_reached warning to the audit
+    # log when the day's total crosses this percentage of max_per_day_usd.
+    # Non-blocking. 1–100, and requires max_per_day_usd to be set.
     warn_at_pct_of_daily: 80
 
 # ---------------------------------------------------------------------------
-# Human Gate Policies
+# limits — runtime constraints
 # ---------------------------------------------------------------------------
-# Defines when the agent must pause and request human approval before acting.
-human_gates:
+limits:
+  # ENFORCED. Maximum wall-clock run time. On expiry constle stops the
+  # sandbox and records a terminated_by_limit audit event. 0 or omitted
+  # means no limit.
+  max_duration_seconds: 300
 
-  # Global enable/disable. When false, agent runs fully autonomously.
+# ---------------------------------------------------------------------------
+# human_gates — when the agent must stop and ask a human
+# ---------------------------------------------------------------------------
+human_gates:
+  # When false the agent runs fully autonomously. Not recommended.
   enabled: true
 
-  # Conditions that require a human checkpoint.
+  # A LIST OF STRINGS — MCP tool names.
+  #
+  # MAPPING CONTRACT: an entry gates a call when it is an exact, case-sensitive
+  # match for the tool name (the params.name of a tools/call request) on any
+  # server declared under mcp.servers. Exact match is the only deterministic,
+  # auditable mapping available, so there is no semantic guessing and no
+  # pattern syntax. An entry that provably cannot match any declared tool is
+  # NOT enforced, and is reported as a warning at run and validate time rather
+  # than failing silently.
+  #
+  # "send_email" below is enforced because mcp.servers[email] declares a tool
+  # of that exact name.
+  #
+  # WHY THERE IS NO {action, paths, condition} FORM:
+  # Gating a filesystem write — "require approval for writes under
+  # /workspace/output" — cannot be expressed here, and the reason is
+  # architectural rather than a missing feature.
+  #
+  # Constle's core assumption is that nothing inside the sandbox is trusted.
+  # If the agent is compromised, anything it reports about its own behaviour
+  # is attacker-controlled, so a gate that depended on the sandbox announcing
+  # "I am about to write this path" would be exactly the wrong shape: it would
+  # be reliable only while it was unnecessary. Every gate that exists today is
+  # enforced at a chokepoint OUTSIDE the sandbox — the MCP gate proxy sees the
+  # tool call because the call must physically traverse it, the egress proxy
+  # sees the connection for the same reason.
+  #
+  # File writes have no such external chokepoint yet. Enforcing on them
+  # requires host-side observation of the filesystem — a watcher outside the
+  # sandbox, standing in the same relation to writes as the proxy does to
+  # network traffic. That component does not exist. Until it does, a paths/
+  # condition field could only be implemented by trusting the sandbox, so it
+  # is absent by design rather than unimplemented by accident.
   require_approval_for:
-    - action: "file_write"
-      paths: ["/workspace/output/**"]
-      condition: "always"          # always | on_error | never
+    - "send_email"
 
-    - action: "external_api_call"
-      condition: "on_high_cost"    # triggers when call is projected to exceed threshold
-
-    - action: "spawn_subagent"
-      condition: "always"
-
-    - action: "payment"
-      condition: "always"
-
-  # How long to wait for human response before timing out.
+  # How long a gated call waits for a decision. Default 300 when omitted.
   approval_timeout_seconds: 300
 
-  # What to do when approval times out. Options: abort | proceed | retry
+  # What happens when approval does not arrive in time.
+  # Accepted: abort | proceed. Default abort. There is no "retry".
   on_timeout: abort
 
-  # Notification channels for gate events.
+  # ENFORCED. "webhook" is the only channel this version supports, and an
+  # unsupported channel is a validation ERROR, not a warning — a declared
+  # notification path must never look real when it isn't. url_secret_ref
+  # names the environment variable holding the URL, keeping the secret out
+  # of the committed manifest.
   notify:
     - channel: webhook
       url_secret_ref: "HUMAN_GATE_WEBHOOK_URL"
-    - channel: email
-      address_secret_ref: "HUMAN_GATE_EMAIL"
 
 # ---------------------------------------------------------------------------
-# Compliance Tags
+# compliance — regulatory and audit metadata
 # ---------------------------------------------------------------------------
-# Structured metadata used by policy engines, auditors, and registries.
 compliance:
-
-  # Data classification of inputs this agent may process.
-  data_classification:
-    - public
-    # Uncomment as appropriate:
-    # - confidential
-    # - pii
-    # - phi          # HIPAA Protected Health Information
-    # - financial    # PCI-DSS scope
-
-  # Regulatory frameworks this agent deployment must satisfy.
-  frameworks:
-    - name: EU_AI_ACT
-      risk_tier: limited           # minimal | limited | high | unacceptable
-    - name: SOC2_TYPE2
-      in_scope: false
-
-  # Geographic restrictions on where this agent may execute.
-  geo_restrictions:
-    allowed_regions: []            # empty = no restriction
-    denied_regions: []
-
-  # Audit logging level. Options: none | minimal | standard | verbose
+  # Accepted: none | minimal | standard | verbose. Defaults to "standard".
+  #
+  # NOT ENFORCED. The value is parsed and defaulted but no code path varies
+  # logging on it; audit output is the same at every level today.
   audit_log_level: standard
 
-  # Require cryptographic attestation of the sandbox environment.
-  require_tee_attestation: false
+  # A list of strings. NOT ENFORCED — descriptive metadata for external
+  # policy engines, auditors, and registries. Constle neither validates the
+  # names nor changes behaviour based on them.
+  frameworks:
+    - "EU_AI_ACT"
+    - "SOC2_TYPE2"
 
-  # Retention policy for agent run artifacts.
-  artifact_retention_days: 30
-
-  # Custom tags for internal policy engines.
-  tags:
-    team: "research"
-    cost_center: "cc-1042"
-    sensitivity: "low"
+  # NOT ENFORCED. Parsed and carried through for downstream tooling; Constle
+  # does not determine its own region and cannot refuse to run on this basis.
+  geo_restrictions:
+    allowed_regions: []
+    denied_regions: []
 
 # ---------------------------------------------------------------------------
-# Metadata
+# metadata — descriptive only, never enforced by the runtime
 # ---------------------------------------------------------------------------
 metadata:
   description: >
     A research agent that searches the web, reads papers, and produces
     structured summaries. Operates within a strict spending budget and
-    requires human approval before writing output files.
-  author: "did:constle:z6MkAuthorDID"
+    requires human approval before sending email.
+  author: "research@example.com"
   license: "Apache-2.0"
-  source: "https://github.com/example/my-research-agent"
-  created_at: "2026-05-31T00:00:00Z"
   labels:
     use_case: research
     maturity: experimental
+
+# ---------------------------------------------------------------------------
+# Roadmap — NOT valid manifest syntax. Do not uncomment.
+# ---------------------------------------------------------------------------
+# The following are planned but do not exist in the runtime. They are listed
+# here as prose, outside the document body, so that no reader can mistake
+# them for fields that work.
+#
+#   identity
+#     did:web and did:constle methods. Both require a resolution step that
+#     did:key does not — did:web fetches a document over HTTPS, did:constle
+#     implies a registry — so each introduces a trust dependency that must be
+#     designed before it is shipped. Only did:key is supported today.
+#
+#   human_gates
+#     Path- and condition-scoped approval for filesystem writes, blocked on
+#     the host-side file watcher described in the human_gates section above.
+#
+#   spending
+#     Monthly ledger enforcement for max_per_month_usd.
+#
+#   sandbox
+#     Enforcement of network.egress as a policy mode distinct from the
+#     allowed_hosts allowlist.
