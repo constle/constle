@@ -1,6 +1,12 @@
 # Constle Agent Manifest — annotated reference file
-# Version: 0.1.0-draft
+# Spec version: 0.1.0   (apiVersion: constle.dev/v1alpha1)
 # https://constle.dev/spec/agent-manifest
+#
+# This file is the EXECUTABLE companion to spec/agent-manifest.md. That
+# document is normative — it carries the full prose definition of every
+# field, the cross-field validation rules, and the changelog. This file
+# exists so the spec can be checked by running it. Where the two disagree,
+# the .md is correct and the difference is a bug.
 #
 # The Agent Manifest is a declarative, portable descriptor for an AI agent.
 # It defines identity, execution environment, capabilities, governance, and
