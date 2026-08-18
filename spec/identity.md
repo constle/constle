@@ -1,8 +1,17 @@
 # Agent Identity and Signed Audit Logs
 
+**Spec version:** 0.1.0
+**Status:** Implemented. `did:key` identities, signed hash-chained audit logs,
+and `constle audit verify` are all in the runtime.
+**Last updated:** 2026-08-16
+**Source of truth:** `pkg/did`, `internal/identity`, `internal/audit`
+**Related:** [`agent-manifest.md` §5.4](agent-manifest.md) (the `identity.did`
+field), [`a2a.md`](a2a.md) (which builds on this)
+
 Design document for Constle's cryptographic agent identity: how an agent gets a
 DID, where its key lives, and how the audit log becomes tamper-evident. This is
-the foundation the future agent-to-agent (A2A) verification work builds on.
+the foundation agent-to-agent (A2A) verification is built on — A2A signs and
+verifies every envelope with the identity described here.
 
 ---
 

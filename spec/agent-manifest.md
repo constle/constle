@@ -1,75 +1,130 @@
 # Constle AgentManifest Specification
 
-**Version:** 0.1.0-draft
+**Spec version:** 0.1.0
+**apiVersion:** `constle.dev/v1alpha1`
 **Status:** Draft. Field names and semantics may change before v1.0.
-**Last updated:** 2026-06-21
-**Source of truth:** `pkg/manifest/manifest.go`
+**Last updated:** 2026-08-16
+**Source of truth:** `pkg/manifest/manifest.go` and `pkg/manifest/parser.go`
+**Annotated reference file:** [`spec/agent-manifest.yaml`](agent-manifest.yaml)
 **Canonical URL:** https://constle.dev/spec/agent-manifest
 
 ---
 
-## Overview
+## 1. Overview
 
-The AgentManifest (also called the **Agentfile**) is a YAML file that tells the Constle runtime
-everything it needs to know about an AI agent: who the agent is, how to run it in isolation,
-what it is allowed to do, how much it is allowed to spend, when to stop and ask a human for
-approval, and what to log.
+The AgentManifest (also called the **Agentfile**) is a YAML file that tells the
+Constle runtime everything it needs to know about an AI agent: who the agent
+is, how to run it in isolation, what it may reach on the network, which MCP
+servers and peer agents it may talk to, how much it may spend, when it must
+stop and ask a human, and what to log.
 
-The analogy is a Dockerfile. A developer writes one Agentfile and the Constle runtime executes it
-the same way on any infrastructure — AWS, GCP, Azure, or a local machine.
+The analogy is a Dockerfile. A developer writes one Agentfile and the Constle
+runtime executes it the same way on any supported backend.
 
-**Core design rule:** The manifest declares what the agent *needs*, not how to implement it.
-The runtime makes all infrastructure decisions.
+**Core design rule:** the manifest declares what the agent *needs*, not how to
+implement it. The runtime makes the infrastructure decisions.
+
+### 1.1 Relationship to `agent-manifest.yaml`
+
+Two documents describe this format, and they are not redundant:
+
+| File | Role |
+|------|------|
+| `spec/agent-manifest.md` (this document) | The normative specification. Full prose for every field: type, default, validation rules, enforcement status, and the reasoning behind the design. |
+| `spec/agent-manifest.yaml` | An executable annotated reference file. It parses and passes `constle validate` against the current runtime. |
+
+Where the two disagree, this document is normative and the discrepancy is a
+bug. The YAML file is kept executable precisely so that drift is detectable:
+
+```console
+$ constle validate spec/agent-manifest.yaml
+```
+
+### 1.2 The rule this specification is written under
+
+> **A declared protection must never look real when it isn't.**
+
+This principle governs the entire format, and it is why the enforcement labels
+in §2.2 exist and are applied pedantically. A field that is parsed but not
+acted upon is labelled as such, in this document and — where the runtime can
+detect it — in a warning printed by `constle validate` and `constle run`.
+Constle would rather tell an operator that a guardrail is inert than let them
+believe in one that isn't.
 
 ---
 
-## Conventions
+## 2. Conventions
 
-### Required vs. Optional
+### 2.1 Required vs. optional
 
-A field marked **required** will cause the runtime to reject the manifest if it is absent or empty.
+A field marked **required** causes the runtime to reject the manifest if it is
+absent or empty. A field marked **optional** may be omitted; where a default
+exists, it is documented and applied at parse time.
 
-A field marked **optional** may be omitted. Where a default exists it is documented.
+Some fields are **conditionally required** — required only when another field
+is present. These are listed in full in §16.
 
-### Enforcement labels
+### 2.2 Enforcement labels
 
-Every field in this document carries one of four labels:
+Every field carries exactly one label:
 
 | Label | Meaning |
 |-------|---------|
-| ENFORCED | The runtime actively prevents violations at execution time. If the agent violates this constraint, the runtime stops it. |
-| VALIDATED | The runtime checks that the value is well-formed when the manifest is parsed. It does not enforce the constraint during execution. |
-| DECLARED | The value is parsed and written to the audit log, but the runtime does not act on it yet. Enforcement is planned for a future version. |
-| INFORMATIONAL | The runtime does not read this field at all. It exists for humans and external tooling. |
+| **ENFORCED** | The runtime actively prevents violations at execution time. If the agent violates the constraint, the runtime blocks the action or stops the run. |
+| **VALIDATED** | The runtime checks the value is well-formed and internally consistent at parse/validate time, and rejects the manifest if not. It does not constrain behaviour during execution. |
+| **DECLARED** | The value is parsed, defaulted, and carried through (displayed, logged, or exported), but no code path changes behaviour based on it. Enforcement may be planned; it does not exist today. |
+| **INFORMATIONAL** | The runtime does not read the field at all. It exists for humans and external tooling. |
 
-The distinction between DECLARED and ENFORCED matters. If a field is DECLARED, a developer
-cannot rely on the runtime to stop the agent from violating it.
+The distinction between DECLARED and ENFORCED is the most important thing in
+this document. **If a field is DECLARED, you cannot rely on the runtime to stop
+the agent from violating it.** A DECLARED security field is documentation, not
+a control.
+
+### 2.3 Where enforcement happens
+
+Every enforcement point in Constle sits **outside the sandbox**, at a
+chokepoint the agent's traffic must physically traverse:
+
+| Chokepoint | Enforces |
+|------------|----------|
+| Squid egress proxy (per run) | `sandbox.network.allowed_hosts` |
+| MCP gate proxy (per run) | `mcp.servers[].tools`, `human_gates.*`, `spending.*` metering |
+| A2A gate + host listener (per run) | `a2a.peers` authorization, envelope signing and verification |
+| Supervisor process | `limits.max_duration_seconds`, `sandbox.memory_mb` |
+
+This is not an implementation detail — it is the reason certain intuitively
+desirable fields do not exist. Constle assumes nothing inside the sandbox is
+trustworthy. A control that depended on the agent truthfully announcing its own
+behaviour would be reliable only while it was unnecessary. See §13.3 for the
+worked example (filesystem write gating).
 
 ---
 
-## Document Structure
-
-A complete AgentManifest has these top-level sections:
+## 3. Document structure
 
 ```yaml
 apiVersion: constle.dev/v1alpha1   # required
-kind: AgentManifest              # required
+kind: AgentManifest                # required
 
-identity: ...      # who the agent is
+identity: ...      # who the agent is, and its cryptographic identity
 sandbox: ...       # how to run and isolate it
-capabilities: ...  # what the agent is allowed to do
-spending: ...      # budget limits
-limits: ...        # hard execution constraints the runtime enforces today
-human_gates: ...   # when to pause and ask a human for approval
-compliance: ...    # audit logging and regulatory declarations
-metadata: ...      # human-readable description, not read by runtime
+capabilities: ...  # declared action classes; drives isolation inference
+mcp: ...           # MCP servers reachable through the gate proxy
+a2a: ...           # signed agent-to-agent peers
+spending: ...      # cost caps, metered at the MCP gate
+limits: ...        # hard runtime constraints
+human_gates: ...   # when to pause for human approval
+compliance: ...    # audit and regulatory metadata
+metadata: ...      # descriptive only
 ```
+
+All sections except `apiVersion`, `kind`, and `identity.name` are optional.
 
 ---
 
-## Top-Level Fields
+## 4. Top-level fields
 
-### apiVersion
+### 4.1 `apiVersion`
 
 | | |
 |-|-|
@@ -78,14 +133,13 @@ metadata: ...      # human-readable description, not read by runtime
 | Valid values | `constle.dev/v1alpha1` |
 | Enforcement | VALIDATED |
 
-The schema version of this manifest. Must be exactly `constle.dev/v1alpha1`. The runtime
-rejects any other value.
+The schema version of this manifest. Must be exactly `constle.dev/v1alpha1`;
+any other value is rejected with an error naming the expected value.
 
-```yaml
-apiVersion: constle.dev/v1alpha1
-```
+The `v1alpha1` suffix is a promise about stability, not a version of Constle
+itself: see §15.
 
-### kind
+### 4.2 `kind`
 
 | | |
 |-|-|
@@ -94,18 +148,16 @@ apiVersion: constle.dev/v1alpha1
 | Valid values | `AgentManifest` |
 | Enforcement | VALIDATED |
 
-The resource type. Must be exactly `AgentManifest`. Reserved for future types such as
-`AgentPolicy`.
-
-```yaml
-kind: AgentManifest
-```
+The resource type. Must be exactly `AgentManifest`. The field exists so that
+future resource types (for example a separately-distributed `AgentPolicy`) can
+share the same file convention without ambiguity.
 
 ---
 
-## Section: identity
+## 5. Section: `identity`
 
-Who this agent is. Used for logging and attribution.
+Who this agent is, and — optionally — the cryptographic identity that signs its
+audit log and its agent-to-agent traffic.
 
 ```yaml
 identity:
@@ -115,18 +167,24 @@ identity:
   did: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
 ```
 
-### identity.name
+### 5.1 `identity.name`
 
 | | |
 |-|-|
 | Type | string |
-| Required | yes |
-| Enforcement | VALIDATED — appears in every audit log entry |
+| Required | **yes** |
+| Enforcement | VALIDATED |
 
-Human-readable name for this agent. Used as the identifier in `constle ps`, `constle stop`, and
-all audit log entries. Must be non-empty. Recommended format: lowercase with hyphens.
+Human-readable name for the agent. It identifies the agent in `constle ps`,
+`constle stop`, every audit log entry, and the on-disk identity directory
+(`~/.constle/identities/<name>/`). Must be non-empty.
 
-### identity.version
+Recommended format is lowercase with hyphens. The name is not a security
+boundary: it is not unique across machines, and nothing is authorized on the
+basis of it. When you need an identifier that cannot be forged or reassigned,
+that is `identity.did`.
+
+### 5.2 `identity.version`
 
 | | |
 |-|-|
@@ -135,54 +193,86 @@ all audit log entries. Must be non-empty. Recommended format: lowercase with hyp
 | Recommended format | semver, e.g. `1.0.0` |
 | Enforcement | DECLARED |
 
-The version of this agent. Useful for debugging and reconstructing what version of the agent
-ran during an incident.
+The version of this agent's own code and configuration — not the version of the
+manifest schema (that is `apiVersion`) and not the version of this
+specification.
 
-### identity.owner
+It is displayed by `constle validate` and carried into run output. Its value is
+in incident reconstruction: when an audit log shows an agent behaving oddly on
+a given day, `version` is what tells you which build produced it.
 
-| | |
-|-|-|
-| Type | string |
-| Required | optional |
-| Enforcement | DECLARED |
-
-Email or identifier of the human responsible for this agent. Written to every audit log entry.
-If absent, audit events record the owner as `"unknown"`.
-
-Why this matters: in a compliance review or security incident, `owner` is what tells you which
-human authorized this agent to run. Without it, attribution is impossible.
-
-### identity.did
+### 5.3 `identity.owner`
 
 | | |
 |-|-|
 | Type | string |
 | Required | optional |
-| Valid values | a `did:key` identifier for an Ed25519 public key |
-| Enforcement | ENFORCED — when set, every audit log entry is signed and hash-chained, and the run refuses to start without the matching local private key |
+| Enforcement | VALIDATED — conditionally ENFORCED (see below) |
 
-The agent's cryptographic identity: a [did:key](https://w3c-ccg.github.io/did-method-key/)
-identifier that self-describes the agent's Ed25519 public key. Create one with
-`constle identity create <name>` and paste the printed DID here.
+Email address or identifier of the human accountable for this agent.
 
-Only the **public** DID appears in the manifest. The private key lives under
-`~/.constle/identities/<name>/key.pem` (mode 0600) and never enters the Agentfile, the
-audit log, or the sandbox — the same indirection principle as
-`human_gates.notify[].url_secret_ref`.
+When the agent has a DID identity **and** the stored identity records an owner
+**and** both values are non-empty, they must match: a run whose Agentfile
+declares a different owner than `~/.constle/identities/<name>/identity.json`
+is refused. The check is an equality comparison, and it only binds when both
+sides are populated — it is a guard against an Agentfile drifting away from
+the identity it claims, not an authorization system.
 
-When `did` is set:
+Without an owner, attribution in a compliance review is guesswork. Set it.
 
-- every audit log entry is Ed25519-signed with the agent's key and hash-chained to the
-  previous entry, making the log tamper-evident (`constle audit verify`);
-- `constle run` fails closed if the local private key is missing, has permissions other
-  than 0600, or derives a different DID than declared — a declared identity must never
-  look real when it isn't.
+### 5.4 `identity.did`
 
-See `spec/identity.md` for the full design.
+| | |
+|-|-|
+| Type | string |
+| Required | optional |
+| Valid values | a `did:key` identifier encoding an Ed25519 public key |
+| Enforcement | ENFORCED |
+
+The agent's cryptographic identity: a
+[`did:key`](https://w3c-ccg.github.io/did-method-key/) identifier that
+self-describes an Ed25519 public key, base58btc-encoded (`did:key:z…`).
+
+Create one with:
+
+```console
+$ constle identity create my-agent
+```
+
+and paste the printed DID here.
+
+**Only the public DID appears in the manifest.** The private key lives at
+`~/.constle/identities/<name>/key.pem` (mode 0600, in a 0700 directory) and
+never enters the Agentfile, the audit log, or the sandbox — the same
+indirection principle as `human_gates.notify[].url_secret_ref`.
+
+**`did:key` is the only supported method.** It is self-describing: the
+verification key is recovered from the identifier string alone, so there is no
+resolution step, no registry, and no network dependency in the trust path.
+Other methods are rejected at validate time. See §21 for why `did:web` and
+`did:constle` are deliberately not supported yet.
+
+When `did` is set, three things become true:
+
+1. **Every audit log entry is signed and hash-chained.** Each JSONL entry
+   carries `did`, `prev_hash` (SHA-256 of the previous raw line), and `sig`
+   (Ed25519 over the entry with `sig` absent). `constle audit verify` checks
+   every signature and the whole chain, and reports the exact line and kind of
+   tampering — `invalid_signature`, `chain_break_missing_entry`,
+   `chain_break_reordered`, or `did_mismatch`.
+2. **`constle run` fails closed.** The run refuses to start if the matching
+   private key is missing, unreadable, has permissions other than exactly 0600,
+   or derives a DID different from the one declared. A declared identity must
+   never look real when it isn't. `constle validate` warns rather than fails,
+   since validation is not execution.
+3. **Identity-scoped features unlock.** `spending.max_per_day_usd` and any
+   `a2a` configuration require a DID and are rejected without one.
+
+Full design: [`spec/identity.md`](identity.md).
 
 ---
 
-## Section: sandbox
+## 6. Section: `sandbox`
 
 How Constle runs and isolates the agent.
 
@@ -190,117 +280,130 @@ How Constle runs and isolates the agent.
 sandbox:
   isolation: network
   image: "python:3.11-slim"
-  command: ["python", "agent.py"]
+  command: ["python", "/workspace/agent.py"]
   memory_mb: 512
   disk_mb: 2048
   network:
     egress: restricted
     allowed_hosts:
-      - "api.groq.com"
+      - "api.anthropic.com"
 ```
 
-### sandbox.isolation
+### 6.1 `sandbox.isolation`
 
 | | |
 |-|-|
 | Type | string |
 | Required | optional |
 | Valid values | `none`, `process`, `network`, `kernel` |
-| Default | auto-inferred from `capabilities` if not set |
-| Enforcement | VALIDATED at parse time; backend selection is ENFORCED |
+| Default | inferred from `capabilities` |
+| Enforcement | ENFORCED (backend selection) |
 
-The isolation level required for this agent. If omitted, the runtime infers the minimum
-necessary level from the `capabilities` list. If set explicitly, the runtime selects the
-strongest available backend that satisfies this requirement.
-
-**Isolation levels, from weakest to strongest:**
+The isolation level this agent requires. When omitted, the runtime infers the
+minimum sufficient level from `capabilities` (§7) and always picks the
+strongest level any declared capability requires. `constle validate` prints the
+level it resolved.
 
 | Level | What it provides | Use when |
 |-------|-----------------|----------|
-| `none` | No isolation. Dev mode only. Never use in production. | Local testing only |
+| `none` | No isolation. Development only. | Local testing, never production |
 | `process` | Process-level separation from the host | Agent only reads or writes local files |
-| `network` | Network and process isolation | Agent makes outbound API calls |
-| `kernel` | Full hardware-level isolation via Firecracker microVM | Agent can transfer money, delete records, or spawn sub-agents |
+| `network` | Network and process isolation | Agent makes outbound calls |
+| `kernel` | Hardware-level isolation via a Firecracker microVM | Agent can move money, delete data, or spawn sub-agents |
 
-The runtime always selects the highest required isolation level. If your capabilities list
-includes `external_transfer`, the runtime requires `kernel` even if you declare
-`isolation: process`.
+The runtime selects the strongest **available** backend that satisfies the
+requirement. When the required level cannot be provided on this machine —
+Firecracker requires KVM and root — the runtime says so explicitly rather than
+silently downgrading, because a silent downgrade is precisely a protection that
+looks real when it isn't.
 
-### sandbox.image
+### 6.2 `sandbox.image`
 
 | | |
 |-|-|
 | Type | string |
-| Required | required in practice for the Docker backend |
+| Required | optional in the schema; required in practice by both backends |
 | Enforcement | ENFORCED |
 
-The Docker image to run. The runtime pulls this image and uses it as the agent's execution
-environment.
+The container image to run. The Docker backend pulls and runs it directly; the
+Firecracker backend resolves it to a rootfs.
+
+`Validate()` does not reject a manifest without an image, because a manifest
+can legitimately be validated for its policy content alone. A run without an
+image fails at the backend.
 
 ```yaml
 image: "python:3.11-slim"
 image: "ghcr.io/myorg/myagent:v1.2.0"
 ```
 
-### sandbox.command
+Pin a digest or an immutable tag for anything you care about. A mutable tag
+means the thing you audited and the thing that runs are only incidentally the
+same.
+
+### 6.3 `sandbox.command`
 
 | | |
 |-|-|
 | Type | list of strings |
 | Required | optional |
+| Default | the image's own CMD |
 | Enforcement | ENFORCED |
 
-The command to run inside the container. Passed directly as the Docker CMD. If omitted, the
-image's default CMD is used.
+The command to run inside the sandbox, passed through as the container command.
+Exec form only — a list of arguments, not a shell string. There is no shell
+interpolation.
 
 ```yaml
-command: ["python", "agent.py"]
-command: ["node", "dist/index.js", "--task", "summarize"]
+command: ["python", "/workspace/agent.py"]
 ```
 
-### sandbox.memory_mb
+### 6.4 `sandbox.memory_mb`
 
 | | |
 |-|-|
 | Type | integer |
 | Required | optional |
 | Default | `512` |
-| Unit | Megabytes |
-| Enforcement | ENFORCED — passed as `--memory` to Docker |
+| Unit | megabytes |
+| Enforcement | ENFORCED |
 
-Maximum RAM the container may use. Docker enforces this as a hard limit. The container is
-killed with an out-of-memory error if it exceeds it.
+Maximum RAM available to the agent. The Docker backend passes it as the
+container memory limit; the Firecracker backend sizes the microVM with it. In
+both cases the limit is imposed from outside the sandbox and the agent cannot
+raise it. Exceeding it kills the workload.
 
-### sandbox.disk_mb
+### 6.5 `sandbox.disk_mb`
 
 | | |
 |-|-|
 | Type | integer |
 | Required | optional |
 | Default | `2048` |
-| Unit | Megabytes |
-| Enforcement | DECLARED |
+| Unit | megabytes |
+| Enforcement | **DECLARED** |
 
-Maximum disk space for the container's writable layer. Parsed and logged but not yet applied
-to the Docker backend.
+Intended maximum writable disk space. **Parsed and defaulted, but not applied
+by either backend today.** An agent can currently fill the host disk regardless
+of this value. Treat it as documentation of intent until it moves to ENFORCED.
 
 ---
 
-## Section: sandbox.network
+## 7. Section: `sandbox.network`
 
-Controls what the agent is allowed to reach on the network. This is the most security-critical
-part of the manifest in v0.4.
+What the agent may reach on the network. With the MCP gate, this is the most
+security-critical part of the manifest.
 
 ```yaml
 sandbox:
   network:
     egress: restricted
     allowed_hosts:
-      - "api.openai.com"
+      - "api.anthropic.com"
       - "arxiv.org"
 ```
 
-### sandbox.network.egress
+### 7.1 `sandbox.network.egress`
 
 | | |
 |-|-|
@@ -308,142 +411,478 @@ sandbox:
 | Required | optional |
 | Valid values | `restricted`, `open`, `none` |
 | Default | `restricted` |
-| Enforcement | ENFORCED |
+| Enforcement | **DECLARED** |
 
-Controls outbound network access from the agent container.
+Intended egress policy mode.
 
-| Value | Effect |
-|-------|--------|
-| `restricted` | Agent can only reach hosts listed in `allowed_hosts`. All other outbound traffic is blocked at the network level. |
-| `open` | Agent has unrestricted outbound internet access. Use with extreme caution. |
-| `none` | Agent has no network access at all. |
+**This field is not enforced.** It is parsed and defaulted, but no code path
+reads it. Egress is governed entirely by `allowed_hosts` below: the sandbox has
+no default gateway, and every outbound connection must pass the proxy
+allowlist. Setting `egress: open` does **not** open the network — an agent with
+`egress: open` and an empty `allowed_hosts` reaches nothing at all.
 
-How `restricted` is enforced: Constle connects the agent container only to an internal Docker
-network that has no default gateway. A Squid proxy container is the only bridge to the
-internet, and it enforces the allowlist. This is enforced at the OS network level. The agent
-cannot bypass it by unsetting environment variables or attempting direct IP connections.
+The field is retained because the split between a policy mode and the allowlist
+is expected to become real, and removing it now would break existing files.
+Until then, do not reason about network exposure from this value; read
+`allowed_hosts`.
 
-### sandbox.network.allowed_hosts
+### 7.2 `sandbox.network.allowed_hosts`
 
 | | |
 |-|-|
 | Type | list of strings |
-| Required | required when `egress: restricted` |
-| Enforcement | ENFORCED |
+| Required | optional (an empty list means no egress) |
+| Enforcement | **ENFORCED** |
 
-Hostnames the agent is permitted to reach. Domain names only. No ports, no wildcards, no IP
-addresses in this version.
+The allowlist from which the per-run egress proxy is built. This is the field
+that actually constrains the network. Everything not listed is refused.
 
 ```yaml
 allowed_hosts:
-  - "api.groq.com"
-  - "api.openai.com"
+  - "api.anthropic.com"
+  - ".example.com"        # matches example.com and all subdomains
 ```
 
-All outbound connections to hosts not on this list are blocked and logged to the audit trail
-as `network_blocked` events.
+Entries are hostnames. An entry beginning with `.` matches that domain and all
+its subdomains; otherwise the match is exact. Ports, schemes, paths, and IP
+literals are not part of the matching.
+
+**How it is enforced.** The agent's sandbox is attached only to an internal
+network with no route to the internet. A per-run Squid proxy is the sole
+bridge, and it enforces the allowlist. On the Firecracker backend the same
+proxy runs on the host, with nftables restricting the guest to it. Enforcement
+is at the OS network layer: the agent cannot bypass it by unsetting proxy
+environment variables or dialling an IP directly, because there is no route.
+
+Blocked attempts are recorded as `network_blocked` audit events; permitted ones
+as `network_allowed`.
+
+**Two entries are rejected at validate time** rather than silently accepted,
+because each would open a bypass around a stronger control:
+
+1. **Any host that also appears under `mcp.servers[].url` or
+   `a2a.peers[].endpoint`.** Allowlisting it would let the agent reach that
+   server or peer directly, bypassing the gate proxy that enforces tool
+   allowlists, human gates, spending metering, and A2A signing. MCP and A2A
+   traffic is routed through the gate automatically; it must not — and need
+   not — appear here.
+2. **`localhost`, `127.0.0.1`, `::1`, or `host.docker.internal`, when `mcp` or
+   `a2a` are declared.** These name the sandbox's host, which is where the gate
+   transport listens. Allowlisting them wholesale would expose the gate itself
+   and every other host service to the agent.
+
+Both are errors, not warnings. A bypass that is merely warned about is a bypass.
 
 ---
 
-## Section: capabilities
+## 8. Section: `capabilities`
 
-An explicit list of what the agent is allowed to do. The runtime uses this list to infer the
-minimum required isolation level if `sandbox.isolation` is not set.
+A flat list of strings naming the classes of action this agent performs.
 
 ```yaml
 capabilities:
+  - read_file
+  - write_file
   - web_search
   - external_api
-  - read_file
+  - send_email
 ```
 
-### Capability values
+| | |
+|-|-|
+| Type | list of strings |
+| Required | optional |
+| Enforcement | ENFORCED for isolation inference; DECLARED otherwise |
 
-| Value | Meaning | Minimum isolation required |
-|-------|---------|--------------------------|
-| `read_file` | Read files from the filesystem | `process` |
-| `write_file` | Write files to the filesystem | `process` |
-| `web_search` | Make outbound HTTP requests for search | `network` |
-| `external_api` | Call external APIs over the network | `network` |
-| `send_email` | Send email via external SMTP or API | `network` |
-| `spawn_subagent` | Start another agent as a subprocess | `kernel` |
-| `external_transfer` | Transfer money or financial assets | `kernel` |
+This is the complete set of recognised values. An unrecognised entry is a
+**validation error**, not a warning — a typo'd capability must not silently
+lower the inferred isolation level.
+
+| Value | Meaning | Minimum isolation |
+|-------|---------|-------------------|
+| `read_file` | Read files | `process` |
+| `write_file` | Write files | `process` |
+| `web_search` | Outbound HTTP for search | `network` |
+| `external_api` | Call external APIs | `network` |
+| `send_email` | Send email | `network` |
+| `spawn_subagent` | Start another agent | `kernel` |
+| `external_transfer` | Move money or financial assets | `kernel` |
 | `delete_records` | Permanently delete data | `kernel` |
 
-The runtime selects the highest minimum isolation level across all declared capabilities.
+The list drives exactly two things, and nothing else:
 
-Example: an agent with `[web_search, external_transfer]` requires `kernel` isolation,
-because `external_transfer` requires it.
+**1. Isolation inference (ENFORCED).** When `sandbox.isolation` is omitted, the
+runtime selects the strongest level any declared capability requires. An agent
+declaring `[web_search, external_transfer]` gets `kernel`, because
+`external_transfer` demands it.
 
-Current enforcement status: capabilities influence isolation level selection and are written to
-the audit log at run start. Enforcement of individual capabilities (blocking an undeclared
-action mid-run) is planned for v0.5.
+**2. Advisory gate reporting (DECLARED).** Capabilities naming an irreversible
+action — `send_email`, `spawn_subagent`, `external_transfer`, `delete_records`
+— are reported by `constle validate` as requiring approval. **This is advice,
+not enforcement.** Declaring `send_email` here gates nothing on its own.
+Enforcement happens only through `human_gates.require_approval_for` (§11),
+which matches MCP tool names.
+
+### 8.1 What `capabilities` is not
+
+It is not a sandbox permission system. Declaring `read_file` does not grant
+file access, and omitting it does not remove it — the agent's actual filesystem
+access comes from the image and the mounts, not from this list. Nothing at
+runtime blocks an undeclared action on the basis of its absence here.
+
+Note also the shape of the document: `capabilities` is a flat list of strings,
+and `mcp:` and `a2a:` are **separate top-level keys**, not nested under it.
+They are independent wiring with their own validators; nothing reads them
+through this list.
 
 ---
 
-## Section: spending
+## 9. Section: `mcp`
 
-Budget limits for what the agent is allowed to spend per run, per day, and per month.
+The Model Context Protocol servers this agent may call.
+
+```yaml
+mcp:
+  servers:
+    - id: web-search
+      url: "https://mcp-search.example.com/mcp"
+      tools: ["search"]
+      pricing:
+        meters:
+          - usage_path: "result.usage.input_tokens"
+            usd_per_unit: "0.00000300"
+          - usage_path: "result.usage.output_tokens"
+            usd_per_unit: "0.00001500"
+```
+
+Every declared server is reachable **only** through the Constle gate proxy — a
+protocol-aware chokepoint, the MCP analogue of the HTTP egress proxy. The agent
+receives `CONSTLE_MCP_<ID>_URL` pointing at the gate; the real URL never enters
+the sandbox, and the sandbox network blocks every direct path to it (§7.2).
+
+The gate is what makes tool allowlists, human gates, and spending metering
+enforceable: the call must physically traverse it.
+
+### 9.1 `mcp.servers[].id`
+
+| | |
+|-|-|
+| Type | string |
+| Required | **yes** |
+| Charset | lowercase letters, digits, `-`, `_` |
+| Enforcement | VALIDATED |
+
+A unique local identifier for this server. It names the environment variable
+the agent reads (`web-search` → `CONSTLE_MCP_WEB_SEARCH_URL`: hyphens become
+underscores, uppercased) and appears in audit events. Must be unique across
+servers; duplicates are rejected.
+
+### 9.2 `mcp.servers[].url`
+
+| | |
+|-|-|
+| Type | string |
+| Required | **yes** |
+| Valid schemes | `http`, `https` |
+| Enforcement | ENFORCED (host-side only) |
+
+The real endpoint of the MCP server. Streamable HTTP is the only supported MCP
+transport, so other schemes are rejected. The URL must have a host.
+
+This value is **host side only**. It is never forwarded into the sandbox, and
+its host must not appear in `allowed_hosts` (§7.2).
+
+### 9.3 `mcp.servers[].tools`
+
+| | |
+|-|-|
+| Type | list of strings |
+| Required | optional |
+| Default | empty — every tool is allowed through |
+| Enforcement | **ENFORCED** |
+
+An allowlist of tool names the agent may call on this server. When present, a
+`tools/call` naming anything else is refused at the gate and recorded as an
+`mcp_tool_blocked` audit event. When omitted, every tool passes through —
+gated tools (§11) still gate.
+
+Declaring the allowlist is worth the effort: it converts "this server exposes
+40 tools and the agent probably only uses 2" from a trust assumption into an
+enforced fact.
+
+### 9.4 `mcp.servers[].pricing`
+
+| | |
+|-|-|
+| Type | object with a `meters` list |
+| Required | optional |
+| Enforcement | **ENFORCED** |
+
+When present, the gate proxy meters **every** `tools/call` response from this
+server and charges it against the caps in `spending` (§10).
+
+**Pricing is deliberately server-wide.** A priced server cannot expose an
+"unpriced" tool: a response missing a declared usage value is a *metering
+failure* that kills the run (fail closed), because a server that could omit its
+usage field could zero its own bill. To mix free and priced tools from one
+upstream, declare its URL twice under two ids with disjoint `tools`
+allowlists — one priced, one not.
+
+Pricing is always declared here by the operator, never guessed or hardcoded per
+provider, so the metering code stays generic and auditable.
+
+A `pricing` block with an empty `meters` list is rejected: it could not measure
+anything, and would read as "priced" while metering nothing.
+
+#### `pricing.meters[].usage_path`
+
+| | |
+|-|-|
+| Type | string |
+| Required | **yes** |
+| Enforcement | VALIDATED (syntax), ENFORCED (extraction) |
+
+A dot-separated path into the **full JSON-RPC response message**, locating one
+usage number. A digit segment indexes an array:
+`result.content.0.usage.input_tokens`.
+
+There are no wildcards. The path is an exact, deterministic contract — the same
+principle as exact tool-name matching for gates. A pattern language here would
+mean the bill depended on a fuzzy match.
+
+#### `pricing.meters[].usd_per_unit`
+
+| | |
+|-|-|
+| Type | string (exact decimal) |
+| Required | **yes** |
+| Precision | at most 8 decimal places (1e-8 USD) |
+| Enforcement | VALIDATED (parse), ENFORCED (charge) |
+
+The price of one usage unit, as a decimal **string**, never a YAML float.
+Floats cannot represent decimal money exactly, and a rounding error in a
+spending cap is a security bug, not a cosmetic one. Internally all money is
+integer micro-cents.
+
+The cost of one response is the **sum over all meters** — a list, because real
+API pricing rates input and output units differently.
+
+---
+
+## 10. Section: `a2a`
+
+Signed agent-to-agent communication with explicitly declared peers.
+
+```yaml
+a2a:
+  listen: ":9443"
+  peers:
+    - name: summarizer
+      did: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
+      endpoint: "https://summarizer.example.net/a2a"
+```
+
+Every peer is declared by the operator, with its DID and endpoint exchanged out
+of band. **There is deliberately no discovery mechanism.** An agent can only
+ever exchange A2A calls with peers written into this file — it cannot find,
+resolve, or be introduced to a peer it was not already configured to know
+about. That is a scope decision, not a gap.
+
+All A2A traffic is signed and verified **in the host Constle process** using
+this agent's identity, so `identity.did` is required. The sandbox never signs,
+never verifies, and never learns a peer's real endpoint: it talks only to the
+per-run gate at `CONSTLE_A2A_URL`.
+
+Full design, including the inbound listener hardening, envelope format, and the
+named replay-protection limitation: [`spec/a2a.md`](a2a.md).
+
+### 10.1 `a2a.listen`
+
+| | |
+|-|-|
+| Type | string (`host:port` or `:port`) |
+| Required | optional |
+| Enforcement | ENFORCED |
+
+The host-side address on which this agent's Constle process accepts inbound
+calls from declared peers. Omit it for outbound-only agents.
+
+The listener runs on the **host**, never in the sandbox. It relays a call
+inward only after the call passes signature verification *and* its sender DID
+appears in `peers`. Verified calls are parked in a bounded per-peer inbox that
+the agent drains over a connection it initiates.
+
+**Declaring `listen` without `peers` is an error.** No sender could ever be
+authorized, so the listener could only ever reject — a configuration that looks
+like connectivity and provides none.
+
+### 10.2 `a2a.peers[].name`
+
+| | |
+|-|-|
+| Type | string |
+| Required | **yes** |
+| Charset | lowercase letters, digits, `-`, `_` |
+| Enforcement | VALIDATED |
+
+A local alias for the peer, used in gate URLs and audit events. Must be unique.
+This is the only way the sandbox can name a peer — it posts to
+`$CONSTLE_A2A_URL/send/<name>`, and an undeclared name is rejected at the gate
+with a 403. Nothing in the sandbox can name an endpoint.
+
+### 10.3 `a2a.peers[].did`
+
+| | |
+|-|-|
+| Type | string (`did:key`) |
+| Required | **yes** |
+| Enforcement | **ENFORCED** |
+
+The peer's `did:key` identifier. The verification key for every message to and
+from this peer is recovered from this string alone — no registry, no resolution
+service.
+
+Rejected at validate time: a malformed DID, two peers declaring the same DID
+(sender identity would be ambiguous), and a peer DID equal to this agent's own
+`identity.did`.
+
+### 10.4 `a2a.peers[].endpoint`
+
+| | |
+|-|-|
+| Type | string (URL) |
+| Required | **yes** |
+| Valid schemes | `http`, `https` |
+| Enforcement | ENFORCED (host-side only) |
+
+The peer's public A2A URL — its host process's `a2a.listen` address. Host side
+only; never forwarded into the sandbox, and its host must not appear in
+`allowed_hosts` (§7.2).
+
+---
+
+## 11. Section: `spending`
+
+Cost guardrails, enforced against traffic metered at the MCP gate.
 
 ```yaml
 spending:
   max_per_run_usd: "0.50"
   max_per_day_usd: "5.00"
   max_per_month_usd: "50.00"
+  alerts:
+    warn_at_pct_of_daily: 80
 ```
 
-All three fields are DECLARED in v0.4. The runtime parses them and writes them to the audit
-log at run start, but it does not track actual costs or stop the agent when limits are reached.
-Enforcement is planned for v0.5.
+### 11.1 Enforcement scope — read this before relying on a cap
 
-### spending.max_per_run_usd
+Limits are enforced against cost **metered at the MCP gate proxy, for servers
+that declare a `pricing` block** (§9.4). Nothing else is metered.
+
+In particular, traffic through `sandbox.network.allowed_hosts` is **not**
+metered. Constle refuses to TLS-intercept it: doing so would let the runtime
+read everything the agent says to every allowlisted host, which is far beyond
+what cost metering needs. The consequence is stated plainly rather than hidden:
+a limit declared without a priced MCP server measures nothing at all.
+
+`constle validate` and `constle run` warn explicitly in each of these cases:
+
+| Situation | Warning |
+|-----------|---------|
+| Limits declared, no priced MCP server | Limits are **not enforced** — nothing to meter |
+| Limits declared, priced servers present, `allowed_hosts` non-empty | Limits cover only the priced servers; `allowed_hosts` traffic is unmetered |
+| Priced servers present, no limits declared | Usage is metered but nothing is enforced |
+| `max_per_month_usd` declared | Not enforced by this version |
+
+### 11.2 Amount format
+
+All amounts are exact decimal **strings**, never YAML floats, for the reason
+given in §9.4. A cap of `"0"` is **rejected as ambiguous** — at enforcement
+time a zero cap would read as "unset", so the manifest must say which it means:
+omit the field to leave a limit unset.
+
+### 11.3 `spending.max_per_run_usd`
 
 | | |
 |-|-|
-| Type | string (decimal number) |
+| Type | string (exact decimal) |
 | Required | optional |
-| Enforcement | DECLARED |
+| Enforcement | **ENFORCED** |
 
-Maximum cost in USD for a single agent run. When enforcement is implemented, the runtime
-will abort the run and log a `spending_limit_exceeded` event if this value is reached.
+Hard cap on metered cost for a single run. Crossing it trips the gate and kills
+the run through the same path as `limits.max_duration_seconds`, recording a
+`spending_limit_reached` audit event naming `max_per_run_usd`.
 
-### spending.max_per_day_usd
+The cap trips when the running total **exceeds** it. Because metering is
+post-hoc — a response's cost is only knowable once the response has arrived —
+the charge that crosses the cap is still incurred and still recorded. The
+ledger records reality; enforcement stops what happens next.
+
+### 11.4 `spending.max_per_day_usd`
 
 | | |
 |-|-|
-| Type | string (decimal number) |
+| Type | string (exact decimal) |
 | Required | optional |
-| Enforcement | DECLARED |
+| Requires | `identity.did` |
+| Enforcement | **ENFORCED** |
 
-Maximum cumulative spend across all runs of this agent in a calendar day (UTC).
+Hard cap per UTC calendar day, tracked durably across runs in
+`~/.constle/spending/<did>/` under a file lock, so concurrent runs of the same
+identity share one ledger.
 
-### spending.max_per_month_usd
+**It requires `identity.did` and is rejected without one.** Keying the ledger
+by name would let a rename reset the tracking, which is not a cap.
+
+Two behaviours follow from durability:
+
+- A run whose accumulated daily spend already meets or exceeds the cap is
+  **refused before the sandbox starts**, with a `spending_limit_reached` event
+  recording `action: run_refused`. Starting it would guarantee an overshoot,
+  since the kill can only land after a charge is metered.
+- An unreadable ledger is a hard error, never treated as `$0` spent.
+
+### 11.5 `spending.max_per_month_usd`
 
 | | |
 |-|-|
-| Type | string (decimal number) |
+| Type | string (exact decimal) |
 | Required | optional |
-| Enforcement | DECLARED |
+| Enforcement | **DECLARED** |
 
-Maximum cumulative spend across all runs of this agent in a calendar month (UTC).
+**Not enforced by this version.** The value is parsed and validated, but no
+monthly ledger exists. Declaring it produces an explicit warning rather than
+silent false assurance.
+
+### 11.6 `spending.alerts.warn_at_pct_of_daily`
+
+| | |
+|-|-|
+| Type | integer, 1–100 |
+| Required | optional |
+| Requires | `spending.max_per_day_usd` |
+| Enforcement | **ENFORCED** (non-blocking) |
+
+Writes a one-time `spending_limit_reached` warning to the audit log when the
+day's total first crosses this percentage of `max_per_day_usd`. It never blocks
+a call — it is a signal, not a control.
+
+The threshold comparison is exact (cross-multiplied in arbitrary precision), so
+it cannot drift or overflow. Setting it without `max_per_day_usd` is an
+error: there would be no cap to warn about.
 
 ---
 
-## Section: limits
+## 12. Section: `limits`
 
-Hard execution constraints that the runtime enforces actively today. Unlike `spending`, the
-fields in this section are ENFORCED in v0.4.
-
-The `spending` and `limits` sections are intentionally separate. `limits` contains what the
-runtime acts on now. `spending` contains what will be enforced in a future version. The
-separation makes it immediately clear what you can rely on.
+Hard runtime constraints.
 
 ```yaml
 limits:
   max_duration_seconds: 300
 ```
 
-### limits.max_duration_seconds
+### 12.1 `limits.max_duration_seconds`
 
 | | |
 |-|-|
@@ -451,66 +890,119 @@ limits:
 | Required | optional |
 | Default | `0` (no limit) |
 | Unit | seconds |
-| Enforcement | ENFORCED |
+| Enforcement | **ENFORCED** |
 
-Maximum wall-clock time the agent is allowed to run. When the limit is reached, the runtime
-sends `docker stop` to the container and writes a `terminated_by_limit` event to the audit log.
+Maximum wall-clock run time. On expiry the runtime stops the sandbox and
+records a `terminated_by_limit` audit event. `0` or omitted means no limit.
 
-A value of `0` means no time limit is applied.
-
-```yaml
-limits:
-  max_duration_seconds: 300   # 5 minutes
-```
+This is a supervisor-side timer, not a request the agent can decline.
 
 ---
 
-## Section: human_gates
+## 13. Section: `human_gates`
 
-Defines when the agent must pause and wait for human approval before continuing. Human gates
-are the primary defense against prompt injection attacks that try to trick the agent into
-performing a sensitive action.
+When the agent must stop and ask a human.
 
 ```yaml
 human_gates:
   enabled: true
   require_approval_for:
-    - external_transfer
-    - delete_records
-    - send_email
+    - "send_email"
+  approval_timeout_seconds: 300
   on_timeout: abort
+  notify:
+    - channel: webhook
+      url_secret_ref: "HUMAN_GATE_WEBHOOK_URL"
 ```
 
-All fields in this section are DECLARED in v0.4. The runtime parses and logs them, but does
-not yet pause execution to wait for approval. Full enforcement is planned for v1.0.
+Human gates are the primary defense against an agent being talked into a
+consequential action — by a prompt injection, a poisoned document, or its own
+misjudgement.
 
-### human_gates.enabled
+### 13.1 `human_gates.enabled`
 
 | | |
 |-|-|
 | Type | boolean |
 | Required | optional |
 | Default | `false` |
-| Enforcement | DECLARED |
+| Enforcement | **ENFORCED** |
 
-Master switch for human gate enforcement. When `true`, the actions listed in
-`require_approval_for` will require human approval before the agent executes them.
+The master switch. When `false`, **no gating occurs at all**, even if
+`require_approval_for` lists entries. Set it to `true` for any agent whose
+gates you intend to rely on.
 
-Set to `false` only for fully automated, low-risk agents where human review adds no value.
-
-### human_gates.require_approval_for
+### 13.2 `human_gates.require_approval_for`
 
 | | |
 |-|-|
-| Type | list of strings |
+| Type | list of strings — **MCP tool names** |
 | Required | optional |
-| Enforcement | DECLARED |
+| Enforcement | **ENFORCED** for entries matching a declared MCP tool |
 
-The action categories that require human approval. Recommended values correspond to the
-high-risk entries in `capabilities`: `external_transfer`, `delete_records`, `send_email`,
-`spawn_subagent`.
+**Mapping contract:** an entry gates a call when it is an **exact,
+case-sensitive match** for the tool name — the `params.name` of a `tools/call`
+request — on any server declared under `mcp.servers`. The tool name is the only
+protocol-level identifier the gate proxy observes, and exact match is the only
+deterministic, auditable mapping. There is no semantic guessing and no pattern
+syntax.
 
-### human_gates.on_timeout
+When a gated call arrives, the gate pauses it, emits a `gate_triggered` audit
+event, notifies any configured webhook, and waits for a decision — recorded as
+`gate_approved`, `gate_denied`, or `gate_timeout`.
+
+**Entries that cannot match are reported, not silently ignored.** An entry that
+provably matches no tool on any declared server is surfaced as a warning at
+both validate and run time, stating that those calls will run *without*
+approval. An entry is treated as possibly-enforced when any declared server
+omits its `tools` allowlist, since the runtime match is against the actual tool
+name of every call.
+
+Note the consequence: **with no `mcp.servers` declared, nothing is gated**, and
+Constle says so.
+
+### 13.3 Why there is no `{action, paths, condition}` form
+
+Gating a filesystem write — "require approval for writes under
+`/workspace/output`" — cannot be expressed here, and the reason is
+architectural rather than a missing feature. It is worth stating in full,
+because the omission otherwise looks like an oversight.
+
+Constle's core assumption is that nothing inside the sandbox is trusted. If the
+agent is compromised, anything it reports about its own behaviour is
+attacker-controlled. A gate that depended on the sandbox announcing "I am about
+to write this path" would be exactly the wrong shape: **reliable only while it
+was unnecessary.**
+
+Every gate that exists today is enforced at a chokepoint *outside* the sandbox.
+The MCP gate proxy sees the tool call because the call must physically traverse
+it. The egress proxy sees the connection for the same reason.
+
+File writes have no such external chokepoint yet. Enforcing on them requires
+host-side observation of the filesystem — a watcher standing in the same
+relation to writes as the proxy does to network traffic. That component does
+not exist. Until it does, a `paths`/`condition` field could only be implemented
+by trusting the sandbox, so it is **absent by design rather than unimplemented
+by accident**.
+
+### 13.4 `human_gates.approval_timeout_seconds`
+
+| | |
+|-|-|
+| Type | integer |
+| Required | optional |
+| Default | `300` |
+| Enforcement | **ENFORCED** |
+
+How long a gated call waits for a decision before `on_timeout` applies. A
+negative value is rejected.
+
+When stdin is not a terminal — a backgrounded run, a pipe, CI — no human can
+answer, so the gate says so once and simply waits for the deadline, letting
+`on_timeout` decide. It does not block forever on a read that can never
+resolve, and it does not silently treat "nobody is watching" as approval.
+
+### 13.5 `human_gates.on_timeout`
 
 | | |
 |-|-|
@@ -518,39 +1010,57 @@ high-risk entries in `capabilities`: `external_transfer`, `delete_records`, `sen
 | Required | optional |
 | Valid values | `abort`, `proceed` |
 | Default | `abort` |
-| Enforcement | DECLARED |
+| Enforcement | **ENFORCED** |
 
-What the runtime does when a human gate triggers but no approval arrives within the timeout
-period.
+| Value | Behaviour |
+|-------|-----------|
+| `abort` | The gated call is refused and the run stops. The safe default. |
+| `proceed` | The call continues without approval. |
 
-| Value | Behavior |
-|-------|----------|
-| `abort` | The agent run is terminated. The pending action is not taken. This is the safe default. |
-| `proceed` | The agent continues without approval. Use only for low-risk gates where availability matters more than confirmation. |
+There is deliberately no `retry`. Use `abort`: an agent that proceeds without
+approval after a timeout has a gate that reduces to a delay.
 
-Use `abort`. An agent that proceeds without human approval after a timeout defeats the purpose
-of the gate.
+### 13.6 `human_gates.notify`
+
+| | |
+|-|-|
+| Type | list of `{channel, url_secret_ref}` |
+| Required | optional |
+| Supported channels | `webhook` |
+| Enforcement | **ENFORCED** |
+
+Where to signal that a gate has triggered. **An unsupported channel is a
+validation error, not a warning** — a declared notification path must never
+look real when it isn't. A `webhook` entry without `url_secret_ref` is
+likewise rejected.
+
+`url_secret_ref` names the **environment variable** holding the webhook URL,
+keeping the secret out of the committed manifest — the same indirection as
+`identity.did` keeping the private key out.
+
+Delivery is fire-and-forget: the gate never blocks on a notification, and a
+failed delivery never blocks the approval flow. The local prompt and timeout
+are the enforcement; the webhook is the signal. An unset environment variable
+produces a visible warning and the gate still enforces locally.
 
 ---
 
-## Section: compliance
+## 14. Section: `compliance`
 
-Audit logging configuration and regulatory declarations.
+Regulatory and audit metadata.
 
 ```yaml
 compliance:
   audit_log_level: standard
   frameworks:
-    - EU_AI_ACT
-    - SOC2_TYPE2
+    - "EU_AI_ACT"
+    - "SOC2_TYPE2"
   geo_restrictions:
-    allowed_regions:
-      - eu-west-1
-      - eu-central-1
+    allowed_regions: []
     denied_regions: []
 ```
 
-### compliance.audit_log_level
+### 14.1 `compliance.audit_log_level`
 
 | | |
 |-|-|
@@ -558,62 +1068,48 @@ compliance:
 | Required | optional |
 | Valid values | `none`, `minimal`, `standard`, `verbose` |
 | Default | `standard` |
-| Enforcement | ENFORCED |
+| Enforcement | **DECLARED** |
 
-Controls what the runtime writes to the JSONL audit log at `~/.constle/logs/`.
+**Not enforced.** The value is parsed and defaulted, but no code path varies
+logging on it — audit output is identical at every level today, and setting
+`none` does not disable the audit log.
 
-| Level | Events logged |
-|-------|--------------|
-| `none` | No audit log is written |
-| `minimal` | Run start, run end, errors only |
-| `standard` | Start, end, network events, limit events, spending events |
-| `verbose` | All of the above plus every agent action and tool call |
-
-### compliance.frameworks
+### 14.2 `compliance.frameworks`
 
 | | |
 |-|-|
 | Type | list of strings |
 | Required | optional |
-| Enforcement | DECLARED |
+| Enforcement | **INFORMATIONAL** |
 
-Regulatory frameworks this agent deployment must satisfy. Written to audit log metadata.
-Compliance report generation from these declarations is planned for v1.0.
+Regulatory frameworks the deployment is meant to satisfy. Descriptive metadata
+for external policy engines, auditors, and registries. Constle neither
+validates the names nor changes behaviour based on them.
 
 Common values: `EU_AI_ACT`, `SOC2_TYPE2`, `ISO27001`, `HIPAA`, `PCI_DSS`.
 
-### compliance.geo_restrictions.allowed_regions
+### 14.3 `compliance.geo_restrictions`
 
 | | |
 |-|-|
-| Type | list of strings |
+| Type | object with `allowed_regions` and `denied_regions` string lists |
 | Required | optional |
-| Enforcement | DECLARED |
+| Enforcement | **INFORMATIONAL** |
 
-Cloud region identifiers where this agent is permitted to run. An empty list means no
-geographic restriction. Example: `["eu-west-1", "eu-central-1"]` for a GDPR EU-only deployment.
-
-### compliance.geo_restrictions.denied_regions
-
-| | |
-|-|-|
-| Type | list of strings |
-| Required | optional |
-| Enforcement | DECLARED |
-
-Cloud region identifiers where this agent must not run. Takes precedence over
-`allowed_regions` if a region appears in both lists.
+Region identifiers where the agent may or may not run. Parsed and carried
+through for downstream tooling. **Constle does not determine its own region and
+cannot refuse to run on this basis.** These lists constrain nothing today.
 
 ---
 
-## Section: metadata
+## 15. Section: `metadata`
 
-Informational fields for humans and external tooling. The runtime does not use any of these
-fields when making execution decisions.
+Descriptive fields, never read by the runtime when making execution decisions.
+All **INFORMATIONAL**.
 
 ```yaml
 metadata:
-  description: "Processes invoices and routes to approval queue."
+  description: "Processes invoices and routes them to the approval queue."
   author: "finance-team@company.com"
   license: "Apache-2.0"
   labels:
@@ -622,61 +1118,92 @@ metadata:
     environment: "production"
 ```
 
-### metadata.description
-
-Human-readable description of what this agent does. INFORMATIONAL.
-
-### metadata.author
-
-Identifier of the author. Can be an email address, DID, or GitHub handle. INFORMATIONAL.
-
-### metadata.license
-
-SPDX license identifier for the agent's code. Examples: `Apache-2.0`, `MIT`. INFORMATIONAL.
-
-### metadata.labels
-
-Arbitrary key-value string pairs for organizational use. Useful for cost allocation, team
-ownership, and environment tagging. No enforced key names or value formats. INFORMATIONAL.
+| Field | Type | Notes |
+|-------|------|-------|
+| `description` | string | What this agent does, for humans |
+| `author` | string | Email, DID, or handle |
+| `license` | string | SPDX identifier for the agent's code |
+| `labels` | map of string to string | Arbitrary key/value pairs for cost allocation, ownership, environment tagging. No enforced key names or formats. |
 
 ---
 
-## Enforcement Summary
+## 16. Cross-field validation rules
+
+These rules involve more than one field, and all of them are **errors**, not
+warnings. Each closes a path where a declared control could be silently
+inert or bypassed.
+
+| Rule | Rationale |
+|------|-----------|
+| `spending.max_per_day_usd` requires `identity.did` | The daily ledger is keyed by DID; keying by name would let a rename reset it |
+| `spending.alerts.warn_at_pct_of_daily` requires `max_per_day_usd` | No cap to warn about |
+| A spending cap of `"0"` is rejected | Ambiguous between "no spending allowed" and "unset" |
+| `a2a.*` requires `identity.did` | Every A2A call is signed with the agent's identity |
+| `a2a.listen` requires a non-empty `a2a.peers` | No sender could ever be authorized |
+| Peer DIDs must be unique, and none may equal `identity.did` | Sender identity would be ambiguous |
+| `mcp.servers[].id` and `a2a.peers[].name` must be unique and match the id charset | They are embedded in env var names, gate URLs, and audit events |
+| An MCP server URL host must not appear in `allowed_hosts` | Would bypass the gate proxy |
+| An A2A peer endpoint host must not appear in `allowed_hosts` | Would bypass the signing gate |
+| Host loopback aliases must not appear in `allowed_hosts` when `mcp` or `a2a` are declared | Would expose the gate transport and other host services |
+| An `mcp.servers[].pricing` block must declare at least one meter | Would read as priced while metering nothing |
+| `human_gates.notify[].channel` must be `webhook`, with a `url_secret_ref` | A declared notification path must never look real when it isn't |
+| An unrecognised capability is rejected | A typo must not silently lower inferred isolation |
+
+Warnings — surfaced, but not fatal — cover the cases where a declaration is
+well-formed but the runtime cannot act on it: unenforceable gate entries,
+unmetered spending limits, `max_per_month_usd`, and an `identity.did` whose
+private key is not available on this machine.
+
+---
+
+## 17. Enforcement summary
 
 | Field | Enforcement | Notes |
 |-------|-------------|-------|
 | `apiVersion` | VALIDATED | Must be `constle.dev/v1alpha1` |
 | `kind` | VALIDATED | Must be `AgentManifest` |
-| `identity.name` | VALIDATED | Must be non-empty; appears in all audit events |
-| `identity.version` | DECLARED | Logged at run start |
-| `identity.owner` | DECLARED | Logged at run start; `"unknown"` if absent |
-| `sandbox.isolation` | VALIDATED | Inferred if absent; drives backend selection |
-| `sandbox.image` | ENFORCED | Docker pulls and runs this image |
-| `sandbox.command` | ENFORCED | Passed as Docker CMD |
-| `sandbox.memory_mb` | ENFORCED | Passed as `--memory` to Docker |
-| `sandbox.disk_mb` | DECLARED | Parsed but not yet applied |
-| `sandbox.network.egress` | ENFORCED | Two-network Docker architecture with Squid proxy |
-| `sandbox.network.allowed_hosts` | ENFORCED | Squid proxy allowlist |
-| `capabilities` | DECLARED | Influences isolation inference; logged at run start |
-| `spending.max_per_run_usd` | DECLARED | Logged; not tracked or enforced yet |
-| `spending.max_per_day_usd` | DECLARED | Logged; not tracked or enforced yet |
-| `spending.max_per_month_usd` | DECLARED | Logged; not tracked or enforced yet |
-| `limits.max_duration_seconds` | ENFORCED | Container killed after this; audit event written |
-| `human_gates.enabled` | DECLARED | Logged; gate not triggered at runtime yet |
-| `human_gates.require_approval_for` | DECLARED | Logged; not checked at runtime yet |
-| `human_gates.on_timeout` | DECLARED | Logged; not applied yet |
-| `compliance.audit_log_level` | ENFORCED | Controls what the runtime logs |
-| `compliance.frameworks` | DECLARED | Logged in audit metadata |
-| `compliance.geo_restrictions` | DECLARED | Not checked at runtime |
-| `metadata.*` | INFORMATIONAL | Not read by runtime |
+| `identity.name` | VALIDATED | Required; appears in all audit events |
+| `identity.version` | DECLARED | Displayed and carried through |
+| `identity.owner` | VALIDATED | Enforced as an equality check against the stored identity when both are set |
+| `identity.did` | **ENFORCED** | Signs and chains the audit log; run fails closed without the local key |
+| `sandbox.isolation` | **ENFORCED** | Inferred when absent; drives backend selection |
+| `sandbox.image` | **ENFORCED** | Pulled and run by the backend |
+| `sandbox.command` | **ENFORCED** | Passed as the container command |
+| `sandbox.memory_mb` | **ENFORCED** | Container memory limit / microVM size |
+| `sandbox.disk_mb` | DECLARED | Parsed and defaulted; not applied |
+| `sandbox.network.egress` | DECLARED | Parsed and defaulted; **no code path reads it** |
+| `sandbox.network.allowed_hosts` | **ENFORCED** | Per-run Squid allowlist; the real egress control |
+| `capabilities` | **ENFORCED** (inference) / DECLARED (gate advice) | Unknown values rejected |
+| `mcp.servers[].id` | VALIDATED | Unique; names `CONSTLE_MCP_<ID>_URL` |
+| `mcp.servers[].url` | **ENFORCED** | Host side only; never enters the sandbox |
+| `mcp.servers[].tools` | **ENFORCED** | Non-listed tools blocked at the gate |
+| `mcp.servers[].pricing` | **ENFORCED** | Meters every `tools/call` response; fails closed on missing usage |
+| `a2a.listen` | **ENFORCED** | Host-side listener; verifies before relaying inward |
+| `a2a.peers[].name` | VALIDATED | The only peer reference the sandbox can name |
+| `a2a.peers[].did` | **ENFORCED** | Verification key for every message |
+| `a2a.peers[].endpoint` | **ENFORCED** | Host side only; never enters the sandbox |
+| `spending.max_per_run_usd` | **ENFORCED** | Trips the gate and kills the run |
+| `spending.max_per_day_usd` | **ENFORCED** | Durable per-DID ledger; refuses to start when exhausted |
+| `spending.max_per_month_usd` | DECLARED | No monthly ledger exists; warned about |
+| `spending.alerts.warn_at_pct_of_daily` | **ENFORCED** | One-time non-blocking audit warning |
+| `limits.max_duration_seconds` | **ENFORCED** | Sandbox stopped; `terminated_by_limit` recorded |
+| `human_gates.enabled` | **ENFORCED** | Master switch; `false` disables all gating |
+| `human_gates.require_approval_for` | **ENFORCED** | Exact MCP tool-name match; unmatchable entries warned |
+| `human_gates.approval_timeout_seconds` | **ENFORCED** | Default 300 |
+| `human_gates.on_timeout` | **ENFORCED** | Default `abort` |
+| `human_gates.notify` | **ENFORCED** | Webhook only; unsupported channel is an error |
+| `compliance.audit_log_level` | DECLARED | Parsed and defaulted; logging does not vary |
+| `compliance.frameworks` | INFORMATIONAL | Descriptive metadata |
+| `compliance.geo_restrictions` | INFORMATIONAL | Constle cannot determine its own region |
+| `metadata.*` | INFORMATIONAL | Never read for execution decisions |
 
 ---
 
-## Examples
+## 18. Examples
 
-### Minimal Example
+### 18.1 Minimal
 
-The smallest valid Agentfile that is actually useful:
+The smallest valid Agentfile that does something useful:
 
 ```yaml
 apiVersion: constle.dev/v1alpha1
@@ -687,21 +1214,19 @@ identity:
 
 sandbox:
   image: "python:3.11-slim"
-  command: ["python", "agent.py"]
+  command: ["python", "/workspace/agent.py"]
   network:
-    egress: restricted
     allowed_hosts:
-      - "api.openai.com"
+      - "api.anthropic.com"
 ```
 
-This manifest runs `python agent.py` in a Python 3.11 container, blocks all network traffic
-except to `api.openai.com`, applies no time limit, and logs at the default `standard` level.
+Runs `python /workspace/agent.py` in a Python 3.11 container, blocks all
+outbound traffic except to `api.anthropic.com`, applies no time limit, and
+writes an unsigned audit log.
 
----
+### 18.2 Full
 
-### Full Example
-
-A production-grade manifest for a financial processing agent:
+A production-shaped manifest exercising every enforced control:
 
 ```yaml
 apiVersion: constle.dev/v1alpha1
@@ -711,29 +1236,44 @@ identity:
   name: "invoice-processor"
   version: "2.1.0"
   owner: "finance-team@company.com"
+  did: "did:key:z6MkeTG3bFFSLYVU7VqhgZxqr6YzpaGrQtFMh1uvqGy1vDnP"
 
 sandbox:
   isolation: kernel
   image: "ghcr.io/myorg/invoice-agent:2.1.0"
   command: ["python", "main.py"]
   memory_mb: 1024
-  disk_mb: 4096
   network:
-    egress: restricted
     allowed_hosts:
-      - "api.openai.com"
-      - "api.company-erp.com"
+      - "arxiv.org"
 
 capabilities:
   - read_file
   - write_file
   - external_api
-  - external_transfer
+  - send_email
+
+mcp:
+  servers:
+    - id: erp
+      url: "https://mcp-erp.example.com/mcp"
+      tools: ["lookup_invoice", "post_payment"]
+      pricing:
+        meters:
+          - usage_path: "result.usage.input_tokens"
+            usd_per_unit: "0.00000300"
+          - usage_path: "result.usage.output_tokens"
+            usd_per_unit: "0.00001500"
+
+    - id: email
+      url: "https://mcp-email.example.com/mcp"
+      tools: ["send_email"]
 
 spending:
   max_per_run_usd: "0.50"
   max_per_day_usd: "10.00"
-  max_per_month_usd: "150.00"
+  alerts:
+    warn_at_pct_of_daily: 80
 
 limits:
   max_duration_seconds: 300
@@ -741,120 +1281,173 @@ limits:
 human_gates:
   enabled: true
   require_approval_for:
-    - external_transfer
-    - delete_records
+    - "post_payment"
+    - "send_email"
+  approval_timeout_seconds: 300
   on_timeout: abort
+  notify:
+    - channel: webhook
+      url_secret_ref: "HUMAN_GATE_WEBHOOK_URL"
 
 compliance:
   audit_log_level: verbose
   frameworks:
-    - EU_AI_ACT
-    - SOC2_TYPE2
-  geo_restrictions:
-    allowed_regions:
-      - eu-west-1
-      - eu-central-1
-    denied_regions: []
+    - "EU_AI_ACT"
+    - "SOC2_TYPE2"
 
 metadata:
   description: >
-    Reads incoming invoices, validates them against the ERP,
-    and initiates payment transfers. Human approval is required
-    before every transfer.
+    Reads incoming invoices, validates them against the ERP, and initiates
+    payments. Human approval is required before every payment and every email.
   author: "finance-team@company.com"
   license: "Proprietary"
   labels:
     team: "finance"
     cost_center: "cc-1042"
     environment: "production"
-    sensitivity: "high"
 ```
+
+Note what makes the gates in this example real: `post_payment` and `send_email`
+are exact tool names declared under `mcp.servers[].tools`, so the gate proxy
+matches and pauses them. Had they been written as capability names not exposed
+by any declared server, `constle validate` would warn that they gate nothing.
 
 ---
 
-## Versioning and Breaking Changes
+## 19. Versioning and compatibility
 
-### Current Version
+### 19.1 Two version numbers
 
-This specification is at `v1alpha1`. This means field names and semantics may change between
-releases before v1.0. No compatibility guarantees are made in this phase.
+| Number | What it versions | Current |
+|--------|-----------------|---------|
+| **Spec version** | This document — its prose, structure, and accuracy | `0.1.0` |
+| **`apiVersion`** | The wire format the runtime accepts | `constle.dev/v1alpha1` |
 
-### How apiVersion Changes
+The spec version changes whenever this document changes materially, including
+when a field's enforcement status changes without any change to the format. The
+`apiVersion` changes only when the format itself changes incompatibly.
 
-When a breaking change is introduced, the `apiVersion` value is bumped:
+### 19.2 apiVersion progression
 
 | apiVersion | Status | Meaning |
 |------------|--------|---------|
-| `constle.dev/v1alpha1` | Current | Unstable. In active development. |
+| `constle.dev/v1alpha1` | **Current** | Unstable. Field names and semantics may change. |
 | `constle.dev/v1beta1` | Planned | Stable field names. New fields may be added. |
 | `constle.dev/v1` | Planned | Fully stable. Backward-compatible changes only. |
 
-The runtime will support the previous `apiVersion` for at least one major release after it is
-deprecated. A `v1beta1` runtime will run `v1alpha1` manifests and write a deprecation warning
-to the audit log.
+The runtime will support the previous `apiVersion` for at least one major
+release after it is deprecated; a `v1beta1` runtime will run `v1alpha1`
+manifests and record a deprecation warning.
 
-### What Is a Breaking Change
+### 19.3 What is a breaking change
 
-A breaking change is anything that causes a previously valid manifest to be rejected or to
-behave differently without modification:
+A previously valid manifest being rejected, or behaving differently without
+modification:
 
-- Renaming a field
-- Changing the type of a field (e.g. integer to string)
-- Making an optional field required
-- Removing a valid enum value
-- Changing the default value of a field in a way that affects security behavior
+- renaming a field;
+- changing a field's type;
+- making an optional field required;
+- removing a valid enum value;
+- changing a default in a way that affects security behaviour.
 
-### What Is Not a Breaking Change
+### 19.4 What is not
 
-- Adding a new optional field
-- Adding a new valid enum value
-- Adding a new section that is entirely optional
-- Moving a field from DECLARED to ENFORCED — this is always a feature, not a breaking change
+- adding a new optional field;
+- adding a new valid enum value;
+- adding an entirely optional section;
+- **moving a field from DECLARED to ENFORCED.**
 
-### Changelog
-
-#### 0.1.0-draft (current)
-
-- Initial draft of the AgentManifest specification
-- Defined `identity`, `sandbox`, `capabilities`, `spending`, `limits`, `human_gates`,
-  `compliance`, `metadata` sections
-- `limits.max_duration_seconds`, `sandbox.network`, and `sandbox.memory_mb` are ENFORCED
-- All `spending` and `human_gates` fields are DECLARED, not yet ENFORCED
+The last deserves comment. Promoting a field to ENFORCED can certainly stop an
+agent that a previous version let run — but the manifest declared the
+constraint, and Constle's whole premise is that a declared constraint should be
+real. Under this specification that is a bug fix, not a breach of compatibility.
+Such promotions are always called out in the changelog.
 
 ---
 
-## Field Quick Reference
+## 20. Changelog
 
-| Field | Type | Required | Default | Enforcement |
-|-------|------|----------|---------|-------------|
-| `apiVersion` | string | yes | — | VALIDATED |
-| `kind` | string | yes | — | VALIDATED |
-| `identity.name` | string | yes | — | VALIDATED |
-| `identity.version` | string | no | — | DECLARED |
-| `identity.owner` | string | no | — | DECLARED |
-| `sandbox.isolation` | string | no | auto | VALIDATED |
-| `sandbox.image` | string | no* | — | ENFORCED |
-| `sandbox.command` | []string | no | image CMD | ENFORCED |
-| `sandbox.memory_mb` | int | no | 512 | ENFORCED |
-| `sandbox.disk_mb` | int | no | 2048 | DECLARED |
-| `sandbox.network.egress` | string | no | restricted | ENFORCED |
-| `sandbox.network.allowed_hosts` | []string | no** | — | ENFORCED |
-| `capabilities` | []string | no | — | DECLARED |
-| `spending.max_per_run_usd` | string | no | — | DECLARED |
-| `spending.max_per_day_usd` | string | no | — | DECLARED |
-| `spending.max_per_month_usd` | string | no | — | DECLARED |
-| `limits.max_duration_seconds` | int | no | 0 (none) | ENFORCED |
-| `human_gates.enabled` | bool | no | false | DECLARED |
-| `human_gates.require_approval_for` | []string | no | — | DECLARED |
-| `human_gates.on_timeout` | string | no | abort | DECLARED |
-| `compliance.audit_log_level` | string | no | standard | ENFORCED |
-| `compliance.frameworks` | []string | no | — | DECLARED |
-| `compliance.geo_restrictions.allowed_regions` | []string | no | — | DECLARED |
-| `compliance.geo_restrictions.denied_regions` | []string | no | — | DECLARED |
-| `metadata.description` | string | no | — | INFORMATIONAL |
-| `metadata.author` | string | no | — | INFORMATIONAL |
-| `metadata.license` | string | no | — | INFORMATIONAL |
-| `metadata.labels` | map[string]string | no | — | INFORMATIONAL |
+### 0.1.0 — 2026-08-16
 
-*`sandbox.image` is required in practice for the Docker backend.
-**`sandbox.network.allowed_hosts` is required when `egress: restricted`.
+First numbered release of this specification, and the first revision verified
+field-by-field against the runtime rather than against intent.
+
+**Added — sections that did not previously exist in this document:**
+
+- `mcp`: gate-proxied MCP servers, tool allowlists, and the `pricing` /
+  `meters` metering model (§9).
+- `a2a`: signed agent-to-agent peers, the host-side listener, and the no
+  discovery scope decision (§10).
+- `identity.did`: `did:key` identity, signed and hash-chained audit logs, and
+  the fail-closed run behaviour (§5.4).
+- `spending.alerts.warn_at_pct_of_daily` (§11.6).
+- `human_gates.approval_timeout_seconds` and `human_gates.notify` (§13.4,
+  §13.6).
+- Cross-field validation rules, collected in one table (§16).
+- The enforcement-point model — why every control sits outside the sandbox
+  (§2.3), and the worked consequence for filesystem gating (§13.3).
+
+**Corrected — the previous revision described the runtime inaccurately:**
+
+- `spending.max_per_run_usd` and `max_per_day_usd` were documented as DECLARED.
+  Both are **ENFORCED**, metered at the MCP gate against priced servers, with a
+  durable per-DID daily ledger. The scope limits of that metering are now
+  stated explicitly (§11.1).
+- `human_gates.*` were documented as DECLARED and "planned for v1.0". Gates are
+  **ENFORCED** on MCP tool calls.
+- `human_gates.require_approval_for` was documented as taking capability
+  categories. It takes **exact MCP tool names**; the mapping contract is now
+  specified (§13.2).
+- `sandbox.network.egress` was documented as ENFORCED. It is **DECLARED** — no
+  code path reads it, and `egress: open` does not open the network (§7.1).
+- `compliance.audit_log_level` was documented as ENFORCED with a per-level
+  event table. It is **DECLARED**; logging does not vary by level (§14.1).
+- `compliance.frameworks` and `geo_restrictions` were documented as DECLARED;
+  they are **INFORMATIONAL**.
+- `capabilities` was documented as enforcement "planned for v0.5". Its actual
+  role — isolation inference plus advisory gate reporting, and nothing else —
+  is now stated, along with what it is *not* (§8.1).
+- `sandbox.network.allowed_hosts` was documented as required under
+  `egress: restricted`. It is optional; an empty list means no egress.
+- References to Constle release versions (v0.4, v0.5) were removed. This
+  document now describes the runtime it ships with, and states enforcement
+  status directly rather than by release number.
+
+**Structure:**
+
+- Added spec-level version numbering, distinct from `apiVersion` (§19.1).
+- Added this changelog.
+- Stated the relationship between this document and the executable
+  `agent-manifest.yaml` reference file, and which is normative (§1.1).
+
+---
+
+## 21. Roadmap — not valid manifest syntax
+
+The following are planned but **do not exist in the runtime**. They are
+described here in prose, deliberately outside the field reference, so that no
+reader can mistake them for syntax that works. Nothing in this section may be
+written into an Agentfile.
+
+**`identity` — `did:web` and `did:constle` methods.**
+Both require a resolution step that `did:key` does not: `did:web` fetches a
+document over HTTPS, and `did:constle` implies a registry. Each therefore
+introduces a trust dependency — a network path and an authority — into what is
+currently a self-contained verification. That dependency has to be designed
+before it ships, because a DID method whose resolution can be intercepted is
+worse than no DID at all. Only `did:key` is supported today.
+
+**`human_gates` — path- and condition-scoped approval for filesystem writes.**
+Blocked on the host-side file watcher described in §13.3. The field shape is
+not the hard part; the external chokepoint is.
+
+**`spending` — monthly ledger enforcement for `max_per_month_usd`.**
+The daily ledger already establishes the durable, DID-keyed, lock-protected
+pattern; the monthly one is the same mechanism over a wider window.
+
+**`sandbox` — enforcement of `network.egress` as a policy mode.**
+Making `egress` a real policy mode distinct from the `allowed_hosts` allowlist,
+so that `open` and `none` mean what they say (§7.1).
+
+**`sandbox` — application of `disk_mb`.**
+Currently parsed and defaulted but imposed by neither backend (§6.5).
