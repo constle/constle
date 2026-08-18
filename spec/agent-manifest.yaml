@@ -1,6 +1,6 @@
 # Constle Agent Manifest — annotated reference file
 # Spec version: 0.1.0   (apiVersion: constle.dev/v1alpha1)
-# https://constle.dev/spec/agent-manifest
+# https://docs.constle.dev/reference/agent-manifest/
 #
 # This file is the EXECUTABLE companion to spec/agent-manifest.md. That
 # document is normative — it carries the full prose definition of every
