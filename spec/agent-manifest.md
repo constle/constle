@@ -5,8 +5,8 @@
 **Status:** Draft. Field names and semantics may change before v1.0.
 **Last updated:** 2026-08-16
 **Source of truth:** `pkg/manifest/manifest.go` and `pkg/manifest/parser.go`
-**Annotated reference file:** [`spec/agent-manifest.yaml`](agent-manifest.yaml)
-**Canonical URL:** https://constle.dev/spec/agent-manifest
+**Annotated reference file:** [`spec/agent-manifest.yaml`](https://github.com/constle/constle/blob/main/spec/agent-manifest.yaml)
+**Canonical URL:** https://docs.constle.dev/reference/agent-manifest/
 
 ---
 
@@ -268,7 +268,7 @@ When `did` is set, three things become true:
 3. **Identity-scoped features unlock.** `spending.max_per_day_usd` and any
    `a2a` configuration require a DID and are rejected without one.
 
-Full design: [`spec/identity.md`](identity.md).
+Full design: [`spec/identity.md`](https://github.com/constle/constle/blob/main/spec/identity.md).
 
 ---
 
@@ -286,7 +286,7 @@ sandbox:
   network:
     egress: restricted
     allowed_hosts:
-      - "api.anthropic.com"
+      - "api.groq.com"
 ```
 
 ### 6.1 `sandbox.isolation`
@@ -439,6 +439,8 @@ that actually constrains the network. Everything not listed is refused.
 
 ```yaml
 allowed_hosts:
+  - "api.groq.com"
+  - "api.openai.com"
   - "api.anthropic.com"
   - ".example.com"        # matches example.com and all subdomains
 ```
@@ -446,6 +448,8 @@ allowed_hosts:
 Entries are hostnames. An entry beginning with `.` matches that domain and all
 its subdomains; otherwise the match is exact. Ports, schemes, paths, and IP
 literals are not part of the matching.
+
+The provider hosts used as examples in this document (`api.groq.com`, `api.openai.com`, `api.anthropic.com`, etc.) are illustrative, not endorsements or defaults — substitute whatever hosts the agent's actual tools and model calls need.
 
 **How it is enforced.** The agent's sandbox is attached only to an internal
 network with no route to the internet. A per-run Squid proxy is the sole
@@ -694,7 +698,7 @@ never verifies, and never learns a peer's real endpoint: it talks only to the
 per-run gate at `CONSTLE_A2A_URL`.
 
 Full design, including the inbound listener hardening, envelope format, and the
-named replay-protection limitation: [`spec/a2a.md`](a2a.md).
+named replay-protection limitation: [`spec/a2a.md`](https://github.com/constle/constle/blob/main/spec/a2a.md).
 
 ### 10.1 `a2a.listen`
 
@@ -1217,11 +1221,11 @@ sandbox:
   command: ["python", "/workspace/agent.py"]
   network:
     allowed_hosts:
-      - "api.anthropic.com"
+      - "api.openai.com"
 ```
 
 Runs `python /workspace/agent.py` in a Python 3.11 container, blocks all
-outbound traffic except to `api.anthropic.com`, applies no time limit, and
+outbound traffic except to `api.openai.com`, applies no time limit, and
 writes an unsigned audit log.
 
 ### 18.2 Full
