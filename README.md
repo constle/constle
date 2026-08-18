@@ -1,12 +1,27 @@
 # Constle
 
+<!--
+  The `--8<--` comments through this file are section markers, not clutter. The
+  documentation site at constle/constle-docs pulls the marked prose straight out
+  of this README with pymdownx.snippets, so this file is its single source and
+  the two cannot drift. Editing inside a marked section is fine and is the
+  point; deleting or unbalancing a marker breaks that repository's build, not
+  this one, so it will not show up in CI here.
+-->
+
+<!-- --8<-- [start:pitch] -->
 **Constle is a runtime that enforces what an AI agent is allowed to do — network, spend, approvals, identity — from outside the agent, so a compromised agent cannot turn the rules off.**
+<!-- --8<-- [end:pitch] -->
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Go 1.26+](https://img.shields.io/badge/go-1.26+-00ADD8.svg)](https://golang.org)
 [![Release](https://img.shields.io/github/v/release/constle/constle)](https://github.com/constle/constle/releases)
 [![Build](https://github.com/constle/constle/actions/workflows/release.yaml/badge.svg)](https://github.com/constle/constle/actions)
 
+Full documentation lives at [constle/constle-docs](https://github.com/constle/constle-docs),
+publishing to [docs.constle.dev](https://docs.constle.dev).
+
+<!-- --8<-- [start:demo] -->
 You declare the policy in one YAML file. Constle runs the agent inside a sandbox with no default route, routes every packet through an allowlisting proxy, meters cost at the tool-call boundary, pauses sensitive calls for a human, and writes a signed, hash-chained audit log. None of that lives in the agent's process, so there is nothing in it for a prompt injection to disable.
 
 An agent whose manifest declares `allowed_hosts: [api.groq.com]`, reaching for one declared host and one undeclared one:
@@ -25,12 +40,18 @@ $ grep network ~/.constle/logs/egress-probe-2026-08-08.jsonl
 The second request never left the sandbox. The agent didn't get a refusal from the model — it got no route at all: the proxy declined to open the tunnel, which is the `403` on that line and the only thing that `403` means here. The `200` in the log is the *tunnel* being established for the declared host, not the answer Groq eventually gave; whatever status the real server returns after that is between the agent and the server, and Constle doesn't read it (see [limitation 3](#known-limitations)).
 
 Both attempts are in the audit log either way — the blocked one is how you find out it happened.
+<!-- --8<-- [end:demo] -->
 
 ---
 
 ## Architecture
 
+<!-- The docs site replaces the box drawing below with a rendered diagram, so it
+     pulls the prose either side of it as two separate snippets and skips the
+     drawing itself. Keep both markers if you edit this section. -->
+<!-- --8<-- [start:architecture-intro] -->
 Four layers. Three ship today; the fourth does not exist yet and is marked as such.
+<!-- --8<-- [end:architecture-intro] -->
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -56,12 +77,15 @@ Four layers. Three ship today; the fourth does not exist yet and is marked as su
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
+<!-- --8<-- [start:architecture-detail] -->
 The load-bearing property is the direction of control: every layer runs in the **host** `constle` process, and the agent runs in the sandbox. The agent's private key, the real MCP server URLs, and the real A2A peer endpoints never enter the sandbox at all. The agent talks to per-run gate addresses and nothing else.
+<!-- --8<-- [end:architecture-detail] -->
 
 ---
 
 ## 60-second quickstart
 
+<!-- --8<-- [start:quickstart] -->
 Verified end to end on Linux + Docker against `constle v0.4.0`. Copy-paste as-is.
 
 **1. Build the CLI** (Go 1.26+):
@@ -159,13 +183,19 @@ error: TAMPERING DETECTED in ~/.constle/logs/my-agent-2026-08-08.jsonl
 ```
 
 With `identity.did` set, `constle run` also **fails closed**: if the manifest names a DID with no matching private key on this machine, the run refuses to start rather than proceeding under an identity it cannot actually prove.
+<!-- --8<-- [end:quickstart] -->
 
 ---
 
 ## Known limitations
 
+<!-- The docs site puts a summary diagram of all five between these two snippets,
+     so the intro and the detail are pulled separately. -->
+<!-- --8<-- [start:limitations-intro] -->
 These are known, deliberate, and load-bearing to read before you trust anything above. Each one is a case where a manifest field looks stronger than the runtime currently is, and each is stated in the code at the point where it matters.
+<!-- --8<-- [end:limitations-intro] -->
 
+<!-- --8<-- [start:limitations-detail] -->
 ### 1. Human gates match MCP tool names by exact string, and nothing else
 
 `human_gates.require_approval_for` gates a call when an entry is a **byte-exact, case-sensitive match** for the `params.name` of a `tools/call` request on a server declared under `mcp.servers`. The tool name is the only protocol-level identifier the gate proxy sees, and exact match is the only mapping that is deterministic and auditable — there is no semantic matching, no prefix matching, no wildcards.
@@ -205,11 +235,13 @@ So `egress: open` and `egress: none` both parse cleanly, change nothing about wh
 **Until then: treat `allowed_hosts` as the entire network policy. It is.** An empty or absent `allowed_hosts` is your "deny all"; `egress` is documentation.
 
 *Source: `cmd/constle/main.go` (`renderRunSummary`, "KNOWN GAP"), recorded in [#16](https://github.com/constle/constle/issues/16).*
+<!-- --8<-- [end:limitations-detail] -->
 
 ---
 
 ## What Constle enforces
 
+<!-- --8<-- [start:enforces] -->
 | Capability | Mechanism | Status |
 |---|---|---|
 | **Sandboxed execution** | Firecracker microVM (hardware isolation) or a two-network Docker sandbox with no default gateway. Auto-detected, or forced with `--backend=docker\|firecracker`. `isolation: kernel` selects Firecracker and warns loudly if it has to fall back to Docker. | Shipped |
@@ -223,11 +255,13 @@ So `egress: open` and `egress: none` both parse cleanly, change nothing about wh
 | **Agent commerce** | — | Not built |
 
 Constle is **not a framework.** It doesn't decide how an agent reasons or plans. LangGraph, CrewAI, or hand-rolled code run inside it unchanged.
+<!-- --8<-- [end:enforces] -->
 
 ---
 
 ## The Agentfile
 
+<!-- --8<-- [start:agentfile] -->
 One declarative file, enforced identically wherever the runtime is installed. This example uses every field the runtime actually consumes:
 
 ```yaml
@@ -295,11 +329,14 @@ compliance:
 `constle init` scaffolds a starter file with these defaults. Full field reference: [`spec/agent-manifest.md`](spec/agent-manifest.md), plus [`spec/a2a.md`](spec/a2a.md) and [`spec/identity.md`](spec/identity.md).
 
 [`spec/agent-manifest.yaml`](spec/agent-manifest.yaml) is an annotated reference file covering every supported field. It is executable, not aspirational — `constle validate spec/agent-manifest.yaml` passes, and fields that are parsed but not yet enforced are labelled as such inline.
+<!-- --8<-- [end:agentfile] -->
 
 ---
 
 ## How network isolation actually works
 
+<!-- The docs site draws this next hop as a diagram, so the snippet it pulls
+     starts after the box drawing rather than at the top of the section. -->
 ```
 [Agent process]
       │  no default route, IPv4 or IPv6 — there is nowhere else to send a packet
@@ -308,6 +345,7 @@ compliance:
                          ──✗  everything else, including raw IPs    → network_blocked (403)
 ```
 
+<!-- --8<-- [start:network] -->
 The agent process has no route to the internet. The only reachable next hop is the proxy, which checks each `CONNECT` against `allowed_hosts`. Both backends render this policy from the same function (`buildSquidConfig`, `internal/sandbox/docker.go`), so Docker and Firecracker enforce the same ruleset.
 
 Resolving a hostname inside the sandbox and connecting to the resulting address does not get around it — the raw IP of an allowed host is denied along with every other IP literal, because the allowlist is a `dstdomain` ACL that an address can never match:
@@ -339,11 +377,13 @@ One caveat, stated because it's the kind of thing that rots quietly: the proxy's
 The proxy trusts DNS. If a declared hostname resolves to an address an attacker controls, the allowlist will let it through — name-based allowlisting is only as good as the name resolution behind it.
 
 If a document the agent reads contains a hidden instruction to exfiltrate data to an undeclared host, that instruction has no path to succeed. The block happens at the network layer, below the model, whether or not the agent "knows" it is compromised — and the attempt lands in the audit log as a `network_blocked` event, which is how you find out it happened.
+<!-- --8<-- [end:network] -->
 
 ---
 
 ## CLI reference
 
+<!-- --8<-- [start:cli] -->
 | Command | Description |
 |---|---|
 | `constle run [--backend=docker\|firecracker] <agentfile>` | Run an agent in an isolated sandbox |
@@ -355,11 +395,13 @@ If a document the agent reads contains a hidden instruction to exfiltrate data t
 | `constle identity show <name>` | Show an agent's DID and key location |
 | `constle audit verify [--did=<did:key:…>] <logfile>` | Verify an audit log's signatures and hash chain |
 | `constle version` | Print the version |
+<!-- --8<-- [end:cli] -->
 
 ---
 
 ## Verifying a release
 
+<!-- --8<-- [start:verify] -->
 Every release ships a `checksums.txt` covering all archives, signed with [cosign](https://docs.sigstore.dev/) keyless signing from the release workflow. Download `checksums.txt`, `checksums.txt.sig`, and `checksums.txt.pem` next to your archive, then:
 
 ```bash
@@ -380,11 +422,13 @@ Each archive also carries a SLSA build-provenance attestation:
 ```bash
 gh attestation verify constle_<version>_linux_amd64.tar.gz --repo constle/constle
 ```
+<!-- --8<-- [end:verify] -->
 
 ---
 
 ## What Constle is not
 
+<!-- --8<-- [start:isnot] -->
 **Not an agent framework.** It governs the environment, not the logic.
 
 **Not a cloud provider.** It installs on your infrastructure, any cloud or on-premise. Software, not servers.
@@ -394,6 +438,7 @@ gh attestation verify constle_<version>_linux_amd64.tar.gz --repo constle/constl
 **Not finished.** See [Known limitations](#known-limitations) — they are listed there rather than discovered later.
 
 **Not a closed platform.** Apache 2.0, and the Agentfile format is an open, independently auditable standard.
+<!-- --8<-- [end:isnot] -->
 
 ---
 
