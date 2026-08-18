@@ -1,8 +1,14 @@
 # A2A — Signed Agent-to-Agent Communication
 
-Status: complete. Phases 1–4 implemented and verified end to end on both
+**Spec version:** 0.1.0
+**Status:** Complete. Phases 1–4 implemented and verified end to end on both
 the Docker and Firecracker backends (outbound, inbound listener/inbox, audit
 completeness, adversarial verification).
+**Last updated:** 2026-08-16
+**Source of truth:** `internal/a2a`, `internal/sandbox`
+**Related:** [`agent-manifest.md` §10](agent-manifest.md) (the `a2a` manifest
+section), [`identity.md`](identity.md) (the identity every envelope is signed
+with)
 
 ## Scope
 
@@ -78,11 +84,11 @@ strictly before — any signature work:
 1. exact route match (`POST /a2a/v1/call` only; everything else a flat 404);
 2. hard server timeouts (header read, body read, write) and a header-size
    cap, so a slow or stalling client cannot pin connections;
-3. body-size cap enforced on byte count **before any parsing**;
+3. body-size cap (10 MB) enforced on byte count **before any parsing**;
 4. malformed input (bad JSON, framing, base64, DID) rejected via error
    returns — no panics, no body echo;
 5. bounded inbox with a **per-peer admission quota**: each declared peer
-   may hold at most a fixed number of undelivered calls; exceeding it sheds
+   may hold at most 16 undelivered calls; exceeding it sheds
    that peer's calls (503) without affecting any other peer, so a noisy or
    buggy — but fully authenticated — peer cannot starve an unrelated one,
    and total host memory stays bounded by (quota × declared peers).
