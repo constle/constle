@@ -21,6 +21,8 @@
 Full documentation lives at [constle/constle-docs](https://github.com/constle/constle-docs),
 publishing to [docs.constle.dev](https://docs.constle.dev).
 
+Enforcement runs in the host process, not the agent's, and that claim is independently checkable: releases are cosign-signed with keyless signing (see [Verifying a release](#verifying-a-release)), and the audit log is hash-chained so an edited entry fails verification rather than passing silently.
+
 <!-- --8<-- [start:demo] -->
 You declare the policy in one YAML file. Constle runs the agent inside a sandbox with no default route, routes every packet through an allowlisting proxy, meters cost at the tool-call boundary, pauses sensitive calls for a human, and writes a signed, hash-chained audit log. None of that lives in the agent's process, so there is nothing in it for a prompt injection to disable.
 
@@ -442,39 +444,10 @@ gh attestation verify constle_<version>_linux_amd64.tar.gz --repo constle/constl
 
 ---
 
-## Repository structure
+## Beyond this file
 
-```
-constle/
-├── cmd/constle/          # CLI entry point and subcommands
-├── internal/
-│   ├── a2a/              # agent-to-agent messaging, gating, audit
-│   ├── audit/            # JSONL logger, signing, verification, Squid log ingest
-│   ├── identity/         # DID-backed agent identity
-│   ├── mcpgate/          # protocol-aware MCP gate: human gates + cost metering
-│   ├── sandbox/          # SandboxBackend interface: Docker + Firecracker
-│   └── spending/         # exact-decimal money, meter, durable daily ledger
-├── pkg/
-│   ├── did/              # W3C did:key generation and verification
-│   └── manifest/         # Agentfile types, parser, validation
-├── examples/basic-agent/ # working demo agent (Python + Groq)
-├── demo/                 # small manifests for exercising the CLI
-├── scripts/              # install + Firecracker host setup
-└── spec/                 # Agentfile, A2A, and identity specifications
-```
-
----
-
-## Roadmap & contributing
-
-Constle ships in milestones, not on a calendar — see [ROADMAP.md](ROADMAP.md). Early and solo-maintained; see [CONTRIBUTING.md](CONTRIBUTING.md). The most useful contributions right now are bug reports, a gVisor sandbox backend, and anything that closes a row in [Known limitations](#known-limitations).
-
-Security issues: see [SECURITY.md](SECURITY.md).
+Full docs, including everything pulled from this README, are at [docs.constle.dev](https://docs.constle.dev). Constle ships in milestones, not on a calendar — see [ROADMAP.md](ROADMAP.md). It's early and solo-maintained; see [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR — the most useful contributions right now are bug reports, a gVisor sandbox backend, and anything that closes a row in [Known limitations](#known-limitations). Security issues: see [SECURITY.md](SECURITY.md).
 
 ## License
 
 [Apache 2.0](LICENSE)
-
----
-
-**[github.com/constle/constle](https://github.com/constle/constle)**
