@@ -10,7 +10,7 @@
 -->
 
 <!-- --8<-- [start:pitch] -->
-**Constle is a runtime that enforces what an AI agent is allowed to do — network, spend, approvals, identity — from outside the agent, so a compromised agent cannot turn the rules off.**
+**Constle is a runtime that enforces what an AI agent is allowed to do - network, spend, approvals, identity - from outside the agent, so a compromised agent cannot turn the rules off.**
 <!-- --8<-- [end:pitch] -->
 
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -39,9 +39,9 @@ $ grep network ~/.constle/logs/egress-probe-2026-08-08.jsonl
 {"event":"network_blocked","details":{"bytes":3404,"host":"evil.example.com","http_status":403,"method":"CONNECT"}}
 ```
 
-The second request never left the sandbox. The agent didn't get a refusal from the model — it got no route at all: the proxy declined to open the tunnel, which is the `403` on that line and the only thing that `403` means here. The `200` in the log is the *tunnel* being established for the declared host, not the answer Groq eventually gave; whatever status the real server returns after that is between the agent and the server, and Constle doesn't read it (see [limitation 3](#known-limitations)).
+The second request never left the sandbox. The agent didn't get a refusal from the model - it got no route at all: the proxy declined to open the tunnel, which is the `403` on that line and the only thing that `403` means here. The `200` in the log is the *tunnel* being established for the declared host, not the answer Groq eventually gave; whatever status the real server returns after that is between the agent and the server, and Constle doesn't read it (see [limitation 3](#known-limitations)).
 
-Both attempts are in the audit log either way — the blocked one is how you find out it happened.
+Both attempts are in the audit log either way - the blocked one is how you find out it happened.
 <!-- --8<-- [end:demo] -->
 
 ---
@@ -57,22 +57,22 @@ Four layers. Three ship today; the fourth does not exist yet and is marked as su
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│  Layer 4 — Commerce                                       PLANNED    │
+│  Layer 4 - Commerce                                       PLANNED    │
 │  Agents discovering and paying each other for work.                  │
-│  No code in this repo. Direction only — see ROADMAP.md.              │
+│  No code in this repo. Direction only - see ROADMAP.md.              │
 ├──────────────────────────────────────────────────────────────────────┤
-│  Layer 3 — Communication                                  SHIPPED    │
+│  Layer 3 - Communication                                  SHIPPED    │
 │  A2A: Ed25519-signed envelopes, host-side sign + verify,             │
 │  declared peers only, no discovery mechanism by design.              │
 │  internal/a2a/                                                       │
 ├──────────────────────────────────────────────────────────────────────┤
-│  Layer 2 — Identity & Governance                          SHIPPED    │
+│  Layer 2 - Identity & Governance                          SHIPPED    │
 │  W3C did:key identity · signed + hash-chained audit log ·            │
 │  human gates at the MCP proxy · per-run and per-day USD ledger.      │
 │  internal/identity/  internal/audit/  internal/mcpgate/              │
 │  internal/spending/                                                  │
 ├──────────────────────────────────────────────────────────────────────┤
-│  Layer 1 — Runtime & Sandbox                              SHIPPED    │
+│  Layer 1 - Runtime & Sandbox                              SHIPPED    │
 │  Firecracker microVM or two-network Docker sandbox, no default       │
 │  route, Squid egress allowlist, wall-clock kill switch.              │
 │  internal/sandbox/                                                   │
@@ -120,7 +120,7 @@ Pre-built binaries for Linux, macOS, and Windows are on the [releases page](http
    no mcp.servers entry declares a pricing block, so there is nothing to meter.
 ```
 
-That warning is the design working. `examples/basic-agent/agent.yaml` declares `max_per_run_usd: "0.10"` but has no priced MCP server, so there is nothing to meter it against — and Constle says so out loud rather than letting a declared cap look real. See [Known limitations](#known-limitations).
+That warning is the design working. `examples/basic-agent/agent.yaml` declares `max_per_run_usd: "0.10"` but has no priced MCP server, so there is nothing to meter it against - and Constle says so out loud rather than letting a declared cap look real. See [Known limitations](#known-limitations).
 
 **3. Build the example agent image and run it:**
 
@@ -140,7 +140,7 @@ constle v0.4.0
      isolation: network
      memory:    512MB
      network:   restricted → api.groq.com
-     spending:  run≤$0.10 (NOT ENFORCED — no priced MCP servers)
+     spending:  run≤$0.10 (NOT ENFORCED - no priced MCP servers)
 
   → detecting backend
   ✓ backend: docker
@@ -156,7 +156,7 @@ constle v0.4.0
   audit log: ~/.constle/logs/basic-agent-2026-08-08.jsonl
 ```
 
-> `constle run` takes no `--env` flag. Exactly three host variables are forwarded into the sandbox — `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, and `AGENT_TASK` (`internal/sandbox/docker.go`, `forwardedHostEnv`). Export them in your shell; they are never written into the image or the manifest.
+> `constle run` takes no `--env` flag. Exactly three host variables are forwarded into the sandbox - `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, and `AGENT_TASK` (`internal/sandbox/docker.go`, `forwardedHostEnv`). Export them in your shell; they are never written into the image or the manifest.
 
 **4. Sign the audit trail** (optional, ~20 seconds more):
 
@@ -181,7 +181,7 @@ Edit a single byte of that file and re-run it:
 
 ```
 error: TAMPERING DETECTED in ~/.constle/logs/my-agent-2026-08-08.jsonl
-  line 1: invalid_signature — signature does not verify against did:key:z6Mkg… — the entry was edited after signing
+  line 1: invalid_signature - signature does not verify against did:key:z6Mkg… - the entry was edited after signing
 ```
 
 With `identity.did` set, `constle run` also **fails closed**: if the manifest names a DID with no matching private key on this machine, the run refuses to start rather than proceeding under an identity it cannot actually prove.
@@ -200,9 +200,9 @@ These are known, deliberate, and load-bearing to read before you trust anything 
 <!-- --8<-- [start:limitations-detail] -->
 ### 1. Human gates match MCP tool names by exact string, and nothing else
 
-`human_gates.require_approval_for` gates a call when an entry is a **byte-exact, case-sensitive match** for the `params.name` of a `tools/call` request on a server declared under `mcp.servers`. The tool name is the only protocol-level identifier the gate proxy sees, and exact match is the only mapping that is deterministic and auditable — there is no semantic matching, no prefix matching, no wildcards.
+`human_gates.require_approval_for` gates a call when an entry is a **byte-exact, case-sensitive match** for the `params.name` of a `tools/call` request on a server declared under `mcp.servers`. The tool name is the only protocol-level identifier the gate proxy sees, and exact match is the only mapping that is deterministic and auditable - there is no semantic matching, no prefix matching, no wildcards.
 
-**What this means for you:** an entry like `external_transfer` gates *nothing* unless an MCP server actually exposes a tool named exactly `external_transfer`. Constle warns about every unmatched entry at both `validate` and `run` time, so an unenforceable gate is loud rather than silent — but it is still unenforceable. Human gates also do not apply to plain HTTPS traffic through `allowed_hosts`; the gate proxy only sees MCP.
+**What this means for you:** an entry like `external_transfer` gates *nothing* unless an MCP server actually exposes a tool named exactly `external_transfer`. Constle warns about every unmatched entry at both `validate` and `run` time, so an unenforceable gate is loud rather than silent - but it is still unenforceable. Human gates also do not apply to plain HTTPS traffic through `allowed_hosts`; the gate proxy only sees MCP.
 
 *Source: `pkg/manifest/manifest.go` (`HumanGates.RequireApprovalFor`, "MAPPING CONTRACT"), `cmd/constle/gates.go`.*
 
@@ -214,7 +214,7 @@ The field is accepted by the parser and validated as a decimal amount. Nothing e
 
 ### 3. Traffic through `allowed_hosts` is not metered for spending
 
-Cost is metered **only** at the MCP gate proxy, against the `pricing` block a server declares. Ordinary HTTPS to a host in `network.allowed_hosts` — including every direct call to an LLM API — is allowlisted, logged, and **not** counted toward any spending cap.
+Cost is metered **only** at the MCP gate proxy, against the `pricing` block a server declares. Ordinary HTTPS to a host in `network.allowed_hosts` - including every direct call to an LLM API - is allowlisted, logged, and **not** counted toward any spending cap.
 
 This is a deliberate privacy trade-off, not an oversight: metering that traffic would require Constle to TLS-intercept the agent's connections and read their contents, and Constle refuses to do that. The consequence is real and you should size it: **an agent that spends money over `allowed_hosts` rather than through a priced MCP server has no spending enforcement at all.** That is exactly the case the quickstart's example hits, and why it prints `NOT ENFORCED`.
 
@@ -224,15 +224,15 @@ This is a deliberate privacy trade-off, not an oversight: metering that traffic 
 
 The A2A listener rejects duplicate `msg_id`s and envelopes whose timestamp drifts more than ±5 minutes from the local clock. The set of seen message IDs lives in process memory and does not survive a `constle` restart.
 
-**What this means:** an envelope captured during one run can be replayed against a *later* run, provided the replay lands inside the 5-minute timestamp window. Durable, cross-run replay state is out of scope for this version. The mitigation available today is the timestamp window itself — keep runs of the same agent separated by more than 5 minutes if replay across runs is in your threat model.
+**What this means:** an envelope captured during one run can be replayed against a *later* run, provided the replay lands inside the 5-minute timestamp window. Durable, cross-run replay state is out of scope for this version. The mitigation available today is the timestamp window itself - keep runs of the same agent separated by more than 5 minutes if replay across runs is in your threat model.
 
 *Source: `internal/a2a/envelope.go` (`replayGuard`).*
 
 ### 5. `sandbox.network.egress` is declared but has no consumer
 
-The field parses, validates, and defaults to `restricted` — and then nothing reads it. All egress enforcement is derived **solely** from `network.allowed_hosts`, which becomes the Squid `dstdomain` allowlist. An empty list denies everything.
+The field parses, validates, and defaults to `restricted` - and then nothing reads it. All egress enforcement is derived **solely** from `network.allowed_hosts`, which becomes the Squid `dstdomain` allowlist. An empty list denies everything.
 
-So `egress: open` and `egress: none` both parse cleanly, change nothing about what the agent can reach, and still render as `restricted` in the run summary. This is the one gap in this list that is a declared policy which *looks* real and is not, which is precisely what the warnings in items 1 and 2 exist to prevent elsewhere. Fixing it means deciding what `egress: open` should *do*, not just what it should print — until that decision is made, the display label is deliberately not derived from the field, because deriving it would make the output honest about a value the runtime still ignores.
+So `egress: open` and `egress: none` both parse cleanly, change nothing about what the agent can reach, and still render as `restricted` in the run summary. This is the one gap in this list that is a declared policy which *looks* real and is not, which is precisely what the warnings in items 1 and 2 exist to prevent elsewhere. Fixing it means deciding what `egress: open` should *do*, not just what it should print - until that decision is made, the display label is deliberately not derived from the field, because deriving it would make the output honest about a value the runtime still ignores.
 
 **Until then: treat `allowed_hosts` as the entire network policy. It is.** An empty or absent `allowed_hosts` is your "deny all"; `egress` is documentation.
 
@@ -247,14 +247,14 @@ So `egress: open` and `egress: none` both parse cleanly, change nothing about wh
 | Capability | Mechanism | Status |
 |---|---|---|
 | **Sandboxed execution** | Firecracker microVM (hardware isolation) or a two-network Docker sandbox with no default gateway. Auto-detected, or forced with `--backend=docker\|firecracker`. `isolation: kernel` selects Firecracker and warns loudly if it has to fall back to Docker. | Shipped |
-| **Network egress** | All egress traverses a Squid proxy allowlisting `network.allowed_hosts`. Matching is name-based (`dstdomain`), and a separate rule denies destinations given as raw IPs — including the real IP of an allowed host — so resolving a name yourself and connecting to the address is not a way around the allowlist. Every allow and every block is an audit event. | Shipped |
+| **Network egress** | All egress traverses a Squid proxy allowlisting `network.allowed_hosts`. Matching is name-based (`dstdomain`), and a separate rule denies destinations given as raw IPs - including the real IP of an allowed host - so resolving a name yourself and connecting to the address is not a way around the allowlist. Every allow and every block is an audit event. | Shipped |
 | **Max duration** | The agent is killed when `limits.max_duration_seconds` elapses; the kill is recorded as `terminated_by_limit`. | Shipped |
 | **Audit log** | JSONL per agent per UTC day. With `identity.did` set, every entry is Ed25519-signed and hash-chained; `constle audit verify` detects tampering and reports the offending line. | Shipped |
-| **Spending limits** | Hard `max_per_run_usd` and `max_per_day_usd`. Metered at the MCP gate against each server's declared `pricing`. The daily ledger is durable across runs, keyed by DID so a rename can't reset it. A priced server whose response omits a declared usage value kills the run — a server that could omit its usage field could zero its own bill. **Scope caveats: limitations 2 and 3.** | Shipped |
-| **Human gates** | Declared MCP servers are reachable only through a protocol-aware gate proxy. A matching `tools/call` pauses for a terminal approval; `on_timeout` defaults to `abort`. Non-interactive stdin (CI, piped input, backgrounded runs) is detected up front and announced, rather than blocking on a read that never resolves — the call then waits out its deadline and `on_timeout` decides. **Matching caveat: limitation 1.** | Shipped |
+| **Spending limits** | Hard `max_per_run_usd` and `max_per_day_usd`. Metered at the MCP gate against each server's declared `pricing`. The daily ledger is durable across runs, keyed by DID so a rename can't reset it. A priced server whose response omits a declared usage value kills the run - a server that could omit its usage field could zero its own bill. **Scope caveats: limitations 2 and 3.** | Shipped |
+| **Human gates** | Declared MCP servers are reachable only through a protocol-aware gate proxy. A matching `tools/call` pauses for a terminal approval; `on_timeout` defaults to `abort`. Non-interactive stdin (CI, piped input, backgrounded runs) is detected up front and announced, rather than blocking on a read that never resolves - the call then waits out its deadline and `on_timeout` decides. **Matching caveat: limitation 1.** | Shipped |
 | **Cryptographic identity** | W3C `did:key` (Ed25519). The private key stays at `~/.constle/identities/<name>/` (mode 0600) and never enters the sandbox. `constle run` fails closed on a declared DID with no local key. | Shipped |
 | **Agent-to-agent messaging** | Signed envelopes to explicitly declared peers only. The host signs and verifies; the sandbox does no cryptography and never sees a peer's real endpoint. No discovery mechanism exists, by design. **Replay caveat: limitation 4.** | Shipped |
-| **Agent commerce** | — | Not built |
+| **Agent commerce** | - | Not built |
 
 Constle is **not a framework.** It doesn't decide how an agent reasons or plans. LangGraph, CrewAI, or hand-rolled code run inside it unchanged.
 <!-- --8<-- [end:enforces] -->
@@ -278,10 +278,10 @@ identity:
 
 sandbox:
   image: invoice-processor:latest
-  isolation: kernel               # or omit — inferred from capabilities
+  isolation: kernel               # or omit - inferred from capabilities
   memory_mb: 512
   network:
-    egress: restricted            # declared only — see limitation 5
+    egress: restricted            # declared only - see limitation 5
     allowed_hosts:                # this list IS the network policy
       - api.groq.com
 
@@ -313,7 +313,7 @@ limits:
 human_gates:
   enabled: true
   require_approval_for:
-    - pay_invoice                 # must exactly match an MCP tool name — limitation 1
+    - pay_invoice                 # must exactly match an MCP tool name - limitation 1
   approval_timeout_seconds: 300
   on_timeout: abort               # default; stop, never proceed
 
@@ -330,7 +330,7 @@ compliance:
 
 `constle init` scaffolds a starter file with these defaults. Full field reference: [`spec/agent-manifest.md`](spec/agent-manifest.md), plus [`spec/a2a.md`](spec/a2a.md) and [`spec/identity.md`](spec/identity.md).
 
-[`spec/agent-manifest.yaml`](spec/agent-manifest.yaml) is an annotated reference file covering every supported field. It is executable, not aspirational — `constle validate spec/agent-manifest.yaml` passes, and fields that are parsed but not yet enforced are labelled as such inline.
+[`spec/agent-manifest.yaml`](spec/agent-manifest.yaml) is an annotated reference file covering every supported field. It is executable, not aspirational - `constle validate spec/agent-manifest.yaml` passes, and fields that are parsed but not yet enforced are labelled as such inline.
 <!-- --8<-- [end:agentfile] -->
 
 ---
@@ -341,7 +341,7 @@ compliance:
      starts after the box drawing rather than at the top of the section. -->
 ```
 [Agent process]
-      │  no default route, IPv4 or IPv6 — there is nowhere else to send a packet
+      │  no default route, IPv4 or IPv6 - there is nowhere else to send a packet
       ▼
 [Squid allowlist proxy]  ──▶  hosts in network.allowed_hosts        → network_allowed
                          ──✗  everything else, including raw IPs    → network_blocked (403)
@@ -350,7 +350,7 @@ compliance:
 <!-- --8<-- [start:network] -->
 The agent process has no route to the internet. The only reachable next hop is the proxy, which checks each `CONNECT` against `allowed_hosts`. Both backends render this policy from the same function (`buildSquidConfig`, `internal/sandbox/docker.go`), so Docker and Firecracker enforce the same ruleset.
 
-Resolving a hostname inside the sandbox and connecting to the resulting address does not get around it — the raw IP of an allowed host is denied along with every other IP literal, because the allowlist is a `dstdomain` ACL that an address can never match:
+Resolving a hostname inside the sandbox and connecting to the resulting address does not get around it - the raw IP of an allowed host is denied along with every other IP literal, because the allowlist is a `dstdomain` ACL that an address can never match:
 
 ```
 declared hostname              https://api.groq.com/      CONNECT allowed
@@ -368,17 +368,17 @@ IPv6  2606:4700:4700::1111   OSError: [Errno 101] Network is unreachable
 IPv4  1.1.1.1                OSError: [Errno 101] Network is unreachable
 ```
 
-DNS doesn't resolve in there either — the sandbox cannot look up an address, let alone route to one.
+DNS doesn't resolve in there either - the sandbox cannot look up an address, let alone route to one.
 
-IPv6 in particular is closed on both backends, and closed *deterministically rather than environment-dependently*: the internal network is created with an explicit `--ipv6=false` instead of inheriting whatever the operator's Docker daemon defaults to, so this guarantee is a property of the code and not of the host it runs on. The Firecracker guest gets only a kernel-generated link-local `fe80::` address, never a global one or a `::/0` route, and its per-run nftables table drops the tap interface in the dual-family `inet` table — so the same rule covers both families.
+IPv6 in particular is closed on both backends, and closed *deterministically rather than environment-dependently*: the internal network is created with an explicit `--ipv6=false` instead of inheriting whatever the operator's Docker daemon defaults to, so this guarantee is a property of the code and not of the host it runs on. The Firecracker guest gets only a kernel-generated link-local `fe80::` address, never a global one or a `::/0` route, and its per-run nftables table drops the tap interface in the dual-family `inet` table - so the same rule covers both families.
 
-One caveat, stated because it's the kind of thing that rots quietly: the proxy's raw-IP ACL (`ip_only`) is IPv4-only, with no `::/0` counterpart. Nothing rides on it today — an IPv6 literal is refused by the config's trailing `deny all`, and nothing can reach the proxy over IPv6 anyway — but it would become a real gap if a future change gave a sandbox an IPv6 route without adding the matching rule. It's flagged in the code at `buildSquidConfig`.
+One caveat, stated because it's the kind of thing that rots quietly: the proxy's raw-IP ACL (`ip_only`) is IPv4-only, with no `::/0` counterpart. Nothing rides on it today - an IPv6 literal is refused by the config's trailing `deny all`, and nothing can reach the proxy over IPv6 anyway - but it would become a real gap if a future change gave a sandbox an IPv6 route without adding the matching rule. It's flagged in the code at `buildSquidConfig`.
 
 ### What this does not cover
 
-The proxy trusts DNS. If a declared hostname resolves to an address an attacker controls, the allowlist will let it through — name-based allowlisting is only as good as the name resolution behind it.
+The proxy trusts DNS. If a declared hostname resolves to an address an attacker controls, the allowlist will let it through - name-based allowlisting is only as good as the name resolution behind it.
 
-If a document the agent reads contains a hidden instruction to exfiltrate data to an undeclared host, that instruction has no path to succeed. The block happens at the network layer, below the model, whether or not the agent "knows" it is compromised — and the attempt lands in the audit log as a `network_blocked` event, which is how you find out it happened.
+If a document the agent reads contains a hidden instruction to exfiltrate data to an undeclared host, that instruction has no path to succeed. The block happens at the network layer, below the model, whether or not the agent "knows" it is compromised - and the attempt lands in the audit log as a `network_blocked` event, which is how you find out it happened.
 <!-- --8<-- [end:network] -->
 
 ---
@@ -417,7 +417,7 @@ cosign verify-blob \
 sha256sum --check --ignore-missing checksums.txt
 ```
 
-The two `--certificate-*` flags are **not optional.** Keyless signing has no fixed public key: anyone can obtain a valid Fulcio certificate and sign anything. Without pinning the identity, cosign will report `Verified OK` for a file signed by a complete stranger — all that proves is that *somebody* signed it. Pinning to `constle/constle`'s `release.yaml` on a `v*` tag, issued by GitHub's OIDC issuer, is what turns the signature into "this came from the Constle release workflow."
+The two `--certificate-*` flags are **not optional.** Keyless signing has no fixed public key: anyone can obtain a valid Fulcio certificate and sign anything. Without pinning the identity, cosign will report `Verified OK` for a file signed by a complete stranger - all that proves is that *somebody* signed it. Pinning to `constle/constle`'s `release.yaml` on a `v*` tag, issued by GitHub's OIDC issuer, is what turns the signature into "this came from the Constle release workflow."
 
 Each archive also carries a SLSA build-provenance attestation:
 
@@ -437,7 +437,7 @@ gh attestation verify constle_<version>_linux_amd64.tar.gz --repo constle/constl
 
 **Not a monitoring overlay.** Isolation stops exfiltration even if the model is fully compromised, because enforcement sits below the agent rather than inside it. There is nothing for a compromised agent to disable.
 
-**Not finished.** See [Known limitations](#known-limitations) — they are listed there rather than discovered later.
+**Not finished.** See [Known limitations](#known-limitations) - they are listed there rather than discovered later.
 
 **Not a closed platform.** Apache 2.0, and the Agentfile format is an open, independently auditable standard.
 <!-- --8<-- [end:isnot] -->
@@ -446,7 +446,7 @@ gh attestation verify constle_<version>_linux_amd64.tar.gz --repo constle/constl
 
 ## Beyond this file
 
-Full docs, including everything pulled from this README, are at [docs.constle.dev](https://docs.constle.dev). Constle ships in milestones, not on a calendar — see [ROADMAP.md](ROADMAP.md). It's early and solo-maintained; see [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR — the most useful contributions right now are bug reports, a gVisor sandbox backend, and anything that closes a row in [Known limitations](#known-limitations). Security issues: see [SECURITY.md](SECURITY.md).
+Full docs, including everything pulled from this README, are at [docs.constle.dev](https://docs.constle.dev). Constle ships in milestones, not on a calendar - see [ROADMAP.md](ROADMAP.md). It's early and solo-maintained; see [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR - the most useful contributions right now are bug reports, a gVisor sandbox backend, and anything that closes a row in [Known limitations](#known-limitations). Security issues: see [SECURITY.md](SECURITY.md).
 
 ## License
 
