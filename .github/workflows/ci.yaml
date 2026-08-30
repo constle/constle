@@ -63,6 +63,25 @@ jobs:
           }" spec/
 
   # ---------------------------------------------------------------------------
+  # Hygiene: no AI-attribution trailers or unexpected script ranges in the
+  # commits a PR would add. Generic patterns only — maintainer-private
+  # patterns run in the local pre-push hook (see scripts/hygiene-check.sh).
+  # Scoped to the PR range rather than --all deliberately: it gates new
+  # content without re-litigating history on every run.
+  # ---------------------------------------------------------------------------
+  hygiene:
+    name: Hygiene (attribution & identity)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan PR commits
+        run: ./scripts/hygiene-check.sh --range "origin/${{ github.base_ref }}..HEAD"
+
+  # ---------------------------------------------------------------------------
   # Cross-platform build of the CLI binary.
   # ---------------------------------------------------------------------------
   build:
