@@ -81,13 +81,20 @@ func New(m *manifest.AgentManifest, signer Signer, logger *audit.Logger) (*Gate,
 			m.Identity.DID, signer.DID())
 	}
 
+	// Fail closed at construction: a gate that cannot persist accepted
+	// msg_ids cannot keep its replay guarantee, so it must not start.
+	store, err := openReplayStore(signer.DID())
+	if err != nil {
+		return nil, fmt.Errorf("a2a gate cannot open its replay store: %w", err)
+	}
+
 	g := &Gate{
 		signer:     signer,
 		peers:      map[string]manifest.A2APeer{},
 		peersByDID: map[string]manifest.A2APeer{},
 		logger:     logger,
 		client:     &http.Client{Timeout: callTimeout},
-		replay:     newReplayGuard(),
+		replay:     newReplayGuard(store),
 		inbox:      make(chan *inboundCall, perPeerInboxCapacity*max(len(m.A2A.Peers), 1)),
 		inboxUsed:  map[string]int{},
 		pending:    map[string]*inboundCall{},

@@ -16,8 +16,8 @@ import (
 // DailyStore is the durable per-DID spending ledger: one append-only JSONL
 // file per UTC day under ~/.constle/spending/<did>/. Durability across
 // independent `constle run` processes is the whole point — an in-memory
-// daily total (like the deliberately per-run A2A replay guard) would reset
-// on every exit and enforce nothing.
+// daily total would reset on every exit and enforce nothing. (The a2a
+// replay store follows this file's model for the same reason.)
 //
 // Concurrency: every read and append holds an advisory lock on the day file,
 // and Append recomputes the day total from the file while still holding the

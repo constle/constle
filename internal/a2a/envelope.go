@@ -50,7 +50,7 @@ type Envelope struct {
 	To   string `json:"to"`
 
 	// MsgID is a random per-message id. Receivers reject an id they have
-	// already seen — see replayGuard for the (per-run) scope of that check.
+	// already seen — see replayGuard for the scope of that check.
 	MsgID string `json:"msg_id"`
 
 	// InReplyTo binds a response to the MsgID of the request it answers; the
@@ -128,6 +128,12 @@ const (
 	ReasonStaleTimestamp RejectReason = "stale_timestamp"
 	ReasonReplay         RejectReason = "replay"
 	ReasonInboxFull      RejectReason = "inbox_full"
+
+	// ReasonGuardUnavailable fails closed when the durable replay store
+	// cannot be read or written: with no way to tell a fresh envelope from
+	// a replayed one, nothing is admitted. Reported to the peer as 503 —
+	// retryable, like inbox_full — never as a verdict on the envelope.
+	ReasonGuardUnavailable RejectReason = "replay_guard_unavailable"
 
 	// Transport-failure reasons. a2a_call_rejected means "this round trip
 	// did not complete, for reason X" on whichever log records it; a
@@ -208,25 +214,27 @@ const replayWindow = 5 * time.Minute
 
 // replayGuard rejects duplicate and stale envelopes.
 //
-// LIMITATION (by design, stated rather than implied): this protection is
-// in-memory and per-run only. The seen set does not survive a constle
-// process restart and is not shared across runs — a validly signed envelope
-// captured in one run can be replayed against a LATER run while still
-// inside the timestamp window. Durable, cross-run replay state is out of
-// scope for this version; operators who need it must rotate identities or
-// keep runs apart by more than replayWindow.
+// Two layers share the work: an in-memory seen set answers same-run
+// duplicates without touching disk, and the durable replayStore (see
+// replay_store.go) extends the guarantee across process restarts and
+// concurrent runs of the same identity — closing what used to be a named
+// limitation, where an envelope captured in one run could be replayed
+// against a later run inside the timestamp window. A nil store (unit tests
+// exercising only the window and dedup logic) keeps the guard per-run.
 type replayGuard struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
+	mu    sync.Mutex
+	seen  map[string]time.Time
+	store *replayStore
 }
 
-func newReplayGuard() *replayGuard {
-	return &replayGuard{seen: map[string]time.Time{}}
+func newReplayGuard(store *replayStore) *replayGuard {
+	return &replayGuard{seen: map[string]time.Time{}, store: store}
 }
 
-// check admits an envelope at most once per run and only within
-// replayWindow of the local clock. Expired ids are pruned on the way, so
-// the set stays bounded by the traffic of one window.
+// check admits an envelope at most once — across every run of this
+// identity — and only within replayWindow of the local clock. Expired
+// in-memory ids are pruned on the way, so the set stays bounded by the
+// traffic of one window; the durable store prunes its own files.
 func (g *replayGuard) check(env *Envelope) error {
 	now := time.Now().UTC()
 
@@ -252,6 +260,20 @@ func (g *replayGuard) check(env *Envelope) error {
 		return &RejectError{ReasonReplay,
 			fmt.Sprintf("msg_id %s was already accepted in this run", env.MsgID)}
 	}
+
+	// The durable check runs under g.mu too: the store's file lock already
+	// serializes processes, this serializes goroutines sharing one guard.
+	if g.store != nil {
+		dup, err := g.store.checkAndRecord(env.MsgID, now)
+		if err != nil {
+			return &RejectError{ReasonGuardUnavailable, err.Error()}
+		}
+		if dup {
+			return &RejectError{ReasonReplay,
+				fmt.Sprintf("msg_id %s was already accepted within the replay window", env.MsgID)}
+		}
+	}
+
 	g.seen[env.MsgID] = now
 	return nil
 }
