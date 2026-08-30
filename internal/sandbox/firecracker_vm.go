@@ -40,11 +40,43 @@ func fcConsoleLogPath(runDir string) string {
 	return filepath.Join(runDir, "console.log")
 }
 
+// fcLookPath and fcFallbackBinary are package variables so tests can steer
+// binary resolution without a firecracker install on the host — the same
+// stub pattern as dockerAvailable and detectOut.
+var (
+	fcLookPath       = exec.LookPath
+	fcFallbackBinary = "/usr/local/bin/firecracker"
+)
+
+// resolveFirecrackerBinary locates the firecracker binary for jailer's
+// --exec-file. PATH decides first — packaged installs land wherever the
+// distro puts them (/usr/bin on Arch, /usr/local/bin from our setup script)
+// — with the setup script's install path as the fallback for root shells
+// whose PATH omits it. jailer requires an absolute path, so a PATH hit is
+// made absolute before use.
+func resolveFirecrackerBinary() (string, error) {
+	if p, err := fcLookPath("firecracker"); err == nil {
+		if abs, absErr := filepath.Abs(p); absErr == nil {
+			return abs, nil
+		}
+		return p, nil
+	}
+	if _, err := os.Stat(fcFallbackBinary); err == nil {
+		return fcFallbackBinary, nil
+	}
+	return "", fmt.Errorf("firecracker binary not found in PATH or at %s — run scripts/setup-firecracker", fcFallbackBinary)
+}
+
 // launchVM starts jailer (which execs into firecracker — the returned
 // command's PID is the VMM PID) and waits for the API socket to appear.
 // The serial console and VMM log stream into <runDir>/console.log.
 func launchVM(runID, runDir string) (*exec.Cmd, error) {
 	uid, gid, err := lookupFCUser()
+	if err != nil {
+		return nil, err
+	}
+
+	fcBinary, err := resolveFirecrackerBinary()
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +89,7 @@ func launchVM(runID, runDir string) (*exec.Cmd, error) {
 
 	cmd := exec.Command("jailer",
 		"--id", runID,
-		"--exec-file", "/usr/local/bin/firecracker",
+		"--exec-file", fcBinary,
 		"--uid", fmt.Sprint(uid),
 		"--gid", fmt.Sprint(gid),
 		"--chroot-base-dir", fcJailDir,

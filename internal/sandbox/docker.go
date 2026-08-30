@@ -571,7 +571,7 @@ func startAgentContainer(name, intNet, image string, memoryMB int, command []str
 
 func dockerRun(args ...string) error {
 	if out, err := exec.Command("docker", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("docker %s: %s", strings.Join(args, " "), strings.TrimSpace(string(out)))
+		return cmdError("docker "+strings.Join(args, " "), err, out)
 	}
 	return nil
 }
