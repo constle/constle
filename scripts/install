@@ -2,15 +2,25 @@
 # install.sh — one-line installer for constle (Linux & macOS)
 #
 # Usage (what users run):
-#   curl -fsSL https://constle.dev/install | sh
+#   curl -fsSL https://constle.dev/install | sh                     # latest release
+#   curl -fsSL https://constle.dev/install | sh -s -- v0.5.0        # pinned release
+#   curl -fsSL https://constle.dev/install | sh -s -- <commit-sha>  # pinned commit
+#
+# The ref can also be given as an environment variable (equivalent forms):
+#   CONSTLE_VERSION=v0.5.0 sh install
 #
 # What this script does, step by step:
 #   1. Detect the OS (Linux or macOS)
 #   2. Detect the CPU architecture (amd64 or arm64)
-#   3. Ask the GitHub API for the latest release tag
-#   4. Construct the download URL for the right archive
-#   5. Download and extract the binary
-#   6. Install it to /usr/local/bin/constle (using sudo if needed)
+#   3. Resolve what to install: the requested ref, or the latest release tag
+#      from the GitHub API
+#   4. Get the binary:
+#        release tag  → download the prebuilt archive for this OS/arch
+#        commit sha   → build from source with `go install` (prebuilt
+#                       archives only exist for tagged releases, so a pinned
+#                       commit needs a Go toolchain on this machine)
+#   5. Install it to /usr/local/bin/constle (using sudo if needed);
+#      CONSTLE_INSTALL_DIR overrides the destination.
 
 set -e  # Exit immediately if any command returns a non-zero exit code.
         # Without this, a failed curl would let the script continue with
@@ -21,14 +31,20 @@ set -e  # Exit immediately if any command returns a non-zero exit code.
 # ---------------------------------------------------------------------------
 REPO="constle/constle"
 BINARY="constle"
-INSTALL_DIR="/usr/local/bin"
+INSTALL_DIR="${CONSTLE_INSTALL_DIR:-/usr/local/bin}"
+
+# The ref to install: first positional argument wins, then $CONSTLE_VERSION,
+# and with neither the latest release is used. A ref starting with "v" and a
+# digit is treated as a release tag; anything else as a git commit.
+REF="${1:-${CONSTLE_VERSION:-}}"
 
 # ---------------------------------------------------------------------------
 # Pretty output helpers
 # ---------------------------------------------------------------------------
 info()  { printf "  \033[34m→\033[0m %s\n" "$*"; }  # blue arrow
 ok()    { printf "  \033[32m✓\033[0m %s\n" "$*"; }  # green check
-error() { printf "\n\033[31merror:\033[0m %s\n\n" "$*" >&2; exit 1; }
+# %b (not %s) so multi-line guidance written with \n actually renders.
+error() { printf "\n\033[31merror:\033[0m %b\n\n" "$*" >&2; exit 1; }
 
 printf "\n\033[1mconstle installer\033[0m\n\n"
 
@@ -69,7 +85,14 @@ if ! command -v curl > /dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4: Fetch latest release version from the GitHub API
+# Step 4: Resolve what to install
+#
+# Three cases:
+#   no ref       → ask the GitHub API for the latest release tag
+#   release tag  → use it as given (the download failing cleanly is the
+#                  existence check — one fewer API round-trip)
+#   commit sha   → handled separately below: releases only exist for tags,
+#                  so a pinned commit is built from source
 #
 # The GitHub releases API endpoint returns JSON like:
 #   { "tag_name": "v0.5.0", "name": "Release v0.5.0", ... }
@@ -83,37 +106,33 @@ fi
 #   -S  still show error messages even with -s
 #   -L  follow redirects
 # ---------------------------------------------------------------------------
-info "fetching latest release from GitHub..."
+FROM_SOURCE=0
+case "$REF" in
+  "")
+    info "fetching latest release from GitHub..."
+    API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+    VERSION="$(curl -fsSL "$API_URL" \
+      | grep '"tag_name"' \
+      | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
 
-API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-VERSION="$(curl -fsSL "$API_URL" \
-  | grep '"tag_name"' \
-  | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
-
-if [ -z "$VERSION" ]; then
-  error "could not determine latest release version.\nCheck your internet connection or visit: https://github.com/${REPO}/releases"
-fi
-
-ok "latest version: $VERSION"
-
-# ---------------------------------------------------------------------------
-# Step 5: Construct the download URL
-#
-# GoReleaser names archives using the template in .goreleaser.yaml:
-#   constle_{{ .Version }}_{{ .Os }}_{{ .Arch }}.tar.gz
-#
-# {{.Version}} is the tag WITHOUT the leading "v".  So tag "v0.5.0" →
-# archive "constle_0.5.0_linux_amd64.tar.gz", but the GitHub release URL
-# path still uses the full tag: /releases/download/v0.5.0/constle_0.5.0_...
-# ---------------------------------------------------------------------------
-VERSION_NO_V="${VERSION#v}"   # strip the leading "v": "v0.5.0" → "0.5.0"
-ARCHIVE="constle_${VERSION_NO_V}_${OS}_${ARCH}.tar.gz"
-URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
-
-info "downloading $ARCHIVE..."
+    if [ -z "$VERSION" ]; then
+      error "could not determine latest release version.\nCheck your internet connection or visit: https://github.com/${REPO}/releases"
+    fi
+    ok "latest version: $VERSION"
+    ;;
+  v[0-9]*)
+    VERSION="$REF"
+    ok "requested release: $VERSION"
+    ;;
+  *)
+    FROM_SOURCE=1
+    VERSION="$REF"
+    ok "requested commit: $REF (will build from source)"
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
-# Step 6: Download to a temporary directory
+# Step 5: Get the binary into a temporary directory
 #
 # mktemp -d creates a new temporary directory with a random name, e.g.
 # /tmp/tmp.a3Bx9q.  The `trap` ensures we delete it on exit — whether the
@@ -122,30 +141,72 @@ info "downloading $ARCHIVE..."
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT   # cleanup on any exit
 
-curl -fsSL "$URL" -o "$TMP_DIR/$ARCHIVE"
+if [ "$FROM_SOURCE" = 1 ]; then
+  # -------------------------------------------------------------------------
+  # Pinned commit: build from source.
+  #
+  # `go install module/cmd/constle@<sha>` fetches exactly that commit through
+  # the Go module system and builds it locally — the standard Go answer to
+  # "give me the binary at this commit". GOBIN redirects the result into our
+  # temp dir so the install step below stays identical for both paths.
+  #
+  # The version stamp mirrors what GoReleaser embeds for releases
+  # (-X main.constleVersion=...), so `constle version` names the commit
+  # instead of claiming a stale default. The CLI prints it as
+  # "constle v<stamp>", so the stamp follows Go's pseudo-version shape:
+  # 0.0.0-<ref> reads as "no release, exactly this commit".
+  # -------------------------------------------------------------------------
+  if ! command -v go > /dev/null 2>&1; then
+    error "installing a specific commit builds from source, which needs Go.\nInstall Go (https://go.dev/dl) or pick a tagged release instead:\n  curl -fsSL https://constle.dev/install | sh -s -- v0.5.0"
+  fi
 
-# ---------------------------------------------------------------------------
-# Step 7: Extract the binary
-#
-# tar flags:
-#   -x  extract
-#   -z  decompress with gzip (.tar.gz)
-#   -f  read from this file
-#   -C  change to this directory before extracting
-#
-# After extraction, find the binary anywhere in the temp dir (handles the
-# case where GoReleaser wraps files in a subdirectory).
-# ---------------------------------------------------------------------------
-info "extracting..."
-tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
+  info "building github.com/${REPO}@${REF} from source (go install)..."
+  if ! GOBIN="$TMP_DIR" GOFLAGS= go install \
+      -ldflags "-X main.constleVersion=0.0.0-${REF}" \
+      "github.com/${REPO}/cmd/${BINARY}@${REF}"; then
+    error "go install failed for commit ${REF}.\nCheck that the commit exists on https://github.com/${REPO} and is spelled fully enough to be unambiguous."
+  fi
+  BINARY_PATH="$TMP_DIR/$BINARY"
+  [ -f "$BINARY_PATH" ] || error "go install reported success but produced no binary — please report this at https://github.com/${REPO}/issues"
+else
+  # -------------------------------------------------------------------------
+  # Release tag: download the prebuilt archive.
+  #
+  # GoReleaser names archives using the template in .goreleaser.yaml:
+  #   constle_{{ .Version }}_{{ .Os }}_{{ .Arch }}.tar.gz
+  #
+  # {{.Version}} is the tag WITHOUT the leading "v".  So tag "v0.5.0" →
+  # archive "constle_0.5.0_linux_amd64.tar.gz", but the GitHub release URL
+  # path still uses the full tag: /releases/download/v0.5.0/constle_0.5.0_...
+  # -------------------------------------------------------------------------
+  VERSION_NO_V="${VERSION#v}"   # strip the leading "v": "v0.5.0" → "0.5.0"
+  ARCHIVE="constle_${VERSION_NO_V}_${OS}_${ARCH}.tar.gz"
+  URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
 
-BINARY_PATH="$(find "$TMP_DIR" -name "$BINARY" -type f | head -1)"
-if [ -z "$BINARY_PATH" ]; then
-  error "binary '$BINARY' not found in archive — please report this at https://github.com/${REPO}/issues"
+  info "downloading $ARCHIVE..."
+  if ! curl -fsSL "$URL" -o "$TMP_DIR/$ARCHIVE"; then
+    error "cannot download ${ARCHIVE}.\nDoes release ${VERSION} exist? See: https://github.com/${REPO}/releases"
+  fi
+
+  # tar flags:
+  #   -x  extract
+  #   -z  decompress with gzip (.tar.gz)
+  #   -f  read from this file
+  #   -C  change to this directory before extracting
+  #
+  # After extraction, find the binary anywhere in the temp dir (handles the
+  # case where GoReleaser wraps files in a subdirectory).
+  info "extracting..."
+  tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
+
+  BINARY_PATH="$(find "$TMP_DIR" -name "$BINARY" -type f | head -1)"
+  if [ -z "$BINARY_PATH" ]; then
+    error "binary '$BINARY' not found in archive — please report this at https://github.com/${REPO}/issues"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
-# Step 8: Install
+# Step 6: Install
 #
 # Try writing to INSTALL_DIR directly.  If that fails (permission denied),
 # retry with sudo.  This way users who run as root or have write access don't

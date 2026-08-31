@@ -458,6 +458,13 @@ proxy runs on the host, with nftables restricting the guest to it. Enforcement
 is at the OS network layer: the agent cannot bypass it by unsetting proxy
 environment variables or dialling an IP directly, because there is no route.
 
+On the Firecracker backend the proxy is the host's own Squid package, and
+packaging details differ between distro families (for example, the user Squid
+drops privileges to). Constle resolves such details from the host at runtime
+rather than assuming any one distribution; `scripts/setup-firecracker` checks
+for the required host tools up front. The Docker backend is unaffected — its
+proxy runs inside a pinned container image.
+
 Blocked attempts are recorded as `network_blocked` audit events; permitted ones
 as `network_allowed`.
 
@@ -697,8 +704,15 @@ this agent's identity, so `identity.did` is required. The sandbox never signs,
 never verifies, and never learns a peer's real endpoint: it talks only to the
 per-run gate at `CONSTLE_A2A_URL`.
 
-Full design, including the inbound listener hardening, envelope format, and the
-named replay-protection limitation: [`spec/a2a.md`](https://github.com/constle/constle/blob/main/spec/a2a.md).
+Inbound calls carry replay protection: duplicate `msg_id`s are rejected
+against a durable per-identity store, so the guarantee spans process restarts
+and concurrent runs on the same machine — not only the run that first saw the
+message. The remaining, documented limitation is that this state is
+per-machine: the same identity listening on several machines does not share a
+seen set.
+
+Full design, including the inbound listener hardening, envelope format, and
+the replay-guard store: [`spec/a2a.md`](https://github.com/constle/constle/blob/main/spec/a2a.md).
 
 ### 10.1 `a2a.listen`
 
@@ -953,7 +967,11 @@ syntax.
 
 When a gated call arrives, the gate pauses it, emits a `gate_triggered` audit
 event, notifies any configured webhook, and waits for a decision — recorded as
-`gate_approved`, `gate_denied`, or `gate_timeout`.
+`gate_approved`, `gate_denied`, or `gate_timeout`. An approved call is then
+forwarded like any other, bracketed by `tool_call_start` / `tool_call_end`
+audit events — the same events every forwarded MCP tool call emits, gated or
+not, so the log leading up to a gate prompt shows what the agent was doing
+before it asked.
 
 **Entries that cannot match are reported, not silently ignored.** An entry that
 provably matches no tool on any declared server is surfaced as a warning at

@@ -189,7 +189,17 @@ chmod 0755 "$CONSTLE_DIR" "$CONSTLE_DIR/runs"
 chmod 0700 "$CONSTLE_DIR/jail"
 
 if ! id "$FC_USER" > /dev/null 2>&1; then
-  useradd --system --no-create-home --shell /usr/sbin/nologin "$FC_USER"
+  # nologin lives at /usr/sbin/nologin on Debian-family, /sbin/nologin on
+  # others — ask the host instead of assuming either.
+  NOLOGIN_SHELL="$(command -v nologin 2>/dev/null || echo /usr/sbin/nologin)"
+  if command -v useradd > /dev/null 2>&1; then
+    useradd --system --no-create-home --shell "$NOLOGIN_SHELL" "$FC_USER"
+  elif command -v adduser > /dev/null 2>&1; then
+    # busybox adduser (Alpine): -S system, -H no home, -s shell.
+    adduser -S -H -s "$NOLOGIN_SHELL" "$FC_USER"
+  else
+    error "cannot create user $FC_USER: neither useradd nor adduser found on this host"
+  fi
   ok "created system user $FC_USER (jailer drops privileges to it)"
 else
   ok "system user $FC_USER already exists"

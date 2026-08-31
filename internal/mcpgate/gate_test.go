@@ -3,6 +3,7 @@ package mcpgate
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/pkg/did"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -484,6 +486,226 @@ func TestGateKilledMidFlightFailsClosed(t *testing.T) {
 	// And with the gate gone, the agent cannot reconnect at all.
 	if _, err := http.Post(h.baseURL, "application/json", strings.NewReader(toolCallBody("list_inbox"))); err == nil {
 		t.Fatal("connection to a closed gate succeeded — expected connection refused")
+	}
+}
+
+// testSigner is an in-memory audit.Signer backed by a throwaway Ed25519 key.
+type testSigner struct {
+	did  string
+	priv ed25519.PrivateKey
+}
+
+func newTestSigner(t *testing.T) *testSigner {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	d, err := did.FromPublicKey(pub)
+	if err != nil {
+		t.Fatalf("did from key: %v", err)
+	}
+	return &testSigner{did: d, priv: priv}
+}
+
+func (s *testSigner) DID() string            { return s.did }
+func (s *testSigner) Sign(msg []byte) []byte { return ed25519.Sign(s.priv, msg) }
+
+// TestToolCallEventsPreserveSignedChain: a signed log interleaving the new
+// tool_call_start/end events with gate events must still verify end to end —
+// the chain and signatures are agnostic to event types, and this pins that.
+func TestToolCallEventsPreserveSignedChain(t *testing.T) {
+	signer := newTestSigner(t)
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"sent"}]}}`)
+	}))
+	t.Cleanup(up.Close)
+
+	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := audit.NewSigned(logPath, signer)
+	if err != nil {
+		t.Fatalf("audit.NewSigned: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "test-agent"},
+		MCP: manifest.MCP{Servers: []manifest.MCPServer{
+			{ID: "email", URL: up.URL, Tools: []string{"send_email", "list_inbox"}},
+		}},
+		HumanGates: manifest.HumanGates{
+			Enabled:                true,
+			RequireApprovalFor:     []string{"send_email"},
+			ApprovalTimeoutSeconds: 300,
+			OnTimeout:              "abort",
+		},
+	}
+	g, err := New(m, &fixedApprover{decision: DecisionApproved}, nil, logger, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	port, token, err := g.Bind("signedrun01", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d/%s/servers/email", port, token)
+
+	postJSON(t, baseURL, toolCallBody("list_inbox"))        // start + end
+	postJSON(t, baseURL, toolCallBody("send_email"))        // gate + start + end
+	postJSON(t, baseURL, toolCallBody("delete_everything")) // blocked
+
+	if err := logger.Err(); err != nil {
+		t.Fatalf("audit writes failed: %v", err)
+	}
+	// 2 + (2 gate + 2 tool_call) + 1 blocked = 7 entries, all chained. The
+	// last write can land moments after the final response is read.
+	waitFor(t, func() bool {
+		data, err := os.ReadFile(logPath)
+		return err == nil && len(strings.Split(strings.TrimSpace(string(data)), "\n")) == 7
+	})
+	report, err := audit.VerifyFile(logPath, signer.did)
+	if err != nil {
+		t.Fatalf("signed log with tool_call events failed verification: %v", err)
+	}
+	if report.Entries != 7 {
+		t.Errorf("verified entries = %d, want 7", report.Entries)
+	}
+}
+
+// waitFor polls cond until it holds or the deadline passes. The audit write
+// for tool_call_end lands moments after the proxied response reaches the
+// client — the handler goroutine is still finishing — so tests that assert on
+// it must wait for the log, not assume the response implies the write.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !cond() {
+		t.Fatal("condition not reached within deadline")
+	}
+}
+
+// eventIndex returns the position of the first entry of the given type, or -1.
+func eventIndex(entries []audit.Entry, et audit.EventType) int {
+	for i, e := range entries {
+		if e.Event == et {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestForwardedToolCallEmitsStartAndEnd: an ungated tools/call that reaches
+// the upstream must bracket itself with tool_call_start / tool_call_end,
+// carrying the identifiers needed to read the log mid-run.
+func TestForwardedToolCallEmitsStartAndEnd(t *testing.T) {
+	h := newHarness(t, &fixedApprover{decision: DecisionDenied}, "abort")
+
+	if status, body := postJSON(t, h.baseURL, toolCallBody("list_inbox")); status != 200 || !strings.Contains(body, "sent") {
+		t.Fatalf("ungated call: status=%d body=%s", status, body)
+	}
+
+	waitFor(t, func() bool {
+		return len(eventsOfType(auditEvents(t, h), audit.EventToolCallEnd)) == 1
+	})
+	entries := auditEvents(t, h)
+	starts := eventsOfType(entries, audit.EventToolCallStart)
+	ends := eventsOfType(entries, audit.EventToolCallEnd)
+	if len(starts) != 1 || len(ends) != 1 {
+		t.Fatalf("want 1 tool_call_start + 1 tool_call_end, got %d + %d", len(starts), len(ends))
+	}
+	if eventIndex(entries, audit.EventToolCallStart) > eventIndex(entries, audit.EventToolCallEnd) {
+		t.Error("tool_call_start must precede tool_call_end")
+	}
+
+	start := starts[0]
+	if start.RunID != "testrun01" || start.AgentName != "test-agent" {
+		t.Errorf("start attribution: run_id=%q agent=%q", start.RunID, start.AgentName)
+	}
+	if start.Details["server"] != "email" || start.Details["tool"] != "list_inbox" {
+		t.Errorf("start details = %+v", start.Details)
+	}
+	if ab, ok := start.Details["args_bytes"].(float64); !ok || ab <= 0 {
+		t.Errorf("args_bytes = %v, want > 0 (size recorded, content not)", start.Details["args_bytes"])
+	}
+	if _, hasArgs := start.Details["arguments"]; hasArgs {
+		t.Error("tool arguments must not be copied into the audit log")
+	}
+	if start.Details["rpc_id"] != "1" {
+		t.Errorf("rpc_id = %v, want \"1\"", start.Details["rpc_id"])
+	}
+
+	end := ends[0]
+	if end.Details["server"] != "email" || end.Details["tool"] != "list_inbox" || end.Details["rpc_id"] != "1" {
+		t.Errorf("end details = %+v", end.Details)
+	}
+	if st, ok := end.Details["http_status"].(float64); !ok || int(st) != 200 {
+		t.Errorf("http_status = %v, want 200", end.Details["http_status"])
+	}
+	if _, ok := end.Details["duration_ms"].(float64); !ok {
+		t.Errorf("duration_ms missing from end details: %+v", end.Details)
+	}
+}
+
+// TestGatedApprovedToolCallEventOrder: an approved gated call must read as a
+// narrative — gate_triggered, gate_approved, tool_call_start, tool_call_end.
+func TestGatedApprovedToolCallEventOrder(t *testing.T) {
+	h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+	if status, body := postJSON(t, h.baseURL, toolCallBody("send_email")); status != 200 || !strings.Contains(body, "sent") {
+		t.Fatalf("approved call: status=%d body=%s", status, body)
+	}
+
+	waitFor(t, func() bool {
+		return len(eventsOfType(auditEvents(t, h), audit.EventToolCallEnd)) == 1
+	})
+	entries := auditEvents(t, h)
+	order := []audit.EventType{
+		audit.EventGateTriggered,
+		audit.EventGateApproved,
+		audit.EventToolCallStart,
+		audit.EventToolCallEnd,
+	}
+	prev := -1
+	for _, et := range order {
+		i := eventIndex(entries, et)
+		if i < 0 {
+			t.Fatalf("missing %s in %+v", et, entries)
+		}
+		if i < prev {
+			t.Fatalf("%s out of order (index %d after %d) in %+v", et, i, prev, entries)
+		}
+		prev = i
+	}
+}
+
+// TestUnforwardedCallsEmitNoToolCallEvents: a call that never reaches the
+// upstream — undeclared tool, gate denied, or a non-tools/call method — must
+// not claim it did.
+func TestUnforwardedCallsEmitNoToolCallEvents(t *testing.T) {
+	h := newHarness(t, &fixedApprover{decision: DecisionDenied}, "abort")
+
+	postJSON(t, h.baseURL, toolCallBody("delete_everything")) // undeclared → blocked
+	postJSON(t, h.baseURL, toolCallBody("send_email"))        // gated → denied
+	postJSON(t, h.baseURL, `{"jsonrpc":"2.0","id":7,"method":"tools/list"}`)
+
+	entries := auditEvents(t, h)
+	if n := len(eventsOfType(entries, audit.EventToolCallStart)); n != 0 {
+		t.Errorf("got %d tool_call_start events for calls that never reached the upstream", n)
+	}
+	if n := len(eventsOfType(entries, audit.EventToolCallEnd)); n != 0 {
+		t.Errorf("got %d tool_call_end events for calls that never reached the upstream", n)
+	}
+	if h.calls.Load() != 1 { // only tools/list passes through
+		t.Errorf("upstream calls = %d, want 1 (tools/list only)", h.calls.Load())
 	}
 }
 

@@ -63,6 +63,30 @@ jobs:
           }" spec/
 
   # ---------------------------------------------------------------------------
+  # Hygiene: no AI-attribution trailers or unexpected script ranges in the
+  # commits a PR would add. Generic patterns only — maintainer-private
+  # patterns run in the local pre-push hook (see scripts/hygiene-check.sh).
+  # Scoped to the PR range rather than --all deliberately: it gates new
+  # content without re-litigating history on every run.
+  # ---------------------------------------------------------------------------
+  hygiene:
+    name: Hygiene (attribution & identity)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Invoked via `sh`, not ./: the script's exec bit was once lost on a
+      # checkout where git could not see file modes (core.filemode=false),
+      # and this job failed with "Permission denied" (exit 126) instead of
+      # ever running the scan. The bit is now committed too, but the sh
+      # invocation keeps this job immune to that class of regression.
+      - name: Scan PR commits
+        run: sh scripts/hygiene-check.sh --range "origin/${{ github.base_ref }}..HEAD"
+
+  # ---------------------------------------------------------------------------
   # Cross-platform build of the CLI binary.
   # ---------------------------------------------------------------------------
   build:
