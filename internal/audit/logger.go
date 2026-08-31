@@ -19,16 +19,25 @@ import (
 type EventType string
 
 const (
-	EventRunStarted        EventType = "run_started"
-	EventRunFinished       EventType = "run_finished"
-	EventRunFailed         EventType = "run_failed"
-	EventGateTriggered     EventType = "gate_triggered"
-	EventGateApproved      EventType = "gate_approved"
-	EventGateDenied        EventType = "gate_denied"
-	EventGateTimeout       EventType = "gate_timeout"
-	EventNetworkBlocked    EventType = "network_blocked"
-	EventNetworkAllowed    EventType = "network_allowed"
-	EventMCPToolBlocked    EventType = "mcp_tool_blocked"
+	EventRunStarted     EventType = "run_started"
+	EventRunFinished    EventType = "run_finished"
+	EventRunFailed      EventType = "run_failed"
+	EventGateTriggered  EventType = "gate_triggered"
+	EventGateApproved   EventType = "gate_approved"
+	EventGateDenied     EventType = "gate_denied"
+	EventGateTimeout    EventType = "gate_timeout"
+	EventNetworkBlocked EventType = "network_blocked"
+	EventNetworkAllowed EventType = "network_allowed"
+	EventMCPToolBlocked EventType = "mcp_tool_blocked"
+	// EventToolCallStart and EventToolCallEnd bracket every MCP tools/call
+	// the gate actually forwards to an upstream — including a gated call once
+	// it is approved (so for those the order is gate_triggered, gate_approved,
+	// tool_call_start, tool_call_end). Calls that never reach the upstream
+	// (undeclared tool, gate denied, gate timeout under abort) keep their own
+	// terminal event and emit neither of these. This is what makes a run's
+	// activity visible mid-execution, not only its start/finish and violations.
+	EventToolCallStart     EventType = "tool_call_start"
+	EventToolCallEnd       EventType = "tool_call_end"
 	EventA2ACallSent       EventType = "a2a_call_sent"
 	EventA2ACallReceived   EventType = "a2a_call_received"
 	EventA2ACallRejected   EventType = "a2a_call_rejected"

@@ -126,7 +126,7 @@ func installNFTRules(runID, tapName, gatewayIP string, gatePorts []int) error {
 	cmd := exec.Command("nft", "-f", "-")
 	cmd.Stdin = strings.NewReader(script)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("nft -f: %s", strings.TrimSpace(string(out)))
+		return cmdError("nft -f", err, out)
 	}
 	return nil
 }
@@ -136,7 +136,7 @@ func installNFTRules(runID, tapName, gatewayIP string, gatePorts []int) error {
 func deleteNFTRules(runID string) error {
 	out, err := exec.Command("nft", "delete", "table", "inet", nftTableName(runID)).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "No such file or directory") {
-		return fmt.Errorf("nft delete table: %s", strings.TrimSpace(string(out)))
+		return cmdError("nft delete table", err, out)
 	}
 	return nil
 }
@@ -289,7 +289,7 @@ func detectSquidUser() (string, error) {
 // ipRun runs an ip(8) subcommand, returning stderr in the error like dockerRun.
 func ipRun(args ...string) error {
 	if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("ip %s: %s", strings.Join(args, " "), strings.TrimSpace(string(out)))
+		return cmdError("ip "+strings.Join(args, " "), err, out)
 	}
 	return nil
 }

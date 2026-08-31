@@ -99,9 +99,11 @@ as unenforced human-gate warnings). If an Agentfile declares `identity.did`:
 
 When the agent has an identity, every JSONL audit entry — including the
 enforcement events `network_blocked`, `network_allowed`, `gate_triggered`,
-`gate_approved`, `gate_denied`, `gate_timeout`, and `mcp_tool_blocked` —
-carries three extra fields, written by the same single logger that writes
-every other event (one mechanism, not two):
+`gate_approved`, `gate_denied`, `gate_timeout`, and `mcp_tool_blocked`, and
+the activity events `tool_call_start` and `tool_call_end` that bracket every
+MCP tool call actually forwarded to an upstream — carries three extra fields,
+written by the same single logger that writes every other event (one
+mechanism, not two):
 
 | Field | Content |
 |-------|---------|

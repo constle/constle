@@ -455,7 +455,7 @@ func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, gu
 	}
 
 	if out, err := exec.Command("mkfs.ext4", "-q", "-F", "-d", staging, workspacePath).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("mkfs.ext4: %s", strings.TrimSpace(string(out)))
+		return "", cmdError("mkfs.ext4", err, out)
 	}
 	return workspacePath, nil
 }
@@ -479,9 +479,8 @@ func prepareChroot(runID, rootfsPath, workspacePath string) (string, error) {
 
 	// The guest writes to its root filesystem (/tmp, Python runtime files),
 	// so each VM gets a private sparse copy of the shared image.
-	if out, err := exec.Command("cp", "--sparse=always",
-		rootfsPath, filepath.Join(chroot, "rootfs.ext4")).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("cannot copy rootfs: %s", strings.TrimSpace(string(out)))
+	if err := copyImage(rootfsPath, filepath.Join(chroot, "rootfs.ext4")); err != nil {
+		return "", err
 	}
 
 	if err := os.Rename(workspacePath, filepath.Join(chroot, "workspace.ext4")); err != nil {
@@ -498,6 +497,35 @@ func prepareChroot(runID, rootfsPath, workspacePath string) (string, error) {
 		}
 	}
 	return chroot, nil
+}
+
+// copyImage copies a disk image preserving sparseness where the host's cp
+// supports it. --sparse=always is GNU coreutils; a busybox cp (Alpine and
+// friends) rejects the flag, so an unrecognized-option failure retries as a
+// plain copy — costing disk space, never correctness. Any other failure
+// (disk full, permissions) is reported as-is, not retried.
+func copyImage(src, dst string) error {
+	out, err := exec.Command("cp", "--sparse=always", src, dst).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if sparseFlagUnsupported(out) {
+		if out, err := exec.Command("cp", src, dst).CombinedOutput(); err != nil {
+			return cmdError("cannot copy rootfs", err, out)
+		}
+		return nil
+	}
+	return cmdError("cannot copy rootfs", err, out)
+}
+
+// sparseFlagUnsupported reports whether cp's failure output says the
+// --sparse flag itself is the problem (a non-GNU cp), as opposed to the copy
+// failing for a real reason.
+func sparseFlagUnsupported(out []byte) bool {
+	msg := strings.ToLower(string(out))
+	return strings.Contains(msg, "sparse") &&
+		(strings.Contains(msg, "unrecognized") || strings.Contains(msg, "invalid option") ||
+			strings.Contains(msg, "unknown option") || strings.Contains(msg, "illegal option"))
 }
 
 // lookupFCUser resolves the unprivileged VMM user created by setup.

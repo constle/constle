@@ -385,6 +385,46 @@ func (g *Gate) servePOST(w http.ResponseWriter, r *http.Request, up *upstream) {
 		r = r.WithContext(context.WithValue(r.Context(), meterCtxKey{}, job))
 	}
 
+	// From here on, forwarding a tools/call also records it: tool_call_start
+	// when the call is handed to the upstream, tool_call_end when the proxied
+	// response has been fully written back. Bracketing the forward (rather
+	// than the arrival) keeps exactly one meaning — "this call reached the
+	// upstream" — so blocked, denied, and timed-out-under-abort calls, which
+	// have their own terminal events, never emit a start with no upstream
+	// behind it. rpc_id ties the pair together when concurrent calls to the
+	// same tool interleave in the log; argument bytes are counted, not
+	// copied — tool arguments routinely carry secrets and payloads that do
+	// not belong in an audit log.
+	rpcID := compactRPCID(msg.ID)
+	forward = func() {
+		startDetails := map[string]any{
+			"server":     up.id,
+			"tool":       tool,
+			"args_bytes": len(msg.Params.Arguments),
+		}
+		if rpcID != "" {
+			startDetails["rpc_id"] = rpcID
+		}
+		g.log(audit.EventToolCallStart, startDetails)
+
+		rec := &statusRecorder{ResponseWriter: w}
+		began := time.Now()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		up.proxy.ServeHTTP(rec, r)
+
+		endDetails := map[string]any{
+			"server":      up.id,
+			"tool":        tool,
+			"duration_ms": time.Since(began).Milliseconds(),
+			"http_status": rec.status(),
+		}
+		if rpcID != "" {
+			endDetails["rpc_id"] = rpcID
+		}
+		g.log(audit.EventToolCallEnd, endDetails)
+	}
+
 	// Manifest tool allowlist: undeclared tools are rejected outright, no gate.
 	if len(up.tools) > 0 && !up.tools[tool] {
 		g.log(audit.EventMCPToolBlocked, map[string]any{
@@ -527,6 +567,55 @@ func (g *Gate) log(event audit.EventType, details map[string]any) {
 // whether or not the human ever saw the prompt.
 func outf(w io.Writer, format string, args ...any) {
 	_, _ = fmt.Fprintf(w, format, args...)
+}
+
+// statusRecorder captures the HTTP status a proxied response was sent with,
+// for the tool_call_end audit event. It must stay transparent to streaming:
+// Flush passes through (SSE responses are proxied with FlushInterval -1) and
+// Unwrap lets http.ResponseController reach every other optional interface of
+// the underlying writer.
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.code == 0 {
+		s.code = code
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.code == 0 {
+		s.code = http.StatusOK // implicit 200 on first Write
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+// status returns the recorded status, or 0 when nothing was ever written —
+// which for a proxied call means the upstream connection failed before any
+// response reached the agent.
+func (s *statusRecorder) status() int { return s.code }
+
+// compactRPCID renders a JSON-RPC id for audit details: the raw JSON token
+// (`1`, `"abc"`), capped so a hostile id cannot bloat the log, and empty for
+// notifications, which have no id.
+func compactRPCID(id json.RawMessage) string {
+	const maxIDLen = 64
+	s := string(id)
+	if len(s) > maxIDLen {
+		s = s[:maxIDLen]
+	}
+	return s
 }
 
 // jsonRPCMessage is the subset of a JSON-RPC request the gate inspects.
