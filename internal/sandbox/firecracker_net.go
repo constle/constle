@@ -1,12 +1,14 @@
 package sandbox
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -148,11 +150,19 @@ func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, gate
 	accessLogPath = filepath.Join(runDir, "access.log")
 	configPath := filepath.Join(runDir, "squid.conf")
 
+	// Resolve the user before anything is written: with a wrong user Squid
+	// exits during startup and the failure would surface only as an opaque
+	// readiness timeout.
+	squidUser, err := detectSquidUser()
+	if err != nil {
+		return 0, "", err
+	}
+
 	extra := strings.Join([]string{
 		"pid_filename none",
 		"visible_hostname constle-" + runID,
 		// Squid drops from root to this user; it must be able to write the log.
-		"cache_effective_user proxy",
+		"cache_effective_user " + squidUser,
 		// Exit immediately on SIGTERM — the default waits 30s for clients,
 		// which would leave the per-run Squid lingering after Stop.
 		"shutdown_lifetime 0 seconds",
@@ -178,33 +188,52 @@ func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, gate
 	// error handling and the run continues without an access log rather
 	// than not at all. A missing log is already visible downstream, where
 	// the flush reports that network events were not fully recorded.
-	if uid, gid, err := lookupSquidUser(); err == nil {
+	if uid, gid, err := lookupUserIDs(squidUser); err == nil {
 		_ = os.Chown(accessLogPath, uid, gid)
 	}
 
+	// Startup failures (a bad directive, a port clash) are fatal before the
+	// port opens and land on stderr under -N — keep them for the readiness
+	// error instead of timing out with no indication why.
+	var stderr bytes.Buffer
 	cmd := exec.Command("squid", "-N", "-f", configPath)
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return 0, "", fmt.Errorf("squid start: %w", err)
 	}
 	// Reap in the background so no zombie remains when Stop kills it. The
 	// exit status is meaningless here: the expected end for this process is
 	// the SIGKILL that Stop sends it.
-	go func() { _ = cmd.Wait() }()
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
 
-	if err := waitForHostSquid(gatewayIP); err != nil {
+	if err := waitForHostSquid(gatewayIP, exited); err != nil {
 		// Rollback: the readiness error below is what the caller needs, and
 		// a Squid that survives this kill is reported by Stop's own
 		// "still running after SIGKILL" check.
 		_ = killPID(cmd.Process.Pid)
+		// Wait for the reaper before touching the buffer: cmd.Wait is what
+		// guarantees the stderr copy is complete.
+		<-exited
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			err = fmt.Errorf("%w\nsquid stderr:\n%s", err, msg)
+		}
 		return 0, "", err
 	}
 	return cmd.Process.Pid, accessLogPath, nil
 }
 
-// waitForHostSquid polls the proxy port until Squid accepts connections.
-func waitForHostSquid(gatewayIP string) error {
+// waitForHostSquid polls the proxy port until Squid accepts connections, or
+// fails immediately when the process exits first — waiting out the full
+// timeout on a Squid that already died would only obscure the real error.
+func waitForHostSquid(gatewayIP string, exited <-chan struct{}) error {
 	addr := net.JoinHostPort(gatewayIP, fmt.Sprint(fcSquidPort))
 	for i := 0; i < 30; i++ {
+		select {
+		case <-exited:
+			return fmt.Errorf("squid exited before becoming ready on %s", addr)
+		default:
+		}
 		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
@@ -215,10 +244,46 @@ func waitForHostSquid(gatewayIP string) error {
 	return fmt.Errorf("squid did not become ready on %s after 15s", addr)
 }
 
-// lookupSquidUser resolves the user Squid drops privileges to (Debian/Ubuntu
-// call it "proxy").
-func lookupSquidUser() (uid, gid int, err error) {
-	return lookupUserIDs("proxy")
+// squidDefaultUserRE extracts the --with-default-user configure option that
+// distro packages record in `squid -v` (the value may be shell-quoted).
+var squidDefaultUserRE = regexp.MustCompile(`--with-default-user=['"]?([^'"\s]+)`)
+
+// squidVersionOutput returns the output of `squid -v`. Package variable so
+// tests can exercise user detection without a squid install.
+var squidVersionOutput = func() string {
+	// The exit status does not matter — any configure options the binary
+	// prints before failing are still usable.
+	out, _ := exec.Command("squid", "-v").CombinedOutput()
+	return string(out)
+}
+
+// squidUserExists reports whether the named local user exists. Package
+// variable so tests can pin the host's user database.
+var squidUserExists = func(name string) bool {
+	_, _, err := lookupUserIDs(name)
+	return err == nil
+}
+
+// detectSquidUser resolves the unprivileged user the installed Squid drops
+// privileges to. The name is distro-dependent — Debian/Ubuntu package Squid
+// with "proxy", the RHEL/Fedora family (and Alpine, SUSE) with "squid" — so
+// assuming either breaks the other family. The installed binary itself is
+// the authority: distro builds bake the account in via --with-default-user,
+// which `squid -v` reports. When that is absent (a custom build) or names a
+// user this host does not have, fall back to probing the known package
+// accounts, ending with "nobody" — upstream's compiled-in default.
+func detectSquidUser() (string, error) {
+	if m := squidDefaultUserRE.FindStringSubmatch(squidVersionOutput()); m != nil && squidUserExists(m[1]) {
+		return m[1], nil
+	}
+	for _, name := range []string{"proxy", "squid", "nobody"} {
+		if squidUserExists(name) {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf(`cannot determine the user squid drops privileges to: ` +
+		`no --with-default-user in "squid -v" output, and none of "proxy", "squid", "nobody" exist — ` +
+		`install squid from your distro's package repository`)
 }
 
 // ipRun runs an ip(8) subcommand, returning stderr in the error like dockerRun.

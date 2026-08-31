@@ -140,7 +140,7 @@ func TestOpenRejectsMalformed(t *testing.T) {
 func TestReplayGuard(t *testing.T) {
 	alice := newTestSigner(t, 1)
 	bobDID := newTestSigner(t, 2).DID()
-	guard := newReplayGuard()
+	guard := newReplayGuard(nil)
 
 	wire, _, err := Seal(alice, bobDID, "", []byte(`{"n":1}`))
 	if err != nil {
@@ -174,7 +174,7 @@ func TestReplayGuard(t *testing.T) {
 }
 
 func TestReplayGuardRejectsStaleTimestamp(t *testing.T) {
-	guard := newReplayGuard()
+	guard := newReplayGuard(nil)
 	env := &Envelope{MsgID: "stale", Timestamp: time.Now().UTC().Add(-replayWindow - time.Minute)}
 	assertReject(t, guard.check(env), ReasonStaleTimestamp)
 

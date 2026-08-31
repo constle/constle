@@ -60,7 +60,7 @@ printf "\n\033[1mconstle firecracker setup\033[0m\n\n"
 
 for tool in curl docker nft squid mkfs.ext4 debugfs tar ip; do
   command -v "$tool" > /dev/null 2>&1 \
-    || error "required tool '$tool' not found — on Ubuntu/Debian: sudo apt install nftables squid e2fsprogs iproute2 (squid is spawned per run by constle; disable the system service: sudo systemctl disable --now squid)"
+    || error "required tool '$tool' not found — Ubuntu/Debian: sudo apt install nftables squid e2fsprogs iproute2; RHEL/Fedora: sudo dnf install nftables squid e2fsprogs iproute (squid is spawned per run by constle; disable the system service: sudo systemctl disable --now squid)"
 done
 docker info > /dev/null 2>&1 || error "docker daemon is not reachable (needed to build the reference rootfs)"
 ok "host preconditions satisfied"

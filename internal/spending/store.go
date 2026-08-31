@@ -9,22 +9,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/constle/constle/internal/filelock"
 	"github.com/constle/constle/internal/homedir"
 )
 
 // DailyStore is the durable per-DID spending ledger: one append-only JSONL
 // file per UTC day under ~/.constle/spending/<did>/. Durability across
 // independent `constle run` processes is the whole point — an in-memory
-// daily total (like the deliberately per-run A2A replay guard) would reset
-// on every exit and enforce nothing.
+// daily total would reset on every exit and enforce nothing. (The a2a
+// replay store follows this file's model for the same reason.)
 //
 // Concurrency: every read and append holds an advisory lock on the day file,
 // and Append recomputes the day total from the file while still holding the
 // lock — so two runs of the same DID charging at the same moment serialize,
 // and both observe a total that includes the other's charges. The lock
 // primitive is OS-specific (flock(2) on unix, LockFileEx on Windows) and lives
-// behind build-tagged files store_unix.go / store_windows.go — never call a
-// platform syscall directly here.
+// behind internal/filelock's build-tagged files — never call a platform
+// syscall directly here.
 type DailyStore struct {
 	dir string
 	did string
@@ -100,12 +101,12 @@ func (s *DailyStore) TodayTotal() (MicroCents, error) {
 	// been reported by sumLedger.
 	defer func() { _ = f.Close() }()
 
-	if err := lockShared(f); err != nil {
+	if err := filelock.Shared(f); err != nil {
 		return 0, fmt.Errorf("cannot lock spending ledger: %w", err)
 	}
 	// Unlocking cannot meaningfully fail here: the deferred Close below runs
 	// straight after and releases the flock regardless.
-	defer func() { _ = unlockFile(f) }()
+	defer func() { _ = filelock.Unlock(f) }()
 
 	return sumLedger(f)
 }
@@ -142,12 +143,12 @@ func (s *DailyStore) Append(runID, serverID string, amount MicroCents) (dayTotal
 		return 0, fmt.Errorf("cannot restore spending ledger ownership: %w", err)
 	}
 
-	if err := lockExclusive(f); err != nil {
+	if err := filelock.Exclusive(f); err != nil {
 		return 0, fmt.Errorf("cannot lock spending ledger: %w", err)
 	}
 	// As in TodayTotal: the Close deferred above runs after this and drops
 	// the flock anyway, so a failed unlock changes nothing.
-	defer func() { _ = unlockFile(f) }()
+	defer func() { _ = filelock.Unlock(f) }()
 
 	line, err := json.Marshal(ledgerRecord{
 		TS:         time.Now().UTC(),

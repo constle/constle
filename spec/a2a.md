@@ -142,18 +142,29 @@ with `sig` absent, and a verifier recovers those exact bytes by trimming the
 - `body` must be valid JSON (enforced at the gate) so the envelope
   serializes deterministically.
 
-## Replay protection — named limitation
+## Replay protection
 
 Receivers reject envelopes whose timestamp is outside a ±5 minute window,
 and reject a `msg_id` they have already accepted.
 
-**LIMITATION (by design, stated rather than implied):** the seen-`msg_id`
-set is **in-memory and per-run only**. It does not survive a constle process
-restart and is not shared across runs. A validly signed envelope captured in
-one run can be replayed against a *later* run while still inside the
-timestamp window. Durable cross-run replay state is out of scope for this
-version; operators who need stronger guarantees must rotate identities or
-separate runs by more than the window.
+The seen-`msg_id` set has two layers. An in-memory set answers same-run
+duplicates without touching disk. Under it, a durable store
+(`internal/a2a/replay_store.go`) persists every accepted id under
+`~/.constle/a2a/replay/<did>/` — append-only hourly JSONL buckets,
+serialized by the same advisory-lock discipline as the spending ledger —
+so the guarantee holds across process restarts and across concurrent runs
+of the same identity on one machine. Expired buckets are pruned whole;
+nothing is ever rewritten. A store that cannot be read or written fails
+closed: the envelope is refused as `replay_guard_unavailable` (HTTP 503,
+retryable — a statement about the receiver, not a verdict on the
+envelope).
+
+**LIMITATION (stated rather than implied):** the durable state is
+**per-machine** — it lives in the invoking user's home and is not
+replicated. If the same identity accepts calls on more than one machine, a
+captured envelope can be replayed once per machine within the timestamp
+window. Shared or replicated replay state is out of scope for this
+version.
 
 ## Fail-closed validation
 
@@ -195,7 +206,9 @@ on whichever log records it; `direction` names the failed leg. Reasons:
 
 - verification: `malformed_envelope`, `bad_signature`, `unknown_peer`
   (with the *claimed*, unverified sender DID), `wrong_recipient`,
-  `stale_timestamp`, `replay`, `inbox_full`;
+  `stale_timestamp`, `replay`, `inbox_full`, `replay_guard_unavailable`
+  (the durable replay store could not be read or written — the receiver
+  fails closed and answers 503 so the peer retries);
 - transport: `peer_unreachable`, `peer_http_error`, `reply_timeout`,
   `peer_disconnected`. These exist because peers usually run on separate
   machines under different operators: without them, a sender's log would
@@ -232,6 +245,7 @@ The tests live in `internal/sandbox/a2a_conformance_test.go` and
 
 - **Two-process replay.** Against a real running receiver, the exact same
   validly signed envelope sent twice within one run is accepted once and
-  rejected the second time by the in-memory `msg_id` guard; the sandbox sees
-  it once. (This is the per-run guard whose limitation is named above — it
-  does not span runs or restarts.)
+  rejected the second time; the sandbox sees it once. (The cross-run half
+  of the guarantee — a fresh process rejecting an id a previous one
+  accepted — is pinned by the durable-store tests in
+  `internal/a2a/replay_store_test.go`.)
