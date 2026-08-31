@@ -220,13 +220,13 @@ This is a deliberate privacy trade-off, not an oversight: metering that traffic 
 
 *Source: `pkg/manifest/manifest.go` (`Spending`, "Enforcement scope"), `internal/mcpgate/metering.go`.*
 
-### 4. The A2A replay guard is in-memory and per-run
+### 4. A2A replay state is per machine, not shared between machines
 
-The A2A listener rejects duplicate `msg_id`s and envelopes whose timestamp drifts more than ±5 minutes from the local clock. The set of seen message IDs lives in process memory and does not survive a `constle` restart.
+The A2A listener rejects duplicate `msg_id`s and envelopes whose timestamp drifts more than ±5 minutes from the local clock. The set of seen message IDs is durable: every accepted id is persisted under `~/.constle/a2a/replay/<did>/`, so the check spans process restarts and concurrent runs of the same identity - and fails closed (a retryable 503) if that state cannot be read or written. What it does **not** span is machines: the state lives in the invoking user's home and is not replicated anywhere.
 
-**What this means:** an envelope captured during one run can be replayed against a *later* run, provided the replay lands inside the 5-minute timestamp window. Durable, cross-run replay state is out of scope for this version. The mitigation available today is the timestamp window itself - keep runs of the same agent separated by more than 5 minutes if replay across runs is in your threat model.
+**What this means:** if you run the *same* identity as a listener on more than one machine, an envelope captured in flight can be replayed once per machine, provided each replay lands inside the 5-minute timestamp window. One listening machine per identity - the normal deployment - has no such exposure.
 
-*Source: `internal/a2a/envelope.go` (`replayGuard`).*
+*Source: `internal/a2a/envelope.go` (`replayGuard`), `internal/a2a/replay_store.go`.*
 
 ### 5. `sandbox.network.egress` is declared but has no consumer
 

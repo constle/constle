@@ -150,13 +150,20 @@ func (g *Gate) servePublic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Replay/staleness (in-memory, per-run — see replayGuard's limitation).
+	// Replay/staleness — in-memory for this run, durable across runs (see
+	// replayGuard and replay_store.go).
 	if err := g.replay.check(env); err != nil {
 		reason := ReasonReplay
 		if re, ok := err.(*RejectError); ok {
 			reason = re.Reason
 		}
 		g.logRejected(peer.Name, env.From, "request", env.MsgID, "", reason, err.Error())
+		if reason == ReasonGuardUnavailable {
+			// Not a verdict on the envelope — the receiver could not check
+			// it. 503 so a well-behaved peer retries, as with inbox_full.
+			http.Error(w, "constle a2a: replay guard unavailable, retry later", http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "constle a2a: envelope rejected", http.StatusForbidden)
 		return
 	}
