@@ -172,6 +172,7 @@ func printStyledHelp() {
 		{"validate <agentfile>", "check if an Agentfile is valid"},
 		{"identity create <name>", "create a cryptographic identity (did:key)"},
 		{"identity show <name>", "show an agent's DID and key location"},
+		{"webhook-keygen <name>", "generate a human-gates approver keypair (did:key)"},
 		{"audit verify <logfile>", "verify a signed audit log"},
 		{"ps", "list running and recent agents"},
 		{"stop <run_id>", "stop a running agent by run ID"},

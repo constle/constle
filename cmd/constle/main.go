@@ -115,6 +115,15 @@ func main() {
 			die("%v", err)
 		}
 
+	case "webhook-keygen":
+		name, err := parseWebhookKeygenArgs(os.Args[2:])
+		if err != nil {
+			die("%v", err)
+		}
+		if err := cmdWebhookKeygen(name); err != nil {
+			die("%v", err)
+		}
+
 	case "audit":
 		if len(os.Args) < 3 || os.Args[2] != "verify" {
 			die("usage: constle audit verify [--did=<did:key:…>] <logfile>")
@@ -922,6 +931,7 @@ usage:
   constle identity create <name>  create a cryptographic agent identity (did:key)
     --owner=<email>             bind the identity to an owner
   constle identity show <name>  show an agent's DID and key location
+  constle webhook-keygen <name>  generate a human-gates webhook approver keypair (did:key)
   constle audit verify <logfile>  verify a signed audit log (signatures + hash chain)
     --did=<did:key:…>           pin the identity the log must be signed with
   constle ps                    list running and recent agents
