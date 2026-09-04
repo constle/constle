@@ -1,20 +1,21 @@
-// Package humangate implements the verification half of the human-gates
-// webhook decision channel (spec/human-gates-webhook.md §6-§8): given a
-// decision response and the Agentfile's declared approver_pubkey, it decides
-// whether a gated MCP tool call may proceed.
+// Package humangate implements both halves of the human-gates webhook
+// decision channel that spec/human-gates-webhook.md defines: computing the
+// subject_digest a request is built around (§4-§5), and verifying a
+// decision response against it (§6-§8).
 //
-// It deliberately does not implement §4-§5 (building and delivering the
-// outbound request, including the canonical subject-digest encoding) — the
-// spec itself flags that half as an open design question (§5's note on JCS
-// vs. raw-byte canonicalization) not yet settled, and the transport/delivery
-// mechanism as explicitly out of scope for this revision (§4). Verification
-// needs neither: it only compares the response's echoed subject_digest
-// against the digest Constle already sent, byte for byte (§7 step 4).
+// Verification (VerifyDecision) never recomputes a digest — it only
+// compares the response's echoed subject_digest against the one already
+// sent, byte for byte (§7 step 4) — so SubjectDigest has exactly one caller
+// in this codebase: whatever builds the outbound request.
 package humangate
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -129,4 +130,44 @@ func VerifyDecision(approverPubkey, expectedSubjectDigest string, resp DecisionR
 // (step 4) to check the digest actually matches.
 func signedPayload(requestID, decision, subjectDigest string) []byte {
 	return []byte(requestID + "." + decision + "." + subjectDigest)
+}
+
+// SubjectDigest computes spec §5's subject_digest: SHA-256 of a canonical
+// JSON encoding of {"name": toolName, "arguments": <rawArguments>} — object
+// keys sorted at every level, no insignificant whitespace — hex-encoded and
+// prefixed "sha256:". This is what the approver is actually signing off on
+// (§4), so it must be reproducible from the tool call alone.
+//
+// The canonicalization relies on two guarantees encoding/json already gives:
+// Marshal always emits map keys in sorted order, and decoding with
+// UseNumber() carries each number's original literal text through the
+// round-trip untouched, rather than the lossy float64 default. The one
+// documented gap from a fully general canonicalization: object keys are
+// ordered by Go's byte-wise UTF-8 comparison rather than UTF-16 code-unit
+// order: these agree for every key made of Basic-Multilingual-Plane
+// characters — in practice, every real MCP tool argument name — and diverge
+// only for keys containing characters outside it.
+func SubjectDigest(toolName string, rawArguments json.RawMessage) (string, error) {
+	args := rawArguments
+	if len(args) == 0 {
+		args = json.RawMessage("{}")
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(args))
+	dec.UseNumber()
+	var argsValue any
+	if err := dec.Decode(&argsValue); err != nil {
+		return "", fmt.Errorf("tool call arguments are not valid JSON: %w", err)
+	}
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(map[string]any{"name": toolName, "arguments": argsValue}); err != nil {
+		return "", fmt.Errorf("cannot canonicalize tool call: %w", err)
+	}
+	canonical := bytes.TrimRight(buf.Bytes(), "\n") // Encode appends a trailing newline
+
+	sum := sha256.Sum256(canonical)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }

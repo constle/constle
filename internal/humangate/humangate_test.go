@@ -3,7 +3,10 @@ package humangate
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -188,6 +191,97 @@ func TestVerifyDecisionInvalidApproverPubkeyRejected(t *testing.T) {
 		if err == nil {
 			t.Errorf("approverPubkey %q: err = nil, want error", badKey)
 		}
+	}
+}
+
+func TestSubjectDigestIsCanonicalAndDeterministic(t *testing.T) {
+	// Two byte-different-but-semantically-identical argument encodings
+	// (reordered keys, extra whitespace) must digest identically — that is
+	// the entire point of canonicalization.
+	a, err := SubjectDigest("fs.write", json.RawMessage(`{"path":"/tmp/x","content":"hi"}`))
+	if err != nil {
+		t.Fatalf("SubjectDigest() error: %v", err)
+	}
+	b, err := SubjectDigest("fs.write", json.RawMessage(`  { "content" : "hi" , "path" : "/tmp/x" }  `))
+	if err != nil {
+		t.Fatalf("SubjectDigest() error: %v", err)
+	}
+	if a != b {
+		t.Errorf("digests differ for reordered/whitespaced-but-equivalent arguments: %q vs %q", a, b)
+	}
+	if a[:7] != "sha256:" {
+		t.Errorf("digest %q does not have the sha256: prefix", a)
+	}
+
+	// Different tool name, same arguments, must NOT collide — the digest
+	// binds the tool identity, not just the argument values (spec §5).
+	c, err := SubjectDigest("fs.delete", json.RawMessage(`{"path":"/tmp/x","content":"hi"}`))
+	if err != nil {
+		t.Fatalf("SubjectDigest() error: %v", err)
+	}
+	if a == c {
+		t.Error("digest must differ when the tool name differs, even with identical arguments")
+	}
+
+	// Different argument values must not collide either.
+	d, err := SubjectDigest("fs.write", json.RawMessage(`{"path":"/tmp/y","content":"hi"}`))
+	if err != nil {
+		t.Fatalf("SubjectDigest() error: %v", err)
+	}
+	if a == d {
+		t.Error("digest must differ when argument values differ")
+	}
+}
+
+func TestSubjectDigestMatchesHandComputedHash(t *testing.T) {
+	// Pin the exact canonical form against an independently-computed SHA-256,
+	// so a future refactor cannot silently change what gets signed.
+	const canonical = `{"arguments":{"amount_cents":125000,"to":"acct_9f3"},"name":"transfer_funds"}`
+	sum := sha256.Sum256([]byte(canonical))
+	want := "sha256:" + hex.EncodeToString(sum[:])
+
+	got, err := SubjectDigest("transfer_funds", json.RawMessage(`{"to":"acct_9f3","amount_cents":125000}`))
+	if err != nil {
+		t.Fatalf("SubjectDigest() error: %v", err)
+	}
+	if got != want {
+		t.Errorf("SubjectDigest() = %q, want %q (canonical form: %s)", got, want, canonical)
+	}
+}
+
+func TestSubjectDigestPreservesLargeNumberLiterals(t *testing.T) {
+	// A naive float64 decode would corrupt an integer this large. UseNumber()
+	// must carry the literal text through untouched.
+	a, err := SubjectDigest("charge", json.RawMessage(`{"amount":9007199254740993}`))
+	if err != nil {
+		t.Fatalf("SubjectDigest() error: %v", err)
+	}
+	b, err := SubjectDigest("charge", json.RawMessage(`{"amount":9007199254740992}`))
+	if err != nil {
+		t.Fatalf("SubjectDigest() error: %v", err)
+	}
+	if a == b {
+		t.Error("digests for two distinct large integers collided — number precision was lost")
+	}
+}
+
+func TestSubjectDigestEmptyArgumentsIsWellDefined(t *testing.T) {
+	a, err := SubjectDigest("noop", nil)
+	if err != nil {
+		t.Fatalf("SubjectDigest(nil) error: %v", err)
+	}
+	b, err := SubjectDigest("noop", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("SubjectDigest({}) error: %v", err)
+	}
+	if a != b {
+		t.Errorf("nil arguments should digest the same as an explicit empty object: %q vs %q", a, b)
+	}
+}
+
+func TestSubjectDigestRejectsMalformedArguments(t *testing.T) {
+	if _, err := SubjectDigest("fs.write", json.RawMessage(`{not valid json`)); err == nil {
+		t.Error("SubjectDigest() with malformed arguments succeeded, want error")
 	}
 }
 
