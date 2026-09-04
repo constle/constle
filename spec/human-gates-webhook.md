@@ -1,11 +1,12 @@
 # Human Gates Webhook — External Decision Channel
 
 **Status:** Draft
-**Spec version:** 0.2.0 (supersedes 0.1.0 — HMAC design)
+**Spec version:** 0.3.0 (adds §4.1 delivery mechanism and implements §5 canonicalization)
 **Last updated:** 2026-09-04
 
 ## Changelog
 
+- **0.3.0** (2026-09-04): Resolved the two questions 0.2.0 left open. §4.1 (new) specifies the delivery mechanism previously deferred as "out of scope for this revision": POST-once-then-poll against the same URL `human_gates.notify` already uses, with a derivable per-request decision endpoint. §5 canonicalization is now implemented (`internal/humangate.SubjectDigest`) rather than merely specified, with its two documented, deliberate deviations from strict RFC 8785 noted inline.
 - **0.2.0** (2026-09-04): Replaced HMAC-SHA256 symmetric signing with Ed25519 asymmetric signatures. Introduced a dedicated webhook signing keypair, decoupled from `internal/identity`'s per-agent DIDs. Public key now declared in the Agentfile as a `did:key` string. Fail-closed behavior for a missing or malformed key made explicit.
 - **0.1.0** (2026-08-28): Initial draft. HMAC-SHA256 signing (Stripe-style), subject-digest binding, signed-decision verbatim logging.
 
@@ -53,8 +54,22 @@ human_gates:
 ```
 
 - `subject_digest` is SHA-256 over the exact, canonical byte representation of `tool_call` (§5) — this is what the approver is actually signing off on, byte for byte.
-- Delivery URL/transport is unchanged from the prior draft and out of scope for this revision.
 - No response within the configured timeout = denied (existing behavior, unchanged).
+
+## 4.1 Delivery mechanism
+
+Constle POSTs the §4 request to the URL configured via `human_gates.notify` (`channel: webhook`, `url_secret_ref`) — the same URL that already receives gate-triggered notifications; there is no separate URL to configure for decisions. The receiver acknowledges with any `2xx` status. `request_id` is the idempotency key: a receiver MUST treat a repeated POST carrying the same `request_id` as a retry of the same gate, never as a new one.
+
+The decision is fetched by polling `GET <configured URL>/<request_id>/decision` — derivable from the configured URL and `request_id` alone, so a receiver that never saw the POST (or whose `2xx` response was lost in transit) still exposes a discoverable decision endpoint once it learns about the gate by whatever means. Poll responses:
+
+| Response | Meaning |
+|---|---|
+| `200` with a decision body (§6) | Decided. Constle verifies it per §7 and stops polling either way — an invalid decision denies the call (§8); it does not fall back to continued polling. |
+| anything else (`202`, `404`, `5xx`, connection failure, timeout, …) | Not yet decided. Constle retries the POST (if not yet acknowledged) and re-polls, on a fixed interval, until a decision arrives or the gate's timeout elapses. |
+
+A receiver MAY hold the GET open before answering, as a latency optimization — Constle neither requests nor requires this; it simply polls again on its own schedule regardless.
+
+Every outbound request is bound by the gate's own `approval_timeout_seconds` deadline, computed once when the gate opens. No single request, retry, or poll extends a decision's validity past that deadline, and no response arriving after it is honored — unchanged from the existing timeout behavior.
 
 ## 5. Canonical subject encoding
 
@@ -67,6 +82,8 @@ human_gates:
 Constle computes this once when building the request. The decision endpoint doesn't have to recompute it to respond — but should, to confirm it's approving what it thinks it's approving (§6).
 
 > **Note — this is a second canonicalization convention, not a reuse of the existing one.** The codebase's two existing signed-payload flows (`audit.Entry` in `internal/audit/logger.go`, and `a2a.Envelope` in `internal/a2a/envelope.go`) both deliberately avoid re-canonicalization: they sign/verify over the exact wire bytes produced by a single `encoding/json.Marshal` call, with the signature field declared last and stripped by byte-offset rather than by re-serializing. `envelope.go` states this explicitly as a design choice ("no re-canonicalization, so verification is over the very bytes that traveled"). RFC 8785 JCS is the opposite strategy: both sides independently re-derive canonical bytes from a parsed structure, which only holds if both implementations produce identical output (sorted keys, number formatting, escaping) for every value in `tool_call.arguments` — a guarantee `encoding/json` does not provide out of the box and Go's stdlib has no built-in JCS encoder for. This isn't a hard conflict — `tool_call` is a fresh object, not a shared struct with the other two flows — but it does mean the codebase would carry two different canonicalization philosophies for adjacent problems. Worth a deliberate call before implementation, not an accretion by default.
+
+**Implemented as `internal/humangate.SubjectDigest`, "-style" rather than a strict RFC 8785 encoder**, on the strength of two guarantees `encoding/json` already provides: `Marshal` always emits map keys in sorted order, and decoding with `UseNumber()` carries each number's original literal text through untouched rather than the lossy `float64` default. This is deliberately not a full RFC 8785 implementation; the one documented gap is that object keys are ordered by Go's byte-wise UTF-8 comparison rather than UTF-16 code-unit order — the two agree for every key made of Basic-Multilingual-Plane characters (in practice, every real MCP tool argument name) and diverge only outside it. A future revision that needs strict cross-language byte-for-byte reproducibility should adopt a dedicated JCS library instead.
 
 ## 6. Response: decision endpoint → Constle
 
