@@ -304,11 +304,36 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	// terminal the approve/deny prompt needs.
 	var gate *mcpgate.Gate
 	if len(m.MCP.Servers) > 0 {
-		approver := mcpgate.NewTerminalApprover(lockedStdout{})
+		var approver mcpgate.Approver = mcpgate.NewTerminalApprover(lockedStdout{})
 
 		var notifier mcpgate.Notifier
-		if wn := mcpgate.NewWebhookNotifier(m.HumanGates, lockedStdout{}); wn != nil {
+		wn := mcpgate.NewWebhookNotifier(m.HumanGates, lockedStdout{})
+		if wn != nil {
 			notifier = wn
+		}
+
+		// A declared approver_pubkey means an external decision endpoint can
+		// also answer a gate — it runs concurrently with the terminal
+		// prompt, and whichever produces a decision first wins (see
+		// mcpgate.RaceApprover). It is reached at the same URL the webhook
+		// notifier already posts trigger notifications to.
+		switch {
+		case wn != nil && m.HumanGates.ApproverPubkey != "":
+			approver = mcpgate.RaceApprover{Approvers: []mcpgate.Approver{
+				approver,
+				&mcpgate.WebhookApprover{
+					URL:            wn.URLs[0],
+					ApproverPubkey: m.HumanGates.ApproverPubkey,
+					Out:            lockedStdout{},
+				},
+			}}
+		case wn == nil && m.HumanGates.ApproverPubkey != "":
+			// Declared but unusable: approver_pubkey names a verifier with
+			// nothing to verify, because no notify webhook URL resolved.
+			// Same principle as warnUnenforcedHumanGates — a declared
+			// protection must never look real when it isn't.
+			printf("⚠️  warning: human_gates.approver_pubkey is set but no notify "+
+				"webhook URL resolved — gated calls will only be decided at this terminal\n")
 		}
 
 		gate, err = mcpgate.New(m, approver, notifier, logger, tracker)

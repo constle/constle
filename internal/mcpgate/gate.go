@@ -89,6 +89,34 @@ type Approver interface {
 	Decide(ctx context.Context, req Request) Decision
 }
 
+// Outcome is a decision plus enough context for runGate to log it correctly.
+// Decision is what determines whether the call proceeds; DecidedBy and Event
+// only affect the audit trail.
+type Outcome struct {
+	Decision Decision
+
+	// DecidedBy names the source that produced Decision, for the audit
+	// log's decided_by field (e.g. "webhook"). Empty means the caller's own
+	// default ("terminal").
+	DecidedBy string
+
+	// Event, when non-empty, overrides the generic
+	// EventGateApproved/EventGateDenied event runGate would otherwise log
+	// for this Decision — e.g. audit.EventGateSignatureInvalid for a denial
+	// caused by a signature that failed to verify, rather than an ordinary
+	// human "no".
+	Event audit.EventType
+}
+
+// ReasoningApprover is implemented by an Approver that can explain a denial
+// with a specific audit event instead of the plain deny every Approver can
+// produce. TerminalApprover does not implement it; runGate falls back to
+// its existing generic logging for any Approver that doesn't.
+type ReasoningApprover interface {
+	Approver
+	DecideWithReason(ctx context.Context, req Request) Outcome
+}
+
 // Notifier delivers gate-trigger notifications (e.g. a webhook POST).
 type Notifier interface {
 	NotifyTriggered(req Request)
@@ -488,7 +516,15 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 	defer cancel()
 
 	decision := DecisionNone
-	if g.approver != nil {
+	decidedBy := "terminal"
+	var eventOverride audit.EventType
+	if ra, ok := g.approver.(ReasoningApprover); ok {
+		outcome := ra.DecideWithReason(ctx, req)
+		decision, eventOverride = outcome.Decision, outcome.Event
+		if outcome.DecidedBy != "" {
+			decidedBy = outcome.DecidedBy
+		}
+	} else if g.approver != nil {
 		decision = g.approver.Decide(ctx, req)
 	} else {
 		<-ctx.Done()
@@ -497,14 +533,22 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 
 	switch decision {
 	case DecisionApproved:
-		g.log(audit.EventGateApproved, map[string]any{
-			"server": up.id, "tool": tool, "decided_by": "terminal", "wait_ms": waitMS,
+		event := audit.EventGateApproved
+		if eventOverride != "" {
+			event = eventOverride
+		}
+		g.log(event, map[string]any{
+			"server": up.id, "tool": tool, "decided_by": decidedBy, "wait_ms": waitMS,
 		})
 		forward()
 
 	case DecisionDenied:
-		g.log(audit.EventGateDenied, map[string]any{
-			"server": up.id, "tool": tool, "decided_by": "terminal", "wait_ms": waitMS,
+		event := audit.EventGateDenied
+		if eventOverride != "" {
+			event = eventOverride
+		}
+		g.log(event, map[string]any{
+			"server": up.id, "tool": tool, "decided_by": decidedBy, "wait_ms": waitMS,
 		})
 		writeJSONRPCError(w, msg.ID, fmt.Sprintf(
 			"constle: human gate DENIED tool call %q on server %q", tool, up.id))
