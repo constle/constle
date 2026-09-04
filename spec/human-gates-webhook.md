@@ -55,6 +55,7 @@ human_gates:
 
 - `subject_digest` is SHA-256 over the exact, canonical byte representation of `tool_call` (§5) — this is what the approver is actually signing off on, byte for byte.
 - No response within the configured timeout = denied (existing behavior, unchanged).
+- Constle MAY include additional fields beyond the five above — `run_id`, `approval_timeout_seconds`, `timeout_at`, `on_timeout` — for a receiver's own bookkeeping (a countdown display, knowing when to give up holding a gate open). These carry no cryptographic weight: the signed statement in §6 is exactly `request_id + "." + decision + "." + subject_digest`, nothing else. A receiver MUST NOT require them; one that only implements the five fields above still works correctly end to end.
 
 ## 4.1 Delivery mechanism
 

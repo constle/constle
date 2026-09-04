@@ -57,13 +57,31 @@ type WebhookApprover struct {
 	PollInterval time.Duration
 }
 
-// gateRequestWire is spec §4's outbound request body.
+// gateRequestWire is spec §4's outbound request body, plus optional fields
+// beyond what §4 requires or §7 verifies: a receiver needs none of these to
+// implement the spec correctly (they carry no cryptographic weight — the
+// signed statement is exactly request_id + "." + decision + "." +
+// subject_digest, spec §6), but a receiver that wants to render its own
+// countdown or expire an abandoned gate benefits from knowing the runtime's
+// own deadline rather than guessing one. Any receiver that only implements
+// §4's five required fields and ignores the rest still works correctly —
+// see DecideWithReason's timeout behavior, which depends on none of this.
 type gateRequestWire struct {
 	RequestID     string       `json:"request_id"`
 	AgentName     string       `json:"agent_name"`
 	ToolCall      toolCallWire `json:"tool_call"`
 	SubjectDigest string       `json:"subject_digest"`
 	Timestamp     time.Time    `json:"timestamp"`
+
+	// RunID correlates this gate with the run's audit trail. Optional.
+	RunID string `json:"run_id,omitempty"`
+	// ApprovalTimeoutSeconds and TimeoutAt mirror the deadline this ctx
+	// already enforces locally — advisory only, per the doc comment above.
+	ApprovalTimeoutSeconds int       `json:"approval_timeout_seconds,omitempty"`
+	TimeoutAt              time.Time `json:"timeout_at,omitempty"`
+	// OnTimeout mirrors the manifest's on_timeout policy, so a receiver can
+	// render what not deciding in time actually does.
+	OnTimeout string `json:"on_timeout,omitempty"`
 }
 
 type toolCallWire struct {
@@ -96,12 +114,17 @@ func (w *WebhookApprover) DecideWithReason(ctx context.Context, req Request) Out
 	}
 
 	requestID := newRequestID()
+	now := time.Now().UTC()
 	body, err := json.Marshal(gateRequestWire{
-		RequestID:     requestID,
-		AgentName:     req.AgentName,
-		ToolCall:      toolCallWire{Name: req.Tool, Arguments: args},
-		SubjectDigest: subjectDigest,
-		Timestamp:     time.Now().UTC(),
+		RequestID:              requestID,
+		AgentName:              req.AgentName,
+		ToolCall:               toolCallWire{Name: req.Tool, Arguments: args},
+		SubjectDigest:          subjectDigest,
+		Timestamp:              now,
+		RunID:                  req.RunID,
+		ApprovalTimeoutSeconds: req.TimeoutSeconds,
+		TimeoutAt:              now.Add(time.Duration(req.TimeoutSeconds) * time.Second),
+		OnTimeout:              req.OnTimeout,
 	})
 	if err != nil {
 		w.warn("cannot build gate request: %v", err)
