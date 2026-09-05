@@ -374,6 +374,19 @@ func (m *AgentManifest) validateHumanGates() error {
 		}
 	}
 
+	// A gate with no verifiable approver is not a gate: it would either
+	// block forever or (worse) need some other, undeclared way to decide
+	// approval. Fail closed at validate time, per
+	// spec/human-gates-webhook.md §3 and §8.
+	if len(g.RequireApprovalFor) > 0 {
+		if g.ApproverPubkey == "" {
+			return fmt.Errorf("human_gates.approver_pubkey is required when require_approval_for is non-empty (see spec/human-gates-webhook.md §3)")
+		}
+		if err := did.Validate(g.ApproverPubkey); err != nil {
+			return fmt.Errorf("human_gates.approver_pubkey is not a valid did:key Ed25519 string: %w", err)
+		}
+	}
+
 	return nil
 }
 

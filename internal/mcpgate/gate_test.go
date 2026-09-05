@@ -239,6 +239,57 @@ func TestGateTimeoutAbort(t *testing.T) {
 	}
 }
 
+// TestReasoningApproverOverridesEventAndAttribution pins runGate's
+// integration with ReasoningApprover: a denial carrying a specific Event
+// (e.g. a signature that failed to verify) must replace, not add to, the
+// generic gate_denied line — exactly one terminal audit event per gate,
+// same invariant as every other outcome — and decided_by must reflect the
+// approver that actually decided.
+func TestReasoningApproverOverridesEventAndAttribution(t *testing.T) {
+	h := newHarness(t, &reasonedApprover{
+		fixedApprover: fixedApprover{decision: DecisionDenied},
+		decidedBy:     "webhook",
+		event:         audit.EventGateSignatureInvalid,
+	}, "abort")
+
+	status, body := postJSON(t, h.baseURL, toolCallBody("send_email"))
+	if status != 200 || !strings.Contains(body, "DENIED") {
+		t.Fatalf("denied call: status=%d body=%s", status, body)
+	}
+
+	entries := auditEvents(t, h)
+	if len(eventsOfType(entries, audit.EventGateSignatureInvalid)) != 1 {
+		t.Errorf("want 1 gate_signature_invalid, got %+v", entries)
+	}
+	if len(eventsOfType(entries, audit.EventGateDenied)) != 0 {
+		t.Errorf("gate_signature_invalid must replace gate_denied, not add to it; got %+v", entries)
+	}
+
+	resolved := eventsOfType(entries, audit.EventGateSignatureInvalid)[0]
+	if got := resolved.Details["decided_by"]; got != "webhook" {
+		t.Errorf("decided_by = %v, want %q", got, "webhook")
+	}
+}
+
+// TestPlainApproverStillGetsGenericDenyEvent guards the fallback path: an
+// Approver that is not also a ReasoningApprover (e.g. TerminalApprover)
+// must keep logging the ordinary gate_denied event with decided_by:
+// "terminal", unchanged from before ReasoningApprover existed.
+func TestPlainApproverStillGetsGenericDenyEvent(t *testing.T) {
+	h := newHarness(t, &fixedApprover{decision: DecisionDenied}, "abort")
+
+	_, _ = postJSON(t, h.baseURL, toolCallBody("send_email"))
+
+	entries := auditEvents(t, h)
+	denied := eventsOfType(entries, audit.EventGateDenied)
+	if len(denied) != 1 {
+		t.Fatalf("want 1 gate_denied, got %+v", entries)
+	}
+	if got := denied[0].Details["decided_by"]; got != "terminal" {
+		t.Errorf("decided_by = %v, want %q", got, "terminal")
+	}
+}
+
 func TestGateTimeoutProceed(t *testing.T) {
 	h := newHarness(t, &fixedApprover{decision: DecisionDenied, delay: time.Hour}, "proceed")
 

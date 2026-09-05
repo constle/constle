@@ -19,16 +19,27 @@ import (
 type EventType string
 
 const (
-	EventRunStarted     EventType = "run_started"
-	EventRunFinished    EventType = "run_finished"
-	EventRunFailed      EventType = "run_failed"
-	EventGateTriggered  EventType = "gate_triggered"
-	EventGateApproved   EventType = "gate_approved"
-	EventGateDenied     EventType = "gate_denied"
-	EventGateTimeout    EventType = "gate_timeout"
-	EventNetworkBlocked EventType = "network_blocked"
-	EventNetworkAllowed EventType = "network_allowed"
-	EventMCPToolBlocked EventType = "mcp_tool_blocked"
+	EventRunStarted    EventType = "run_started"
+	EventRunFinished   EventType = "run_finished"
+	EventRunFailed     EventType = "run_failed"
+	EventGateTriggered EventType = "gate_triggered"
+	EventGateApproved  EventType = "gate_approved"
+	EventGateDenied    EventType = "gate_denied"
+	EventGateTimeout   EventType = "gate_timeout"
+	// EventGateSignatureInvalid records a human-gates webhook decision whose
+	// Ed25519 signature did not verify against human_gates.approver_pubkey
+	// (spec/human-gates-webhook.md §7, §8). The call is denied either way —
+	// this event exists so a forged or corrupted decision leaves a distinct
+	// trace instead of looking like an ordinary EventGateDenied.
+	EventGateSignatureInvalid EventType = "gate_signature_invalid"
+	// EventGateDigestMismatch records a human-gates webhook decision whose
+	// subject_digest did not echo the one Constle sent in the request (spec
+	// §6, §8) — a signed statement that does not attest to the tool call it
+	// claims to.
+	EventGateDigestMismatch EventType = "gate_digest_mismatch"
+	EventNetworkBlocked     EventType = "network_blocked"
+	EventNetworkAllowed     EventType = "network_allowed"
+	EventMCPToolBlocked     EventType = "mcp_tool_blocked"
 	// EventToolCallStart and EventToolCallEnd bracket every MCP tools/call
 	// the gate actually forwards to an upstream — including a gated call once
 	// it is approved (so for those the order is gate_triggered, gate_approved,

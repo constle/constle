@@ -326,6 +326,16 @@ human_gates:
     - channel: webhook
       url_secret_ref: "HUMAN_GATE_WEBHOOK_URL"
 
+  # REQUIRED whenever require_approval_for is non-empty; `constle validate`
+  # fails otherwise. A did:key Ed25519 public key (see pkg/did.Decode) — the
+  # party whose signed decisions constle trusts to resolve a gated call
+  # (spec/human-gates-webhook.md). Generate one with `constle webhook-keygen`.
+  #
+  # This is a SEPARATE keypair from identity.did above: it authenticates the
+  # human approving a call, not the agent whose call is being approved.
+  # Reusing an agent's own DID here would conflate the two.
+  approver_pubkey: "did:key:z6Mkf5rGMoatrSj1f4CyvuHBeXJELe9RPdzo2PKGNCKVtZxP"
+
 # ---------------------------------------------------------------------------
 # compliance — regulatory and audit metadata
 # ---------------------------------------------------------------------------
