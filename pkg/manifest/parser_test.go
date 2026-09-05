@@ -171,6 +171,7 @@ mcp:
 human_gates:
   enabled: true
   require_approval_for: [send_email]
+  approver_pubkey: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
   notify:
     - channel: webhook
       url_secret_ref: HUMAN_GATE_WEBHOOK_URL
@@ -335,6 +336,43 @@ func TestValidateHumanGates(t *testing.T) {
 	m.HumanGates.ApprovalTimeoutSeconds = -5
 	if err := m.Validate(); err == nil {
 		t.Error("expected error for negative approval_timeout_seconds, got nil")
+	}
+}
+
+func TestValidateApproverPubkey(t *testing.T) {
+	validDID := "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
+
+	m := validManifestWithMCP()
+	m.HumanGates.RequireApprovalFor = []string{"send_email"}
+	if err := m.Validate(); err == nil {
+		t.Error("expected error for require_approval_for without approver_pubkey, got nil")
+	}
+
+	m = validManifestWithMCP()
+	m.HumanGates.RequireApprovalFor = []string{"send_email"}
+	m.HumanGates.ApproverPubkey = "not-a-did-at-all"
+	if err := m.Validate(); err == nil {
+		t.Error("expected error for malformed approver_pubkey, got nil")
+	}
+
+	m = validManifestWithMCP()
+	m.HumanGates.RequireApprovalFor = []string{"send_email"}
+	m.HumanGates.ApproverPubkey = "did:web:example.com"
+	if err := m.Validate(); err == nil {
+		t.Error("expected error for a non-did:key approver_pubkey, got nil")
+	}
+
+	m = validManifestWithMCP()
+	m.HumanGates.RequireApprovalFor = []string{"send_email"}
+	m.HumanGates.ApproverPubkey = validDID
+	if err := m.Validate(); err != nil {
+		t.Errorf("expected no error for a valid approver_pubkey, got %v", err)
+	}
+
+	// approver_pubkey is optional when no gate is declared at all.
+	m = validManifestWithMCP()
+	if err := m.Validate(); err != nil {
+		t.Errorf("expected no error when require_approval_for is empty, got %v", err)
 	}
 }
 

@@ -165,6 +165,7 @@ func TestValidateWarnsOnUnenforceableGates(t *testing.T) {
   enabled: true
   require_approval_for:
     - send_email
+  approver_pubkey: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
 `)
 
 	if err := cmdValidate(path); err != nil {
@@ -193,6 +194,7 @@ human_gates:
   enabled: true
   require_approval_for:
     - send_email
+  approver_pubkey: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
 `)
 
 	if err := cmdValidate(path); err != nil {
@@ -232,6 +234,7 @@ func TestRunWarnsOnUnenforceableGates(t *testing.T) {
   enabled: true
   require_approval_for:
     - payment
+  approver_pubkey: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
 `)
 
 	err := cmdRun(path, "no-such-backend")

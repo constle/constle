@@ -271,6 +271,17 @@ type HumanGates struct {
 	// channel is supported by this version; unsupported channels are a
 	// validation error so a declared notification never silently goes nowhere.
 	Notify []NotifyChannel `yaml:"notify,omitempty"`
+
+	// ApproverPubkey is the did:key Ed25519 public key of the human-gates
+	// webhook approver — the party whose signed decisions constle trusts to
+	// resolve a gated tool call (spec/human-gates-webhook.md). It is a
+	// separate keypair from any agent identity (internal/identity): this
+	// authenticates the human deciding, not the agent being decided about.
+	//
+	// Required whenever RequireApprovalFor is non-empty; `constle validate`
+	// fails otherwise (fail closed — a gate with no way to verify who
+	// approved it is not a gate).
+	ApproverPubkey string `yaml:"approver_pubkey,omitempty"`
 }
 
 // NotifyChannel is one notification target for gate events.

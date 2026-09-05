@@ -169,6 +169,12 @@ human_gates:
   #   - channel: webhook
   #     url_secret_ref: HUMAN_GATE_WEBHOOK_URL
 
+  # REQUIRED once require_approval_for is non-empty — constle validate
+  # fails without it. The did:key public half of a webhook signing key,
+  # generated with constle webhook-keygen (separate from identity.did:
+  # this authenticates the human approver, not the agent).
+  # approver_pubkey: "did:key:..."
+
 # ---------------------------------------------------------------------------
 # compliance — audit and regulatory metadata
 # ---------------------------------------------------------------------------
