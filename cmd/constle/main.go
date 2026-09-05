@@ -214,6 +214,32 @@ func parseRunArgs(args []string) (runOptions, error) {
 	return opts, nil
 }
 
+// achievedLabel renders the boundary a run actually got, naming the requested
+// level alongside it when the two differ. A bare "network" on a run whose
+// manifest asked for "kernel" would be true and still misleading — the point
+// of the contract is that the gap stays visible wherever the level is shown.
+func achievedLabel(sel *sandbox.Selection) string {
+	if sel.Downgraded {
+		return fmt.Sprintf("%s (requested %s, downgrade accepted)", sel.Achieved, sel.Requested)
+	}
+	return string(sel.Achieved)
+}
+
+// isolationOrigin says where the manifest's isolation level came from, for
+// the one-word qualifier the validate output carries beside it.
+//
+// It used to be hardcoded to "inferred from capabilities", which was wrong
+// whenever the Agentfile declared a level — and actively misleading for a
+// malformed one, since it credited the runtime with a choice the operator had
+// actually written by hand. Validate now rejects a malformed level outright,
+// but the label stays honest either way.
+func isolationOrigin(m *manifest.AgentManifest) string {
+	if m.Sandbox.IsolationInferred {
+		return "inferred from capabilities"
+	}
+	return "declared in the Agentfile"
+}
+
 // runStartedDetails builds the details map for the run_started audit event.
 //
 // The entry's isolation_level records what the Agentfile REQUIRED;
@@ -290,14 +316,8 @@ func cmdRun(opts runOptions) error {
 	}
 	backend, backendType := sel.Backend, sel.Type
 	// The backend name alone does not say what boundary the run got, so the
-	// achieved isolation rides with it — and when it is weaker than the
-	// Agentfile declared, the line says both levels rather than one.
-	if sel.Downgraded {
-		setup.ok("backend: %s  ∙  isolation %s (requested %s, downgrade accepted)",
-			backendType, sel.Achieved, sel.Requested)
-	} else {
-		setup.ok("backend: %s  ∙  isolation %s", backendType, sel.Achieved)
-	}
+	// achieved isolation rides with it.
+	setup.ok("backend: %s  ∙  isolation %s", backendType, achievedLabel(sel))
 	setup.gap()
 
 	logPath := audit.DefaultLogPath(m.Identity.Name)
@@ -518,8 +538,15 @@ func cmdRun(opts runOptions) error {
 	// Full run_id on the persistent settled line — this is the live line during
 	// execution, exactly when a second terminal would need it for `constle stop`.
 	// The post-run footer keeps a short handle (correlation only).
+	//
+	// The achieved isolation rides on this line because in styled mode it is
+	// the ONLY permanent setup row: setup.ok folds into the collapsing line
+	// and is overwritten, so the boundary the run actually got would otherwise
+	// survive nowhere on screen. The plain path already prints it as its own
+	// permanent ✓ row, so its bytes stay untouched here.
 	setup.settle(
-		fmt.Sprintf("sandbox ready  ∙  %s  ∙  run %s", backendType, runCtx.RunID),
+		fmt.Sprintf("sandbox ready  ∙  %s  ∙  isolation %s  ∙  run %s",
+			backendType, achievedLabel(sel), runCtx.RunID),
 		"sandbox started (run_id: %s)", runCtx.RunID)
 
 	// The signed-identity note (styled) rides just under the settled setup line
@@ -833,9 +860,15 @@ func a2aNames(m *manifest.AgentManifest) []string {
 
 // printRunSummaryPlain is the non-TTY run-summary block. It reproduces the
 // exact bytes constle has always emitted — do not restyle this path.
+//
+// The one deliberate exception is the "(requested)" qualifier on the isolation
+// row: this block is printed before backend selection, so the level it shows
+// is what the Agentfile asked for, which is not necessarily what the run gets.
+// Leaving it unqualified let a bare "isolation: kernel" read as an achieved
+// boundary. The achieved level is reported separately once it is known.
 func printRunSummaryPlain(m *manifest.AgentManifest) {
 	printf("     agent:     %s v%s\n", m.Identity.Name, m.Identity.Version)
-	printf("     isolation: %s\n", m.Sandbox.Isolation)
+	printf("     isolation: %s (requested)\n", m.Sandbox.Isolation)
 	printf("     memory:    %dMB\n", m.Sandbox.MemoryMB)
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		printf("     network:   restricted → %s\n",
@@ -868,7 +901,7 @@ func renderRunSummary(m *manifest.AgentManifest) {
 	subjectLine(m.Identity.Name, m.Identity.Version)
 
 	rows := []kv{
-		{"isolation", stInk.Render(string(m.Sandbox.Isolation))},
+		{"isolation", stInk.Render(string(m.Sandbox.Isolation)) + stMuted.Render("  ∙  requested")},
 		{"memory", stInk.Render(fmt.Sprintf("%d MB", m.Sandbox.MemoryMB))},
 	}
 	// KNOWN GAP (stated rather than implied, as elsewhere): the "restricted"
@@ -941,7 +974,7 @@ func printValidatePlain(agentfilePath string, m *manifest.AgentManifest) {
 	if m.Identity.DID != "" {
 		printf("  did:         %s\n", m.Identity.DID)
 	}
-	printf("  isolation:   %s (inferred from capabilities)\n", m.Sandbox.Isolation)
+	printf("  isolation:   %s (%s)\n", m.Sandbox.Isolation, isolationOrigin(m))
 	printf("  image:       %s\n", m.Sandbox.Image)
 	printf("  memory:      %dMB\n", m.Sandbox.MemoryMB)
 
@@ -980,7 +1013,8 @@ func renderValidateStyled(agentfilePath string, m *manifest.AgentManifest) {
 		rows = append(rows, kv{"did", stInk.Render(m.Identity.DID)})
 	}
 	rows = append(rows,
-		kv{"isolation", stInk.Render(string(m.Sandbox.Isolation)) + stMuted.Render("  ∙  inferred")},
+		kv{"isolation", stInk.Render(string(m.Sandbox.Isolation)) +
+			stMuted.Render("  ∙  "+isolationOrigin(m))},
 		kv{"image", stInk.Render(m.Sandbox.Image)},
 		kv{"memory", stInk.Render(fmt.Sprintf("%d MB", m.Sandbox.MemoryMB))},
 	)

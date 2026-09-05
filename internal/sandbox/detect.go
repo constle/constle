@@ -52,6 +52,20 @@ type Selection struct {
 // with Achieved weaker than Requested; when it is empty, an unsatisfiable
 // contract is a hard error.
 func DetectBestBackend(required manifest.IsolationLevel, override string, accepted manifest.IsolationLevel) (*Selection, error) {
+	// Defense in depth. Validate() already rejects a malformed level, so this
+	// is unreachable from `constle run` — but selection must not DEPEND on an
+	// earlier caller having validated. An unrecognized level ranks as nothing,
+	// which would make it satisfiable by the weakest backend present, and it
+	// must not be routable through the downgrade path either: there is no
+	// coherent "weaker than kernal" for an operator to accept. So it stops
+	// here, before either decision.
+	if !required.IsValid() {
+		return nil, fmt.Errorf(
+			"invalid isolation level %q in the manifest — valid levels: none, process, network, kernel",
+			required,
+		)
+	}
+
 	if accepted != "" && accepted.Satisfies(required) {
 		return nil, fmt.Errorf(
 			"--accept-isolation=%s is not a downgrade — the Agentfile already requires %q; drop the flag",

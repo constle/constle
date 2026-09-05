@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -65,6 +66,130 @@ func TestIsolationLevelSatisfies(t *testing.T) {
 				t.Errorf("%q.Satisfies(%q) = %v, want %v", have, required, got, want)
 			}
 		}
+	}
+}
+
+// TestSatisfiesFailsClosedOnInvalidOperands is the defense-in-depth half of
+// the contract. An unrecognized level ranks as nothing, so without this guard
+// `kernal` would rank BELOW every real level and be "satisfied" by the
+// weakest backend on the host — a typo turning a kernel requirement into no
+// requirement at all. Neither operand position may be satisfiable.
+func TestSatisfiesFailsClosedOnInvalidOperands(t *testing.T) {
+	invalid := []IsolationLevel{"", "kernal", "Kernel", " kernel ", "hardware"}
+	valid := []IsolationLevel{IsolationNone, IsolationProcess, IsolationNetwork, IsolationKernel}
+
+	for _, bad := range invalid {
+		for _, good := range valid {
+			// A malformed REQUIREMENT must never read as satisfied, however
+			// strong the boundary on offer.
+			if good.Satisfies(bad) {
+				t.Errorf("%q.Satisfies(%q) = true, want false — a malformed requirement "+
+					"must never be satisfiable", good, bad)
+			}
+			// A malformed PROVIDED level must never satisfy a real one.
+			if bad.Satisfies(good) {
+				t.Errorf("%q.Satisfies(%q) = true, want false — a malformed boundary "+
+					"must never satisfy a real requirement", bad, good)
+			}
+		}
+		if bad.Satisfies(bad) {
+			t.Errorf("%q.Satisfies(itself) = true, want false", bad)
+		}
+	}
+}
+
+// TestValidateRejectsMalformedIsolation is the regression guard for the
+// blocking hole: `isolation: kernal` used to validate cleanly, keep its
+// unknown string through parsing, rank as "none", and let an agent declaring
+// external_transfer run on Docker with no downgrade and no acceptance. It
+// must now be a rejected Agentfile.
+func TestValidateRejectsMalformedIsolation(t *testing.T) {
+	for _, level := range []string{
+		"kernal",     // the transposition that started this
+		"Kernel",     // case variant
+		"KERNEL",     // case variant
+		`" kernel "`, // whitespace variant (quoted so YAML preserves it)
+		`"kernel "`,
+		`" "`,
+		"hardware", // plausible-sounding but undefined
+		"vm",
+		"full",
+	} {
+		t.Run(level, func(t *testing.T) {
+			m, err := Parse([]byte(`apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity:
+  name: typo-agent
+capabilities:
+  - external_transfer
+sandbox:
+  isolation: ` + level + `
+`))
+			if err != nil {
+				t.Fatalf("Parse() error = %v, want nil (the value is well-formed YAML)", err)
+			}
+
+			// The parser must preserve what was authored rather than repair
+			// it — guessing which level was meant is how a weaker boundary
+			// gets silently substituted for a declared one.
+			if m.Sandbox.IsolationInferred {
+				t.Error("an explicitly written level must not be marked inferred")
+			}
+
+			err = m.Validate()
+			if err == nil {
+				t.Fatalf("Validate() error = nil for isolation %s — a malformed level must fail closed", level)
+			}
+			if !strings.Contains(err.Error(), "sandbox.isolation") {
+				t.Errorf("error should name the offending field, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateAcceptsEveryDefinedLevel is the other side of that guard: the
+// rejection must not have narrowed what a legitimate Agentfile may declare.
+func TestValidateAcceptsEveryDefinedLevel(t *testing.T) {
+	for _, level := range []string{"none", "process", "network", "kernel"} {
+		m, err := Parse([]byte(`apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity:
+  name: ok-agent
+sandbox:
+  isolation: ` + level + `
+`))
+		if err != nil {
+			t.Fatalf("Parse(%q) error = %v", level, err)
+		}
+		if err := m.Validate(); err != nil {
+			t.Errorf("Validate() rejected the valid level %q: %v", level, err)
+		}
+		if m.Sandbox.IsolationInferred {
+			t.Errorf("isolation %q was declared, not inferred", level)
+		}
+	}
+}
+
+// TestIsolationInferredFlag pins the distinction the validate output depends
+// on: a level Constle derived vs. one the operator wrote. Reporting a
+// declared level as "inferred" credits the runtime with a choice it did not
+// make — and previously described a typo'd level that way too.
+func TestIsolationInferredFlag(t *testing.T) {
+	inferred, err := Parse([]byte(`apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity:
+  name: infer-agent
+capabilities:
+  - external_transfer
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if !inferred.Sandbox.IsolationInferred {
+		t.Error("IsolationInferred = false, want true when no level is written")
+	}
+	if inferred.Sandbox.Isolation != IsolationKernel {
+		t.Errorf("inferred level = %q, want %q", inferred.Sandbox.Isolation, IsolationKernel)
 	}
 }
 

@@ -302,7 +302,14 @@ sandbox:
 The isolation level this agent requires. When omitted, the runtime infers the
 minimum sufficient level from `capabilities` (§7) and always picks the
 strongest level any declared capability requires. `constle validate` prints the
-level it resolved.
+level it resolved and whether it was declared or inferred.
+
+A value outside the four listed above is a **validation error**, not an
+unknown level to be worked around. Matching is exact, so `kernal`, `Kernel`
+and `" kernel "` are all rejected. Nothing tries to guess which level was
+meant: an unrecognized level would otherwise rank below every real one and be
+satisfied by the weakest backend on the host — a typo silently converting a
+kernel requirement into no requirement at all.
 
 | Level | What it provides | Use when |
 |-------|-----------------|----------|
@@ -341,6 +348,10 @@ backend must still provide at least the accepted level. The run then prints an
 the delivered one in `details.isolation_achieved`, and
 `details.isolation_downgrade_accepted: true`. Requested and achieved isolation
 are never collapsed into a single field.
+
+The same separation holds in the CLI: the run summary labels the manifest
+level `requested`, and the settled sandbox line carries the isolation actually
+achieved, naming the requested level beside it whenever the two differ.
 
 ### 6.2 `sandbox.image`
 

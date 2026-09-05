@@ -317,3 +317,100 @@ func TestBackendProvides(t *testing.T) {
 		}
 	}
 }
+
+// ------------------------------------------------------------
+// The contract against real, parsed manifests
+// ------------------------------------------------------------
+
+// parsedManifest runs an Agentfile through the real parse + validate path, so
+// these cases exercise what `constle run` actually feeds to selection rather
+// than a hand-built struct that could not occur in practice.
+func parsedManifest(t *testing.T, yaml string) *manifest.AgentManifest {
+	t.Helper()
+
+	m, err := manifest.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	return m
+}
+
+const kernelAgentYAML = `apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity:
+  name: money-mover
+capabilities:
+  - external_transfer
+sandbox:
+  isolation: kernel
+  image: "python:3.11-slim"
+`
+
+// TestParsedKernelManifestRefusedWithoutFirecracker is case 2 driven end to
+// end from YAML: an Agentfile that declares kernel isolation, parsed and
+// validated exactly as `constle run` would, is refused on a host without
+// Firecracker unless the operator accepts a weaker boundary.
+func TestParsedKernelManifestRefusedWithoutFirecracker(t *testing.T) {
+	m := parsedManifest(t, kernelAgentYAML)
+	if m.Sandbox.Isolation != manifest.IsolationKernel {
+		t.Fatalf("parsed isolation = %q, want %q", m.Sandbox.Isolation, manifest.IsolationKernel)
+	}
+
+	stubHost(t, true, fcMissing)
+
+	if _, err := DetectBestBackend(m.Sandbox.Isolation, "", ""); err == nil {
+		t.Fatal("a parsed kernel manifest must be refused when Firecracker is unavailable")
+	}
+}
+
+// TestAcceptIsolationIgnoredWhenFirecrackerAvailable is case 4, and the one
+// most likely to rot: the acknowledgement is permission to go weaker, not an
+// instruction to. With Firecracker present the run must still get the kernel
+// boundary and must NOT be marked downgraded — otherwise a flag left behind
+// in a script would quietly weaken every later run on a machine that had
+// since been fixed, and would mislabel a fully isolated run as degraded.
+func TestAcceptIsolationIgnoredWhenFirecrackerAvailable(t *testing.T) {
+	m := parsedManifest(t, kernelAgentYAML)
+	buf := stubHost(t, true, fcAvailable)
+
+	sel, err := DetectBestBackend(m.Sandbox.Isolation, "", manifest.IsolationNetwork)
+	if err != nil {
+		t.Fatalf("DetectBestBackend() error = %v, want nil", err)
+	}
+	if sel.Type != BackendFirecracker {
+		t.Errorf("backend = %q, want %q — an available stronger boundary must win", sel.Type, BackendFirecracker)
+	}
+	if sel.Achieved != manifest.IsolationKernel {
+		t.Errorf("achieved = %q, want %q", sel.Achieved, manifest.IsolationKernel)
+	}
+	if sel.Downgraded {
+		t.Error("Downgraded = true, but the kernel boundary was actually delivered")
+	}
+	if out := buf.String(); out != "" {
+		t.Errorf("no downgrade notice should be printed when none happened, got:\n%s", out)
+	}
+}
+
+// TestDetectRejectsInvalidIsolationLevel is the defense-in-depth guard.
+// Validate() rejects a malformed level first, so this is unreachable from the
+// CLI — but selection must fail closed on its own rather than trusting that
+// some earlier caller validated. Critically, an invalid level must not be
+// routable through the downgrade path either: there is no coherent "weaker
+// than kernal" for an operator to accept, so --accept-isolation must not
+// rescue it.
+func TestDetectRejectsInvalidIsolationLevel(t *testing.T) {
+	for _, bad := range []manifest.IsolationLevel{"kernal", "Kernel", " kernel ", "hardware", ""} {
+		for _, accepted := range []manifest.IsolationLevel{"", manifest.IsolationNetwork, manifest.IsolationNone} {
+			stubHost(t, true, fcMissing)
+
+			sel, err := DetectBestBackend(bad, "", accepted)
+			if err == nil {
+				t.Errorf("DetectBestBackend(%q, accepted=%q) returned %+v with nil error — "+
+					"a malformed level must never select a backend", bad, accepted, sel)
+			}
+		}
+	}
+}
