@@ -237,7 +237,7 @@ func TestRunWarnsOnUnenforceableGates(t *testing.T) {
   approver_pubkey: "did:key:z6MkiTBz1ymuepAQ4HEHYSF1H99mXQkL3vUbEr8W3hosJqFr"
 `)
 
-	err := cmdRun(path, "no-such-backend")
+	err := cmdRun(runOptions{agentfile: path, backendOverride: "no-such-backend"})
 	if err == nil {
 		t.Fatal("cmdRun() error = nil, want an unknown-backend error")
 	}

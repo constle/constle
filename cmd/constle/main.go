@@ -94,11 +94,11 @@ func main() {
 		}
 
 	case "run":
-		agentfile, backendOverride, err := parseRunArgs(os.Args[2:])
+		opts, err := parseRunArgs(os.Args[2:])
 		if err != nil {
 			die("%v", err)
 		}
-		if err := cmdRun(agentfile, backendOverride); err != nil {
+		if err := cmdRun(opts); err != nil {
 			die("%v", err)
 		}
 
@@ -160,28 +160,82 @@ func main() {
 	}
 }
 
-// parseRunArgs extracts the Agentfile path and the optional --backend flag
-// from `constle run` arguments.
-func parseRunArgs(args []string) (agentfile, backendOverride string, err error) {
+// runUsage is the one-line usage string for `constle run`, repeated by every
+// argument error so the flags are always discoverable at the point of failure.
+const runUsage = "usage: constle run [--backend=docker|firecracker] " +
+	"[--accept-isolation=<level>] <agentfile.yaml>"
+
+// runOptions is the parsed form of `constle run` arguments.
+type runOptions struct {
+	// agentfile is the path to the Agentfile to run.
+	agentfile string
+
+	// backendOverride forces a sandbox engine (--backend). It selects an
+	// engine only — it never relaxes the manifest's isolation contract.
+	backendOverride string
+
+	// acceptIsolation is the operator's explicit acknowledgement
+	// (--accept-isolation=<level>) that this run may proceed with a weaker
+	// boundary than the Agentfile declares. Empty means no downgrade is
+	// permitted and an unsatisfiable contract aborts the run.
+	acceptIsolation manifest.IsolationLevel
+}
+
+// parseRunArgs extracts the Agentfile path and the optional flags from
+// `constle run` arguments.
+//
+// --accept-isolation is validated here rather than at selection time: a typo
+// in the level must never be read as "some downgrade was requested", because
+// that is the one input that can weaken a declared boundary.
+func parseRunArgs(args []string) (runOptions, error) {
+	var opts runOptions
+
 	for _, arg := range args {
 		switch {
 		case strings.HasPrefix(arg, "--backend="):
-			backendOverride = strings.TrimPrefix(arg, "--backend=")
+			opts.backendOverride = strings.TrimPrefix(arg, "--backend=")
+		case strings.HasPrefix(arg, "--accept-isolation="):
+			level, err := manifest.ParseIsolationLevel(strings.TrimPrefix(arg, "--accept-isolation="))
+			if err != nil {
+				return runOptions{}, fmt.Errorf("--accept-isolation: %w", err)
+			}
+			opts.acceptIsolation = level
 		case strings.HasPrefix(arg, "-"):
-			return "", "", fmt.Errorf("unknown flag %q\nusage: constle run [--backend=docker|firecracker] <agentfile.yaml>", arg)
-		case agentfile == "":
-			agentfile = arg
+			return runOptions{}, fmt.Errorf("unknown flag %q\n%s", arg, runUsage)
+		case opts.agentfile == "":
+			opts.agentfile = arg
 		default:
-			return "", "", fmt.Errorf("unexpected argument %q", arg)
+			return runOptions{}, fmt.Errorf("unexpected argument %q", arg)
 		}
 	}
-	if agentfile == "" {
-		return "", "", fmt.Errorf("usage: constle run [--backend=docker|firecracker] <agentfile.yaml>")
+	if opts.agentfile == "" {
+		return runOptions{}, fmt.Errorf("%s", runUsage)
 	}
-	return agentfile, backendOverride, nil
+	return opts, nil
 }
 
-func cmdRun(agentfilePath, backendOverride string) error {
+// runStartedDetails builds the details map for the run_started audit event.
+//
+// The entry's isolation_level records what the Agentfile REQUIRED;
+// isolation_achieved records what the sandbox actually delivers. They are
+// separate fields because they can legitimately differ — but only via an
+// explicit operator downgrade, which the entry then names outright. A reader
+// of the log can therefore never mistake a requested boundary for an
+// enforced one.
+func runStartedDetails(m *manifest.AgentManifest, sel *sandbox.Selection) map[string]any {
+	details := map[string]any{
+		"backend":            string(sel.Type),
+		"image":              m.Sandbox.Image,
+		"isolation_achieved": string(sel.Achieved),
+	}
+	if sel.Downgraded {
+		details["isolation_downgrade_accepted"] = true
+	}
+	return details
+}
+
+func cmdRun(opts runOptions) error {
+	agentfilePath := opts.agentfile
 	printHeader()
 
 	// Parsing is transient in styled mode: a self-clearing spinner that leaves
@@ -230,11 +284,20 @@ func cmdRun(agentfilePath, backendOverride string) error {
 
 	setup.step("detecting backend")
 
-	backend, backendType, err := sandbox.DetectBestBackend(m.Sandbox.Isolation, backendOverride)
+	sel, err := sandbox.DetectBestBackend(m.Sandbox.Isolation, opts.backendOverride, opts.acceptIsolation)
 	if err != nil {
 		return err
 	}
-	setup.ok("backend: %s", backendType)
+	backend, backendType := sel.Backend, sel.Type
+	// The backend name alone does not say what boundary the run got, so the
+	// achieved isolation rides with it — and when it is weaker than the
+	// Agentfile declared, the line says both levels rather than one.
+	if sel.Downgraded {
+		setup.ok("backend: %s  ∙  isolation %s (requested %s, downgrade accepted)",
+			backendType, sel.Achieved, sel.Requested)
+	} else {
+		setup.ok("backend: %s  ∙  isolation %s", backendType, sel.Achieved)
+	}
 	setup.gap()
 
 	logPath := audit.DefaultLogPath(m.Identity.Name)
@@ -445,10 +508,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		runCtx.RunID, m.Identity.Name,
 		audit.EventRunStarted,
 		string(m.Sandbox.Isolation),
-		map[string]any{
-			"backend": string(backendType),
-			"image":   m.Sandbox.Image,
-		},
+		runStartedDetails(m, sel),
 	); err != nil {
 		audit.WarnWriteFailure(audit.EventRunStarted, err)
 	}
@@ -952,6 +1012,8 @@ usage:
   constle init                  create agent.yaml with sensible defaults
   constle run <agentfile>       run an agent in a sandbox
     --backend=<name>            force a backend: docker or firecracker
+    --accept-isolation=<level>  run at a weaker isolation level than the
+                                Agentfile declares (none|process|network)
   constle validate <agentfile>  check if an Agentfile is valid
   constle identity create <name>  create a cryptographic agent identity (did:key)
     --owner=<email>             bind the identity to an owner

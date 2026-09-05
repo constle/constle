@@ -246,7 +246,7 @@ So `egress: open` and `egress: none` both parse cleanly, change nothing about wh
 <!-- --8<-- [start:enforces] -->
 | Capability | Mechanism | Status |
 |---|---|---|
-| **Sandboxed execution** | Firecracker microVM (hardware isolation) or a two-network Docker sandbox with no default gateway. Auto-detected, or forced with `--backend=docker\|firecracker`. `isolation: kernel` selects Firecracker and warns loudly if it has to fall back to Docker. | Shipped |
+| **Sandboxed execution** | Firecracker microVM (hardware isolation) or a two-network Docker sandbox with no default gateway. Auto-detected, or forced with `--backend=docker\|firecracker`. A declared `isolation:` level is a minimum contract: `isolation: kernel` selects Firecracker and the run **fails closed** if Firecracker is unavailable, unless an operator explicitly accepts a weaker boundary with `--accept-isolation=<level>`. | Shipped |
 | **Network egress** | All egress traverses a Squid proxy allowlisting `network.allowed_hosts`. Matching is name-based (`dstdomain`), and a separate rule denies destinations given as raw IPs - including the real IP of an allowed host - so resolving a name yourself and connecting to the address is not a way around the allowlist. Every allow and every block is an audit event. | Shipped |
 | **Max duration** | The agent is killed when `limits.max_duration_seconds` elapses; the kill is recorded as `terminated_by_limit`. | Shipped |
 | **Audit log** | JSONL per agent per UTC day. With `identity.did` set, every entry is Ed25519-signed and hash-chained; `constle audit verify` detects tampering and reports the offending line. | Shipped |
@@ -388,7 +388,7 @@ If a document the agent reads contains a hidden instruction to exfiltrate data t
 <!-- --8<-- [start:cli] -->
 | Command | Description |
 |---|---|
-| `constle run [--backend=docker\|firecracker] <agentfile>` | Run an agent in an isolated sandbox |
+| `constle run [--backend=docker\|firecracker] [--accept-isolation=<level>] <agentfile>` | Run an agent in an isolated sandbox |
 | `constle validate <agentfile>` | Validate an Agentfile without running it |
 | `constle init` | Scaffold a starter Agentfile in the current directory |
 | `constle ps` | List running and recent Constle-managed agents |

@@ -65,12 +65,19 @@ const (
 // trimming the `,"sig":"…"}` suffix from the raw line — no re-canonicalization,
 // so verification is over the very bytes on disk.
 type Entry struct {
-	Timestamp      time.Time      `json:"timestamp"`
-	RunID          string         `json:"run_id"`
-	AgentName      string         `json:"agent_name"`
-	Event          EventType      `json:"event"`
-	Details        map[string]any `json:"details,omitempty"`
-	IsolationLevel string         `json:"isolation_level,omitempty"`
+	Timestamp time.Time      `json:"timestamp"`
+	RunID     string         `json:"run_id"`
+	AgentName string         `json:"agent_name"`
+	Event     EventType      `json:"event"`
+	Details   map[string]any `json:"details,omitempty"`
+	// IsolationLevel is the level the Agentfile REQUIRED — the declared
+	// minimum, not necessarily what the sandbox delivered. The boundary
+	// actually achieved is recorded alongside it on the run_started entry as
+	// details.isolation_achieved, because the two can differ (only via an
+	// explicit operator downgrade, which that entry also names). Keeping them
+	// as separate fields is what stops a reader of the log from mistaking a
+	// requested boundary for an enforced one.
+	IsolationLevel string `json:"isolation_level,omitempty"`
 
 	// DID is the did:key identifier whose private key signed this entry.
 	DID string `json:"did,omitempty"`
@@ -279,7 +286,9 @@ func (l *Logger) Log(runID, agentName string, event EventType, details map[strin
 	})
 }
 
-// LogWithIsolation is like Log but also records the isolation level.
+// LogWithIsolation is like Log but also records the isolation level the
+// manifest required. Callers that can also report the achieved boundary pass
+// it in details (see the IsolationLevel field on Entry).
 func (l *Logger) LogWithIsolation(runID, agentName string, event EventType, isolation string, details map[string]any) error {
 	return l.Write(Entry{
 		Timestamp:      time.Now().UTC(),

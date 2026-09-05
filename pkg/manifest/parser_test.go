@@ -52,6 +52,43 @@ func TestInferIsolation(t *testing.T) {
 	}
 }
 
+// TestIsolationLevelSatisfies pins the ordering the isolation contract is
+// decided on: the runtime refuses a run whenever the boundary it can build
+// does not Satisfy the level the Agentfile declared.
+func TestIsolationLevelSatisfies(t *testing.T) {
+	ordered := []IsolationLevel{IsolationNone, IsolationProcess, IsolationNetwork, IsolationKernel}
+
+	for i, have := range ordered {
+		for j, required := range ordered {
+			want := i >= j
+			if got := have.Satisfies(required); got != want {
+				t.Errorf("%q.Satisfies(%q) = %v, want %v", have, required, got, want)
+			}
+		}
+	}
+}
+
+// TestParseIsolationLevel keeps an unrecognized level out of the one input
+// that can weaken a declared boundary — a typo must be an error, never a
+// level that silently ranks as "none".
+func TestParseIsolationLevel(t *testing.T) {
+	for _, valid := range []string{"none", "process", "network", "kernel"} {
+		got, err := ParseIsolationLevel(valid)
+		if err != nil {
+			t.Errorf("ParseIsolationLevel(%q) error = %v, want nil", valid, err)
+		}
+		if string(got) != valid {
+			t.Errorf("ParseIsolationLevel(%q) = %q, want %q", valid, got, valid)
+		}
+	}
+
+	for _, invalid := range []string{"", "kernal", "Kernel", "hardware", "vm"} {
+		if _, err := ParseIsolationLevel(invalid); err == nil {
+			t.Errorf("ParseIsolationLevel(%q) error = nil, want a rejection", invalid)
+		}
+	}
+}
+
 func TestParse(t *testing.T) {
 	yaml := `
 apiVersion: constle.dev/v1alpha1

@@ -1,5 +1,7 @@
 package manifest
 
+import "fmt"
+
 // IsolationLevel defines the required sandbox isolation for an agent.
 // Values are ordered from weakest to strongest; Constle always picks the highest required.
 type IsolationLevel string
@@ -18,6 +20,26 @@ const (
 	// Required when the agent can transfer money, delete data, or spawn sub-agents.
 	IsolationKernel IsolationLevel = "kernel"
 )
+
+// Satisfies reports whether l is at least as strong as required.
+//
+// A declared isolation level is a minimum contract, not a preference: the
+// runtime uses this to decide whether the boundary it can actually build
+// meets what the Agentfile asked for, and refuses to run when it does not.
+func (l IsolationLevel) Satisfies(required IsolationLevel) bool {
+	return isolationRank(l) >= isolationRank(required)
+}
+
+// ParseIsolationLevel converts a user-supplied string into an IsolationLevel,
+// rejecting anything that is not one of the four defined levels.
+func ParseIsolationLevel(s string) (IsolationLevel, error) {
+	switch level := IsolationLevel(s); level {
+	case IsolationNone, IsolationProcess, IsolationNetwork, IsolationKernel:
+		return level, nil
+	default:
+		return "", fmt.Errorf("unknown isolation level %q — valid levels: none, process, network, kernel", s)
+	}
+}
 
 // Capability declares a named action the agent may perform.
 // Constle infers the required IsolationLevel from the declared capabilities.
