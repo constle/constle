@@ -141,10 +141,22 @@ func TestAuditSymmetricRoundTrip(t *testing.T) {
 	_, bobLog, publicURL, bobSandbox := startInboundBob(t, bob, alice)
 
 	// Bob's "agent": drain one call and reply.
+	//
+	// replied carries the outcome of that reply, and the test waits on it
+	// before reading bob's log. Alice's send returning is NOT a signal that
+	// bob has finished logging: serveReply hands the reply to the listener
+	// goroutine (call.respCh <- respWire) *before* it writes its own
+	// a2a_call_sent entry, so alice's connection is released, her POST
+	// returns, and the test can reach bob's log while that write is still in
+	// flight. The reply POST's own response is the signal that does hold —
+	// serveReply answers it only after g.log has returned, and the audit
+	// logger writes straight through to the file.
+	replied := make(chan error, 1)
 	go func() {
 		for i := 0; i < 40; i++ {
 			resp, err := http.Get(bobSandbox + "/inbox")
 			if err != nil {
+				replied <- fmt.Errorf("inbox poll: %w", err)
 				return
 			}
 			if resp.StatusCode == http.StatusOK {
@@ -153,13 +165,22 @@ func TestAuditSymmetricRoundTrip(t *testing.T) {
 				_ = resp.Body.Close()
 				rr, err := http.Post(bobSandbox+"/reply/"+msgID, "application/json",
 					strings.NewReader(`{"pong":true}`))
-				if err == nil {
-					_ = rr.Body.Close()
+				if err != nil {
+					replied <- fmt.Errorf("reply post: %w", err)
+					return
 				}
+				_, _ = io.ReadAll(rr.Body)
+				_ = rr.Body.Close()
+				if rr.StatusCode != http.StatusNoContent {
+					replied <- fmt.Errorf("reply = HTTP %d, want 204", rr.StatusCode)
+					return
+				}
+				replied <- nil
 				return
 			}
 			_ = resp.Body.Close()
 		}
+		replied <- fmt.Errorf("inbox never delivered the call within 40 polls")
 	}()
 
 	// Alice's side: her own gate over her own signed log.
@@ -203,7 +224,19 @@ func TestAuditSymmetricRoundTrip(t *testing.T) {
 	}
 	verifyChain(t, aliceLog, alice.DID())
 
-	// Bob's log: the mirror image.
+	// Bob's log: the mirror image — readable only once his side is done
+	// writing it, which the reply POST's completion establishes. A failure
+	// inside the agent goroutine surfaces here rather than as a confusing
+	// missing-entry assertion further down.
+	select {
+	case err := <-replied:
+		if err != nil {
+			t.Fatalf("bob's agent: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("bob's agent never completed its reply")
+	}
+
 	bobEvents := a2aEvents(t, bobLog)
 	assertSeq(t, bobEvents,
 		"a2a_call_received/request",
