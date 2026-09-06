@@ -155,7 +155,7 @@ func (w *WebhookApprover) DecideWithReason(ctx context.Context, req Request) Out
 		// has no decision yet, which polling discovers the same way a
 		// delivery failure does — no special case needed here.
 		if resp, ok := w.poll(ctx, decisionURL); ok {
-			return w.verify(subjectDigest, resp)
+			return w.verify(requestID, subjectDigest, resp)
 		}
 
 		select {
@@ -169,14 +169,23 @@ func (w *WebhookApprover) DecideWithReason(ctx context.Context, req Request) Out
 // verify applies humangate.VerifyDecision and maps its Reason onto the
 // specific audit event the fail-closed table calls for. approved is never
 // true unless VerifyDecision says so.
-func (w *WebhookApprover) verify(subjectDigest string, resp humangate.DecisionResponse) Outcome {
-	approved, reason, err := humangate.VerifyDecision(w.ApproverPubkey, subjectDigest, resp)
+//
+// requestID is the id this gate actually minted, passed in rather than read
+// back off resp: the decision was fetched from a URL derived from it, but a
+// response body is free to say anything, and "the endpoint I asked" is not
+// the same guarantee as "the gate this answers." Only comparing against the
+// locally-held id binds the decision to this call.
+func (w *WebhookApprover) verify(requestID, subjectDigest string, resp humangate.DecisionResponse) Outcome {
+	approved, reason, err := humangate.VerifyDecision(w.ApproverPubkey, requestID, subjectDigest, resp)
 	switch {
 	case approved:
 		return Outcome{Decision: DecisionApproved, DecidedBy: "webhook"}
 	case reason == humangate.ReasonSignatureInvalid:
 		w.warn("decision signature did not verify: %v", err)
 		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook", Event: audit.EventGateSignatureInvalid}
+	case reason == humangate.ReasonRequestIDMismatch:
+		w.warn("decision request_id did not match the request: %v", err)
+		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook", Event: audit.EventGateRequestIDMismatch}
 	case reason == humangate.ReasonDigestMismatch:
 		w.warn("decision subject_digest did not match the request: %v", err)
 		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook", Event: audit.EventGateDigestMismatch}
@@ -243,9 +252,12 @@ func (w *WebhookApprover) warn(format string, args ...any) {
 }
 
 // newRequestID mints a fresh request_id (spec §4's own example format:
-// "hg_" plus random hex) — unique per gate, never reused, so a decision
-// signed for one request_id can never be mistaken for a decision about a
-// different tool call even if two calls happen to share a subject_digest.
+// "hg_" plus random hex) — unique per gate, never reused. Uniqueness is only
+// half of what keeps one gate's decision from answering another's: it gives
+// the two gates distinguishable ids, and verify's request_id comparison is
+// what actually acts on the difference. Neither half works alone, which
+// matters most for two calls that share a subject_digest — the same tool with
+// the same arguments — where the id is the only thing telling them apart.
 func newRequestID() string {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
