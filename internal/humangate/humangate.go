@@ -4,9 +4,10 @@
 // decision response against it (§6-§8).
 //
 // Verification (VerifyDecision) never recomputes a digest — it only
-// compares the response's echoed subject_digest against the one already
-// sent, byte for byte (§7 step 4) — so SubjectDigest has exactly one caller
-// in this codebase: whatever builds the outbound request.
+// compares the response's echoed request_id and subject_digest against the
+// ones already sent, byte for byte (§7 steps 4-5) — so SubjectDigest has
+// exactly one caller in this codebase: whatever builds the outbound request,
+// which is also what holds the request_id both halves are checked against.
 package humangate
 
 import (
@@ -49,7 +50,8 @@ type DecisionResponse struct {
 // Reason explains a VerifyDecision outcome. It exists so a caller can pick
 // the exact audit event the fail-closed table (spec §8) calls for:
 // ReasonSignatureInvalid maps to audit.EventGateSignatureInvalid,
-// ReasonDigestMismatch maps to audit.EventGateDigestMismatch, and every
+// ReasonDigestMismatch maps to audit.EventGateDigestMismatch,
+// ReasonRequestIDMismatch maps to audit.EventGateRequestIDMismatch, and every
 // other non-approved reason maps to the existing audit.EventGateDenied.
 type Reason string
 
@@ -68,6 +70,14 @@ const (
 	// a genuinely signed statement about the wrong thing.
 	ReasonDigestMismatch Reason = "digest_mismatch"
 
+	// ReasonRequestIDMismatch means the signature verified, but the decision
+	// answers a different gate than the one being verified. Signature coverage
+	// alone does not catch this: request_id is inside the signed payload, so a
+	// decision genuinely signed for request A verifies perfectly as bytes — it
+	// is only wrong relative to request B, which nothing but an explicit
+	// comparison against the request_id actually sent can establish.
+	ReasonRequestIDMismatch Reason = "request_id_mismatch"
+
 	// ReasonNotApproved covers a missing, malformed, or explicit "denied"
 	// decision value once signature and digest have both checked out.
 	ReasonNotApproved Reason = "not_approved"
@@ -79,23 +89,45 @@ const (
 //  1. Decode approverPubkey (the Agentfile's human_gates.approver_pubkey).
 //  2. Reconstruct the signed payload from the response's own fields.
 //  3. Verify Signature against that payload with the decoded public key.
-//  4. Confirm resp.SubjectDigest matches expectedSubjectDigest (the digest
+//  4. Confirm resp.RequestID matches expectedRequestID (the request_id
+//     Constle minted for this gate).
+//  5. Confirm resp.SubjectDigest matches expectedSubjectDigest (the digest
 //     Constle sent in the request).
-//  5. Only if 3 and 4 succeed, and resp.Decision == "approved", is the call
-//     approved.
+//  6. Only if 3, 4 and 5 succeed, and resp.Decision == "approved", is the
+//     call approved.
+//
+// Steps 4 and 5 are separate checks answering separate questions, and
+// neither is implied by step 3. The signed payload covers request_id and
+// subject_digest both, so a valid signature only proves the approver said
+// this about that request_id and that digest — not that either one is the
+// one this call is waiting on. Both bindings have to be asserted against
+// what was actually sent:
+//
+//   - Without step 5, a decision signed over a different tool call is
+//     accepted for this one.
+//   - Without step 4, a decision signed for a different gate is accepted for
+//     this one whenever the two share a subject_digest — which any two
+//     invocations of the same tool with the same arguments do, by
+//     construction (SubjectDigest is a pure function of name and arguments).
+//     That makes a single approval of a repeatable call replayable into every
+//     later occurrence of it, and one human "yes" would silently answer every
+//     identical gate that follows. request_id is what distinguishes those
+//     occurrences, so it is checked here rather than left to the fact that
+//     the decision was fetched from a request_id-derived URL: a verification
+//     function that fails closed cannot depend on how its input was obtained.
 //
 // approved is true on exactly one path: every check above passed. There is
 // no code path that returns approved == true alongside a non-nil err, and no
-// path that treats a decode failure, a bad signature, a digest mismatch, or
-// an unrecognized decision value as approval — an unverifiable or malformed
-// decision always denies.
+// path that treats a decode failure, a bad signature, a request_id mismatch,
+// a digest mismatch, or an unrecognized decision value as approval — an
+// unverifiable or malformed decision always denies.
 //
 // approverPubkey is decoded fresh on every call rather than trusted from a
 // cache: pkg/manifest.validateHumanGates already rejects a malformed
 // approver_pubkey at `constle validate` time, but a value that becomes
 // invalid between validate and run (a hand-edited Agentfile, e.g.) must
 // still fail closed at the point it is actually used, not silently pass.
-func VerifyDecision(approverPubkey, expectedSubjectDigest string, resp DecisionResponse) (approved bool, reason Reason, err error) {
+func VerifyDecision(approverPubkey, expectedRequestID, expectedSubjectDigest string, resp DecisionResponse) (approved bool, reason Reason, err error) {
 	pub, err := did.PublicKey(approverPubkey)
 	if err != nil {
 		return false, ReasonSignatureInvalid, fmt.Errorf("approver_pubkey is not a valid did:key Ed25519 string: %w", err)
@@ -109,6 +141,11 @@ func VerifyDecision(approverPubkey, expectedSubjectDigest string, resp DecisionR
 	payload := signedPayload(resp.RequestID, resp.Decision, resp.SubjectDigest)
 	if !ed25519.Verify(pub, payload, sig) {
 		return false, ReasonSignatureInvalid, errors.New("decision signature does not verify against approver_pubkey")
+	}
+
+	if resp.RequestID != expectedRequestID {
+		return false, ReasonRequestIDMismatch, fmt.Errorf(
+			"decision request_id %q does not match the request's %q", resp.RequestID, expectedRequestID)
 	}
 
 	if resp.SubjectDigest != expectedSubjectDigest {
@@ -127,7 +164,10 @@ func VerifyDecision(approverPubkey, expectedSubjectDigest string, resp DecisionR
 // request_id + "." + decision + "." + subject_digest, ASCII period
 // separators, taken verbatim from the response's own fields (spec §7 step
 // 2) — never from the original request, which is only consulted afterward
-// (step 4) to check the digest actually matches.
+// (steps 4-5) to check that the request_id and digest signed over are
+// actually this gate's. Building the payload from the response's own fields
+// is what makes those later comparisons load-bearing: substituting the
+// expected values here would make any response verify against itself.
 func signedPayload(requestID, decision, subjectDigest string) []byte {
 	return []byte(requestID + "." + decision + "." + subjectDigest)
 }

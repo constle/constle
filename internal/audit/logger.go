@@ -37,9 +37,17 @@ const (
 	// §6, §8) — a signed statement that does not attest to the tool call it
 	// claims to.
 	EventGateDigestMismatch EventType = "gate_digest_mismatch"
-	EventNetworkBlocked     EventType = "network_blocked"
-	EventNetworkAllowed     EventType = "network_allowed"
-	EventMCPToolBlocked     EventType = "mcp_tool_blocked"
+	// EventGateRequestIDMismatch records a human-gates webhook decision whose
+	// request_id did not echo the one Constle sent (spec §6, §8) — a decision
+	// that may be genuinely signed, and may even carry the right
+	// subject_digest, but answers a different gate than the one waiting on it.
+	// Distinct from EventGateDigestMismatch because the subject can match
+	// exactly while the request does not: two invocations of the same tool
+	// with the same arguments share a subject_digest but never a request_id.
+	EventGateRequestIDMismatch EventType = "gate_request_id_mismatch"
+	EventNetworkBlocked        EventType = "network_blocked"
+	EventNetworkAllowed        EventType = "network_allowed"
+	EventMCPToolBlocked        EventType = "mcp_tool_blocked"
 	// EventToolCallStart and EventToolCallEnd bracket every MCP tools/call
 	// the gate actually forwards to an upstream — including a gated call once
 	// it is approved (so for those the order is gate_triggered, gate_approved,
