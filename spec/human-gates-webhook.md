@@ -98,6 +98,7 @@ Constle computes this once when building the request. The decision endpoint does
 }
 ```
 
+- `request_id`: **must echo the request's `request_id` verbatim.** It is what binds the decision to one specific gate. Two gates for the same tool call with the same arguments are indistinguishable by `subject_digest` alone, so a decision that does not echo the id is answering a different gate and is denied (§7 step 4), however genuine its signature.
 - `decision`: `"approved"` or `"denied"`. Any other value, or a missing field, is treated as denied.
 - `subject_digest`: **must echo the digest from the request verbatim.** The approver isn't signing "I approve request hg_7f3a9c2e" (a label Constle could relabel later); they're signing the literal hash of the tool-call bytes. What-you-see-is-what-you-sign.
 - `signature`: Ed25519 signature over the exact bytes `request_id + "." + decision + "." + subject_digest` (UTF-8, ASCII period separators), signed with the private key matching the Agentfile's `approver_pubkey`.
@@ -107,8 +108,11 @@ Constle computes this once when building the request. The decision endpoint does
 1. Decode `approver_pubkey` from the Agentfile via `pkg/did.Decode()`.
 2. Reconstruct the signed payload (`request_id + "." + decision + "." + subject_digest`) from the response fields.
 3. Verify `signature` against that payload with the decoded public key.
-4. Confirm the response's `subject_digest` matches the one Constle sent in the request.
-5. Only if steps 3 **and** 4 succeed, and `decision == "approved"`, does the tool call proceed.
+4. Confirm the response's `request_id` matches the one Constle minted for this gate.
+5. Confirm the response's `subject_digest` matches the one Constle sent in the request.
+6. Only if steps 3, 4 **and** 5 succeed, and `decision == "approved"`, does the tool call proceed.
+
+> **Steps 4 and 5 are separate checks, and neither is implied by step 3.** The signed payload covers `request_id` and `subject_digest` both, so a valid signature proves only that the approver said this about *that* request_id and *that* digest — not that either is the one this call is waiting on. Checking the digest alone leaves the gate open to replay: two invocations of the same tool with the same arguments share a `subject_digest` by construction (§5 is a pure function of name and arguments), and `request_id` is the only thing distinguishing them. Without step 4, a decision genuinely signed for the first invocation verifies cleanly against the second, and one human "yes" to a repeatable call silently answers every identical gate that follows it. Step 4 is checked against the locally-held id rather than inferred from the decision having been fetched from a `request_id`-derived URL (§4.1) — a verification step that fails closed cannot depend on how its input was obtained.
 
 ## 8. Fail-closed behavior
 
@@ -117,13 +121,14 @@ Constle computes this once when building the request. The decision endpoint does
 | `approver_pubkey` missing from Agentfile | `constle validate` fails — agent cannot run at all |
 | `approver_pubkey` present but not a valid `did:key` Ed25519 string | `constle validate` fails |
 | Signature verification fails | denied, logged as `EventGateSignatureInvalid` |
+| `request_id` mismatch between request and response | denied, logged as `EventGateRequestIDMismatch` |
 | `subject_digest` mismatch between request and response | denied, logged as `EventGateDigestMismatch` |
 | Response timeout | denied (existing behavior, unchanged) |
 | `decision` missing, malformed, or anything other than `"approved"` | denied |
 
 There is no code path that treats an unverifiable or malformed decision as approved. A broken or misconfigured webhook fails toward blocking the agent, never toward letting it through.
 
-> **Naming note:** `internal/audit/logger.go` names its existing gate events `EventGateTriggered`, `EventGateApproved`, `EventGateDenied`, `EventGateTimeout` (string values `"gate_triggered"`, `"gate_approved"`, `"gate_denied"`, `"gate_timeout"`) — a `Gate` prefix, not `HumanGate`. The two new constants above follow that existing convention (`EventGateSignatureInvalid` / `"gate_signature_invalid"`, `EventGateDigestMismatch` / `"gate_digest_mismatch"`) rather than introducing a new `HumanGate` prefix alongside it.
+> **Naming note:** `internal/audit/logger.go` names its existing gate events `EventGateTriggered`, `EventGateApproved`, `EventGateDenied`, `EventGateTimeout` (string values `"gate_triggered"`, `"gate_approved"`, `"gate_denied"`, `"gate_timeout"`) — a `Gate` prefix, not `HumanGate`. The three new constants above follow that existing convention (`EventGateSignatureInvalid` / `"gate_signature_invalid"`, `EventGateRequestIDMismatch` / `"gate_request_id_mismatch"`, `EventGateDigestMismatch` / `"gate_digest_mismatch"`) rather than introducing a new `HumanGate` prefix alongside it.
 
 ## 9. Audit log
 

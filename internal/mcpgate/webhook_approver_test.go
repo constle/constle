@@ -251,6 +251,83 @@ func TestWebhookApproverRejectsDigestMismatch(t *testing.T) {
 	}
 }
 
+func TestWebhookApproverRejectsDecisionForDifferentRequestID(t *testing.T) {
+	approver := newTestApprover(t)
+	endpoint := newFakeDecisionEndpoint(t)
+	endpoint.decide = func(req gateRequestWire) (humangate.DecisionResponse, bool) {
+		// Correct digest, real approver key, real signature — but the decision
+		// answers some other gate. Nothing about the bytes is malformed.
+		const foreign = "hg_some_other_gate"
+		sig := approver.sign(foreign, "approved", req.SubjectDigest)
+		return humangate.DecisionResponse{
+			RequestID: foreign, Decision: "approved",
+			SubjectDigest: req.SubjectDigest, Signature: sig,
+		}, true
+	}
+
+	wa := &WebhookApprover{URL: endpoint.url(), ApproverPubkey: approver.did, PollInterval: 10 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	outcome := wa.DecideWithReason(ctx, newTestRequest("send_email", `{}`))
+	if outcome.Decision != DecisionDenied {
+		t.Fatalf("Decision = %v, want DecisionDenied", outcome.Decision)
+	}
+	if outcome.Event != audit.EventGateRequestIDMismatch {
+		t.Errorf("Event = %q, want %q", outcome.Event, audit.EventGateRequestIDMismatch)
+	}
+}
+
+// TestWebhookApproverRejectsReplayedDecisionAcrossIdenticalCalls is the
+// end-to-end shape of HG01: not a forged decision, but a real one reused.
+// Two identical tool calls share a subject_digest, so an endpoint that caches
+// its answer per call rather than per gate hands the second gate the first
+// gate's genuinely-signed approval — and the second call sails through on a
+// human decision that was never made about it.
+func TestWebhookApproverRejectsReplayedDecisionAcrossIdenticalCalls(t *testing.T) {
+	approver := newTestApprover(t)
+	endpoint := newFakeDecisionEndpoint(t)
+
+	var mu sync.Mutex
+	var cached *humangate.DecisionResponse
+	endpoint.decide = func(req gateRequestWire) (humangate.DecisionResponse, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if cached == nil {
+			// The one and only decision a human ever made, signed for the gate
+			// that was open at the time.
+			sig := approver.sign(req.RequestID, "approved", req.SubjectDigest)
+			cached = &humangate.DecisionResponse{
+				RequestID: req.RequestID, Decision: "approved",
+				SubjectDigest: req.SubjectDigest, Signature: sig,
+			}
+		}
+		return *cached, true
+	}
+
+	wa := &WebhookApprover{URL: endpoint.url(), ApproverPubkey: approver.did, PollInterval: 10 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	call := newTestRequest("transfer_funds", `{"to":"acct_9f3","amount_cents":125000}`)
+
+	first := wa.DecideWithReason(ctx, call)
+	if first.Decision != DecisionApproved {
+		t.Fatalf("first call: Decision = %v, want DecisionApproved (the human did approve this one)", first.Decision)
+	}
+
+	// The same call again: identical tool and arguments, so an identical
+	// subject_digest — but a fresh request_id and no fresh decision.
+	second := wa.DecideWithReason(ctx, call)
+	if second.Decision == DecisionApproved {
+		t.Fatal("second identical call was approved by replaying the first gate's decision; " +
+			"every gate must be answered on its own request_id")
+	}
+	if second.Event != audit.EventGateRequestIDMismatch {
+		t.Errorf("second call: Event = %q, want %q", second.Event, audit.EventGateRequestIDMismatch)
+	}
+}
+
 func TestWebhookApproverSurvivesFailedInitialPost(t *testing.T) {
 	approver := newTestApprover(t)
 	// URL that accepts no POST at all (404 on everything) until the decision
