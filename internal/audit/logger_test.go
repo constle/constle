@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/constle/constle/internal/homedir"
 )
 
 func TestLogWritesJSONL(t *testing.T) {
@@ -148,7 +150,10 @@ func TestErrRetainsFirstWriteFailure(t *testing.T) {
 }
 
 func TestDefaultLogPath(t *testing.T) {
-	path := DefaultLogPath("my-agent")
+	path, err := DefaultLogPath("my-agent")
+	if err != nil {
+		t.Fatalf("DefaultLogPath() error: %v", err)
+	}
 
 	if !strings.Contains(path, ".constle") {
 		t.Errorf("path %q should contain .constle", path)
@@ -158,5 +163,31 @@ func TestDefaultLogPath(t *testing.T) {
 	}
 	if !strings.Contains(path, "my-agent") {
 		t.Errorf("path %q should contain agent name", path)
+	}
+}
+
+// A name carrying path separators or dot-segments must not produce a path
+// outside ~/.constle/logs: New() creates that directory and, under sudo,
+// chowns it to the invoking user, so an escaped path hands the user
+// ownership of a directory it had no business touching.
+func TestDefaultLogPathRejectsEscapingNames(t *testing.T) {
+	logsDir := filepath.Join(homedir.InvokingUserHome(), ".constle", "logs")
+
+	// Only separator-bearing names can relocate the path here: a name of "."
+	// or ".." still yields a direct child (".-<date>.jsonl"). Those are
+	// rejected earlier, by identity.name validation in pkg/manifest.
+	for _, name := range []string{
+		"../../../../etc/constle",
+		"../evil",
+		"nested/agent",
+		`..\windows`,
+	} {
+		path, err := DefaultLogPath(name)
+		if err == nil {
+			t.Errorf("DefaultLogPath(%q) = %q, want an error — path escapes %s", name, path, logsDir)
+		}
+		if path != "" {
+			t.Errorf("DefaultLogPath(%q) returned path %q alongside its error, want \"\"", name, path)
+		}
 	}
 }

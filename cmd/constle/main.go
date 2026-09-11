@@ -228,7 +228,10 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	setup.ok("backend: %s", backendType)
 	setup.gap()
 
-	logPath := audit.DefaultLogPath(m.Identity.Name)
+	logPath, err := audit.DefaultLogPath(m.Identity.Name)
+	if err != nil {
+		return err
+	}
 
 	// Fail closed on identity: when the Agentfile declares identity.did,
 	// every audit entry must be signed with the matching local key — running

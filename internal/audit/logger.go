@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -303,9 +304,31 @@ func (l *Logger) Path() string {
 // When constle runs under sudo (required by the Firecracker backend), the
 // log still goes to the invoking user's home so all runs of an agent land
 // in one place regardless of backend.
-func DefaultLogPath(agentName string) string {
+//
+// The agent name becomes part of the filename, so the result is checked to
+// still be a direct child of ~/.constle/logs before it is returned: New()
+// creates — and, under sudo, chowns to the invoking user — whatever
+// directory the returned path names, so a name that relocated the path
+// would relocate that chown with it. Manifest validation rejects such names
+// first (identity.name in pkg/manifest); this is the second line of
+// defence for any caller holding an unvalidated name.
+func DefaultLogPath(agentName string) (string, error) {
 	home := homedir.InvokingUserHome()
+	logsDir := filepath.Join(home, ".constle", "logs")
 	date := time.Now().UTC().Format("2006-01-02")
 	filename := fmt.Sprintf("%s-%s.jsonl", agentName, date)
-	return filepath.Join(home, ".constle", "logs", filename)
+	path := filepath.Join(logsDir, filename)
+
+	// filepath.Join cleans the joined path, so separators or ".." segments
+	// carried by the name resolve away silently. Requiring the cleaned
+	// result to be logsDir plus exactly one non-separator element catches
+	// both the escape and the quieter case of a nested subdirectory.
+	rel, err := filepath.Rel(logsDir, path)
+	if err != nil || rel != filename || strings.ContainsAny(rel, `/\`) {
+		return "", fmt.Errorf(
+			"invalid agent name %q: audit log path %q is not inside %s",
+			agentName, path, logsDir,
+		)
+	}
+	return path, nil
 }
