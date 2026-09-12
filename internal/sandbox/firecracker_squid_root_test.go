@@ -31,7 +31,13 @@ func TestTeardownKillsHostSquid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pid, _, err := startHostSquid("sqtest01", runDir, "127.0.0.1", nil, nil)
+	// teardownFirecrackerRun acts only on IDs shaped like newRunID's, and
+	// removes the run and chroot directories it derives from the ID — point
+	// those at a scratch tree so the test never touches /var/lib/constle.
+	useTempStateDirs(t)
+	const runID = "7371746573743031" // "sqtest01", hex-encoded
+
+	pid, _, err := startHostSquid(runID, runDir, "127.0.0.1", nil, nil)
 	if err != nil {
 		t.Fatalf("startHostSquid: %v", err)
 	}
@@ -41,8 +47,8 @@ func TestTeardownKillsHostSquid(t *testing.T) {
 		t.Fatalf("freshly started squid (pid %d) not recognized by cmdlineMatches", pid)
 	}
 
-	errs := teardownFirecrackerRun(&fcRunState{
-		RunID:    "sqtest01",
+	errs := teardownFirecrackerRun(runID, &fcRunState{
+		RunID:    runID,
 		SquidPID: pid,
 	})
 	// nft cleanup errors are expected here (no table was installed); only

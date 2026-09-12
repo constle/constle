@@ -19,6 +19,13 @@ import (
 // /proc/<pid>/cmdline still names a firecracker process carrying this
 // run's ID (jailer passes `--id <runid>` through to firecracker), which
 // makes the check safe against PID reuse after a crash.
+//
+// A run's identity is its directory name under /var/lib/constle/runs, and
+// every entry point checks that name against the shape newRunID mints
+// before building a path from it. The file's own run_id field is
+// informational: no path, device or table name is ever derived from it,
+// because what gets removed as root is exactly what a substituted file
+// would redirect.
 // ============================================================
 
 // fcRunState is the persisted record of one Firecracker-backed run.
@@ -28,7 +35,7 @@ type fcRunState struct {
 	AgentName      string    `json:"agent_name"`
 	VMPid          int       `json:"vm_pid"`
 	SquidPID       int       `json:"squid_pid"`
-	TAPDevice      string    `json:"tap_device"`
+	TAPDevice      string    `json:"tap_device"` // for inspection only: teardown derives the device from the run ID
 	GatewayIP      string    `json:"gateway_ip"`
 	StartedAt      time.Time `json:"started_at"`
 	IsolationLevel string    `json:"isolation_level,omitempty"`
@@ -67,8 +74,13 @@ func readFCState(runID string) (*fcRunState, error) {
 }
 
 // FirecrackerRunExists reports whether a state file exists for runID —
-// used by `constle stop` to route between backends.
+// used by `constle stop` to route between backends. An ID that is not
+// shaped like a run ID is never joined onto the runs directory: filepath
+// cleaning would let "../" segments name a file anywhere on the host.
 func FirecrackerRunExists(runID string) bool {
+	if ValidateRunID(runID) != nil {
+		return false
+	}
 	_, err := os.Stat(fcStatePath(runID))
 	return err == nil
 }
@@ -115,17 +127,20 @@ func ListFirecrackerRuns() []FCRunInfo {
 
 	var runs []FCRunInfo
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		// The directory name is the run's identity; an entry not named
+		// like a run ID was not created by constle and is not one.
+		runID := entry.Name()
+		if !entry.IsDir() || ValidateRunID(runID) != nil {
 			continue
 		}
-		st, err := readFCState(entry.Name())
+		st, err := readFCState(runID)
 		if err != nil {
 			continue
 		}
 		runs = append(runs, FCRunInfo{
-			RunID:     st.RunID,
+			RunID:     runID,
 			AgentName: st.AgentName,
-			Running:   fcProcessAlive(st.VMPid, st.RunID),
+			Running:   fcProcessAlive(st.VMPid, runID),
 			StartedAt: st.StartedAt,
 		})
 	}
@@ -134,7 +149,14 @@ func ListFirecrackerRuns() []FCRunInfo {
 
 // StopFirecrackerRun force-stops a run by ID and removes all its host
 // resources. Used by `constle stop`; requires root for the teardown.
+//
+// runID arrives from the command line, so it is checked before anything
+// else — ahead of the root check, so a malformed ID is reported as such,
+// and ahead of any path built from it.
 func StopFirecrackerRun(runID string) error {
+	if err := ValidateRunID(runID); err != nil {
+		return err
+	}
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("stopping a firecracker run requires root — re-run with sudo")
 	}
@@ -144,15 +166,15 @@ func StopFirecrackerRun(runID string) error {
 	}
 
 	// Give the guest a brief chance to shut down cleanly before the kill.
-	if fcProcessAlive(st.VMPid, st.RunID) {
+	if fcProcessAlive(st.VMPid, runID) {
 		if sendCtrlAltDel(runID) == nil {
-			for i := 0; i < 30 && fcProcessAlive(st.VMPid, st.RunID); i++ {
+			for i := 0; i < 30 && fcProcessAlive(st.VMPid, runID); i++ {
 				time.Sleep(100 * time.Millisecond)
 			}
 		}
 	}
 
-	if errs := teardownFirecrackerRun(st); len(errs) > 0 {
+	if errs := teardownFirecrackerRun(runID, st); len(errs) > 0 {
 		return fmt.Errorf("cleanup errors: %s", strings.Join(errs, "; "))
 	}
 	return nil
@@ -162,10 +184,23 @@ func StopFirecrackerRun(runID string) error {
 // squid process, TAP device, nftables table, chroot, and the run directory.
 // Best-effort and idempotent; returns a list of error strings like the
 // Docker backend's Stop.
-func teardownFirecrackerRun(st *fcRunState) []string {
+//
+// runID is the directory the state was read from. It is re-checked here
+// regardless of what the caller did: this is the function that removes as
+// root, and Stop and the abandoned-run sweep reach it without going
+// through StopFirecrackerRun. Every path, device and table name removed
+// here is derived from it, never from the state file. The file sits 0644 in a root-owned
+// directory, but what this function removes as root is exactly what a
+// substituted file would redirect, so its run_id and tap_device fields
+// carry no authority. Only the PIDs are taken from it, and each is checked
+// against /proc before it is signalled.
+func teardownFirecrackerRun(runID string, st *fcRunState) []string {
+	if err := ValidateRunID(runID); err != nil {
+		return []string{err.Error()}
+	}
 	var errs []string
 
-	if fcProcessAlive(st.VMPid, st.RunID) {
+	if fcProcessAlive(st.VMPid, runID) {
 		if err := killPID(st.VMPid); err != nil {
 			errs = append(errs, fmt.Sprintf("kill vm %d: %v", st.VMPid, err))
 		}
@@ -191,19 +226,17 @@ func teardownFirecrackerRun(st *fcRunState) []string {
 		}
 	}
 
-	if st.TAPDevice != "" {
-		if err := deleteTAP(st.TAPDevice); err != nil {
-			errs = append(errs, err.Error())
-		}
+	if err := deleteTAP(fcTAPName(runID)); err != nil {
+		errs = append(errs, err.Error())
 	}
-	if err := deleteNFTRules(st.RunID); err != nil {
+	if err := deleteNFTRules(runID); err != nil {
 		errs = append(errs, err.Error())
 	}
 
-	if err := os.RemoveAll(filepath.Join(fcJailDir, "firecracker", st.RunID)); err != nil {
+	if err := os.RemoveAll(filepath.Join(fcJailDir, "firecracker", runID)); err != nil {
 		errs = append(errs, fmt.Sprintf("rm chroot: %v", err))
 	}
-	if err := os.RemoveAll(filepath.Join(fcRunsDir, st.RunID)); err != nil {
+	if err := os.RemoveAll(filepath.Join(fcRunsDir, runID)); err != nil {
 		errs = append(errs, fmt.Sprintf("rm run dir: %v", err))
 	}
 	return errs
@@ -231,21 +264,24 @@ func cleanupAbandonedFirecracker() {
 		return
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		// Only entries named like a run ID are constle's to remove; anything
+		// else under the runs directory is left exactly as found.
+		runID := entry.Name()
+		if !entry.IsDir() || ValidateRunID(runID) != nil {
 			continue
 		}
-		st, err := readFCState(entry.Name())
+		st, err := readFCState(runID)
 		if err != nil {
 			// State never written or corrupt — remove the debris but keep
 			// directories that are too young to judge (Start may be racing).
 			if info, statErr := entry.Info(); statErr == nil && time.Since(info.ModTime()) > time.Minute {
-				_ = os.RemoveAll(filepath.Join(fcRunsDir, entry.Name()))
+				_ = os.RemoveAll(filepath.Join(fcRunsDir, runID))
 			}
 			continue
 		}
-		if fcProcessAlive(st.VMPid, st.RunID) {
+		if fcProcessAlive(st.VMPid, runID) {
 			continue
 		}
-		teardownFirecrackerRun(st)
+		teardownFirecrackerRun(runID, st)
 	}
 }
