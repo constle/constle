@@ -477,6 +477,7 @@ Until then, do not reason about network exposure from this value; read
 |-|-|
 | Type | list of strings |
 | Required | optional (an empty list means no egress) |
+| Charset | lowercase letters, digits, `-`, `.`; one optional leading `.` — see below |
 | Enforcement | **ENFORCED** |
 
 The allowlist from which the per-run egress proxy is built. This is the field
@@ -491,8 +492,26 @@ allowed_hosts:
 ```
 
 Entries are hostnames. An entry beginning with `.` matches that domain and all
-its subdomains; otherwise the match is exact. Ports, schemes, paths, and IP
-literals are not part of the matching.
+its subdomains; otherwise the match is exact. Ports, schemes, and paths are not
+part of the matching.
+
+Each entry must be a plain hostname: dot-separated labels of lowercase ASCII
+letters, digits, and hyphens (no leading or trailing hyphen, at most 63
+characters per label and 253 in total), optionally prefixed with a single `.`.
+Anything else — uppercase, whitespace, control characters, a scheme, a port, a
+path, a wildcard, or a non-ASCII name (use its punycode form) — is rejected at
+validate time. The grammar is strict because each entry is written verbatim
+into the per-run Squid configuration, which has no escaping for ACL values: an
+entry carrying a newline would end the allowlist directive and start another,
+so `"example.com\nhttp_access allow all"` would open all egress. Such a
+manifest is rejected outright. One spelling per host also keeps the two rules
+below exact: they compare entries literally, so a `HOST.DOCKER.INTERNAL` that
+Squid still matched would otherwise slip past them.
+
+An IPv4 address written in dotted-quad form satisfies this grammar and is
+accepted. Squid then matches it literally, so listing an address permits
+connections to it; the raw-IP rule described under enforcement refuses only
+addresses that are not listed.
 
 The provider hosts used as examples in this document (`api.groq.com`, `api.openai.com`, `api.anthropic.com`, etc.) are illustrative, not endorsements or defaults — substitute whatever hosts the agent's actual tools and model calls need.
 
@@ -513,8 +532,8 @@ proxy runs inside a pinned container image.
 Blocked attempts are recorded as `network_blocked` audit events; permitted ones
 as `network_allowed`.
 
-**Two entries are rejected at validate time** rather than silently accepted,
-because each would open a bypass around a stronger control:
+**Two further entries are rejected at validate time** rather than silently
+accepted, because each would open a bypass around a stronger control:
 
 1. **Any host that also appears under `mcp.servers[].url` or
    `a2a.peers[].endpoint`.** Allowlisting it would let the agent reach that
@@ -522,9 +541,10 @@ because each would open a bypass around a stronger control:
    allowlists, human gates, spending metering, and A2A signing. MCP and A2A
    traffic is routed through the gate automatically; it must not — and need
    not — appear here.
-2. **`localhost`, `127.0.0.1`, `::1`, or `host.docker.internal`, when `mcp` or
-   `a2a` are declared.** These name the sandbox's host, which is where the gate
-   transport listens. Allowlisting them wholesale would expose the gate itself
+2. **`localhost`, `127.0.0.1`, or `host.docker.internal`, when `mcp` or `a2a`
+   are declared.** These name the sandbox's host, which is where the gate
+   transport listens. (`::1` is not a valid entry at all — see the grammar
+   above.) Allowlisting them wholesale would expose the gate itself
    and every other host service to the agent.
 
 Both are errors, not warnings. A bypass that is merely warned about is a bypass.
@@ -1209,6 +1229,7 @@ inert or bypassed.
 | `a2a.listen` requires a non-empty `a2a.peers` | No sender could ever be authorized |
 | Peer DIDs must be unique, and none may equal `identity.did` | Sender identity would be ambiguous |
 | `mcp.servers[].id` and `a2a.peers[].name` must be unique and match the id charset | They are embedded in env var names, gate URLs, and audit events |
+| `sandbox.network.allowed_hosts` entries must be plain hostnames | Written verbatim into the Squid allowlist: a newline injects a directive, whitespace a second host |
 | An MCP server URL host must not appear in `allowed_hosts` | Would bypass the gate proxy |
 | An A2A peer endpoint host must not appear in `allowed_hosts` | Would bypass the signing gate |
 | Host loopback aliases must not appear in `allowed_hosts` when `mcp` or `a2a` are declared | Would expose the gate transport and other host services |

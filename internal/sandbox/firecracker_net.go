@@ -168,9 +168,12 @@ func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, gate
 		"shutdown_lifetime 0 seconds",
 	}, "\n")
 
-	config := buildSquidConfig(runID, allowedHosts,
+	config, err := buildSquidConfig(runID, allowedHosts,
 		fmt.Sprintf("%s:%d", gatewayIP, fcSquidPort), accessLogPath, extra,
 		gatewayIP, gatePorts)
+	if err != nil {
+		return 0, "", err
+	}
 	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
 		return 0, "", err
 	}

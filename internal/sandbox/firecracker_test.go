@@ -84,7 +84,7 @@ func TestFCGuestMAC(t *testing.T) {
 }
 
 func TestBuildSquidConfigFirecrackerVariant(t *testing.T) {
-	config := buildSquidConfig("testrun01", []string{"api.groq.com"},
+	config := mustBuildSquidConfig(t, "testrun01", []string{"api.groq.com"},
 		"172.30.1.1:3128", "/var/lib/constle/runs/testrun01/access.log",
 		"pid_filename none", "172.30.1.1", nil)
 
@@ -103,7 +103,7 @@ func TestBuildSquidConfigFirecrackerVariant(t *testing.T) {
 }
 
 func TestBuildSquidConfigEmptyDeniesAll(t *testing.T) {
-	config := buildSquidConfig("testrun02", nil, "172.30.1.1:3128", "/tmp/x.log", "", "172.30.1.1", nil)
+	config := mustBuildSquidConfig(t, "testrun02", nil, "172.30.1.1:3128", "/tmp/x.log", "", "172.30.1.1", nil)
 
 	if !strings.Contains(config, "http_access deny all") {
 		t.Error("empty allowlist config must deny all traffic")

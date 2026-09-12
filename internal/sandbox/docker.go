@@ -310,8 +310,11 @@ func gatePorts(ports ...int) []int {
 }
 
 func writeSquidConfig(runID string, allowedHosts []string, gateHost string, gatePorts []int) (string, error) {
-	config := buildSquidConfig(runID, allowedHosts, "3128", "/var/log/squid/access.log", "",
+	config, err := buildSquidConfig(runID, allowedHosts, "3128", "/var/log/squid/access.log", "",
 		gateHost, gatePorts)
+	if err != nil {
+		return "", err
+	}
 	path := filepath.Join(os.TempDir(), "constle-squid-"+runID+".conf")
 	return path, os.WriteFile(path, []byte(config), 0644)
 }
@@ -321,6 +324,14 @@ func writeSquidConfig(runID string, allowedHosts []string, gateHost string, gate
 // listens inside its own container) or "ip:port" (Firecracker: Squid runs
 // on the host and must bind only the per-run TAP gateway address). extra
 // appends backend-specific directives.
+//
+// Every allowlist entry lands verbatim in squid.conf, a line-oriented
+// format with no escaping for ACL values, so the entries are checked
+// against the hostname grammar (manifest.ValidateAllowedHost) before a
+// single byte is rendered and the function fails closed on any miss. Each
+// host is then emitted on its own "acl allowed_hosts dstdomain" line —
+// Squid merges same-named ACL lines — so no entry shares a line with, or
+// can change the framing of, another.
 //
 // Each gatePorts entry opens exactly one extra route: the gate host on that
 // single port (one port per constle gate — MCP, A2A). The rule precedes
@@ -338,7 +349,30 @@ func writeSquidConfig(runID string, allowedHosts []string, gateHost string, gate
 // link-local address, and the per-run nft table drops the tap in the
 // dual-family `inet` table). It turns into a real hole only if someone later
 // gives a sandbox an IPv6 route without adding the matching ACL here.
-func buildSquidConfig(runID string, allowedHosts []string, httpPort, accessLogPath, extra, gateHost string, gatePorts []int) string {
+//
+// KNOWN GAP (pre-existing, reproduced against Squid 7.2): `deny ip_only
+// !allowed_hosts` below does not refuse every request that names a raw
+// address. When the destination is an IP literal and no value matches by
+// string, Squid resolves the address in reverse and matches the PTR name
+// against the dstdomain values, so an address whose reverse name is an
+// allowlisted host is admitted — over GET and CONNECT alike — and that PTR
+// record belongs to whoever owns the address. Adding the `-n` flag to the
+// dstdomain ACLs turns the reverse lookup off and denies both; it is left
+// for a change of its own because it alters matching for every entry, not
+// only for the addresses this gap is about.
+func buildSquidConfig(runID string, allowedHosts []string, httpPort, accessLogPath, extra, gateHost string, gatePorts []int) (string, error) {
+	// Fail closed: an entry that is not a plain hostname cannot be rendered
+	// safely at all — a newline inside it is a second directive, and
+	// "http_access allow all" placed before the deny rules opens all
+	// egress. Validate already refuses such a manifest; this is the second
+	// line of defense for any caller that builds a manifest in Go without
+	// going through validation first.
+	for _, host := range allowedHosts {
+		if err := manifest.ValidateAllowedHost(host); err != nil {
+			return "", fmt.Errorf("network.allowed_hosts entry %q: %w", host, err)
+		}
+	}
+
 	gateClause := ""
 	if len(gatePorts) > 0 {
 		aclType := "dstdomain"
@@ -359,9 +393,12 @@ http_access allow constle_gate_dst constle_gate_port
 
 	var config string
 	if len(allowedHosts) > 0 {
-		hosts := strings.Join(allowedHosts, " ")
+		aclLines := make([]string, len(allowedHosts))
+		for i, host := range allowedHosts {
+			aclLines[i] = "acl allowed_hosts dstdomain " + host
+		}
 		config = fmt.Sprintf(`# Constle - run %s
-acl allowed_hosts dstdomain %s
+%s
 %s
 # Block direct IP connections to prevent allowlist bypass.
 acl ip_only dst 0.0.0.0/0
@@ -376,7 +413,7 @@ cache deny all
 access_log %s
 cache_log /dev/null
 coredump_dir /tmp
-`, runID, hosts, gateClause, httpPort, accessLogPath)
+`, runID, strings.Join(aclLines, "\n"), gateClause, httpPort, accessLogPath)
 	} else {
 		config = fmt.Sprintf(`# Constle - run %s - no network
 %s
@@ -392,7 +429,7 @@ coredump_dir /tmp
 	if extra != "" {
 		config += extra + "\n"
 	}
-	return config
+	return config, nil
 }
 
 // gateBindCandidates lists the host IPs on which the MCP gate must listen so

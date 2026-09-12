@@ -66,11 +66,55 @@ func TestWriteSquidConfigEmpty(t *testing.T) {
 	}
 }
 
+// mustBuildSquidConfig renders a config whose allowlist is expected to be
+// valid; a rejection is a test failure, not a silent empty config.
+func mustBuildSquidConfig(t *testing.T, runID string, hosts []string, httpPort, accessLogPath, extra, gateHost string, gatePorts []int) string {
+	t.Helper()
+	config, err := buildSquidConfig(runID, hosts, httpPort, accessLogPath, extra, gateHost, gatePorts)
+	if err != nil {
+		t.Fatalf("buildSquidConfig() error: %v", err)
+	}
+	return config
+}
+
+func TestBuildSquidConfigOneACLLinePerHost(t *testing.T) {
+	config := mustBuildSquidConfig(t, "testrun07", []string{"api.openai.com", "arxiv.org"}, "3128", "/tmp/x.log", "", "", nil)
+	for _, want := range []string{
+		"acl allowed_hosts dstdomain api.openai.com\n",
+		"acl allowed_hosts dstdomain arxiv.org\n",
+	} {
+		if !strings.Contains(config, want) {
+			t.Errorf("config missing its own line %q:\n%s", want, config)
+		}
+	}
+	if strings.Contains(config, "api.openai.com arxiv.org") {
+		t.Errorf("hosts must not share one dstdomain line:\n%s", config)
+	}
+}
+
+func TestBuildSquidConfigRejectsInvalidHost(t *testing.T) {
+	for _, bad := range []string{
+		"example.com\nhttp_access allow all", // directive injection
+		"api.example.com 10.1.2.3",           // two entries the overlap checks never saw
+		"\"/etc/passwd\"",                    // Squid file include
+		"-n",                                 // Squid ACL flag
+	} {
+		config, err := buildSquidConfig("testrun08", []string{bad}, "3128", "/tmp/x.log", "", "", nil)
+		if err == nil {
+			t.Errorf("buildSquidConfig(%q) = nil error, want rejection; rendered:\n%s", bad, config)
+			continue
+		}
+		if config != "" {
+			t.Errorf("buildSquidConfig(%q) returned a config alongside the error", bad)
+		}
+	}
+}
+
 func TestBuildSquidConfigGateClause(t *testing.T) {
 	// IP-literal gate host (both backends since the IPv6-preference fix)
 	// must use a dst ACL, scoped to exactly the gate ports, and must precede
 	// the deny rules so the gates stay reachable with an empty allowlist.
-	config := buildSquidConfig("testrun03", nil, "3128", "/tmp/x.log", "", "192.168.65.254", []int{41234})
+	config := mustBuildSquidConfig(t, "testrun03", nil, "3128", "/tmp/x.log", "", "192.168.65.254", []int{41234})
 	for _, want := range []string{
 		"acl constle_gate_dst dst 192.168.65.254",
 		"acl constle_gate_port port 41234",
@@ -85,19 +129,19 @@ func TestBuildSquidConfigGateClause(t *testing.T) {
 	}
 
 	// Two gates bound (MCP + A2A): one port ACL listing both ports.
-	config = buildSquidConfig("testrun06", nil, "3128", "/tmp/x.log", "", "192.168.65.254", []int{41234, 51234})
+	config = mustBuildSquidConfig(t, "testrun06", nil, "3128", "/tmp/x.log", "", "192.168.65.254", []int{41234, 51234})
 	if !strings.Contains(config, "acl constle_gate_port port 41234 51234") {
 		t.Errorf("config must scope the gate ACL to both gate ports:\n%s", config)
 	}
 
 	// A hostname gate host uses dstdomain.
-	config = buildSquidConfig("testrun04", []string{"api.openai.com"}, "3128", "/tmp/x.log", "", "gate.internal", []int{41234})
+	config = mustBuildSquidConfig(t, "testrun04", []string{"api.openai.com"}, "3128", "/tmp/x.log", "", "gate.internal", []int{41234})
 	if !strings.Contains(config, "acl constle_gate_dst dstdomain gate.internal") {
 		t.Errorf("hostname gate host should use dstdomain:\n%s", config)
 	}
 
 	// No gates bound: no gate clause at all.
-	config = buildSquidConfig("testrun05", nil, "3128", "/tmp/x.log", "", "", nil)
+	config = mustBuildSquidConfig(t, "testrun05", nil, "3128", "/tmp/x.log", "", "", nil)
 	if strings.Contains(config, "constle_gate") {
 		t.Errorf("config must have no gate clause when no gate is bound:\n%s", config)
 	}
