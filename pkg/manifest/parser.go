@@ -78,8 +78,8 @@ func (m *AgentManifest) Validate() error {
 		)
 	}
 
-	if m.Identity.Name == "" {
-		return fmt.Errorf("identity.name is required")
+	if err := validateIdentityName(m.Identity.Name); err != nil {
+		return err
 	}
 
 	if m.Identity.DID != "" {
@@ -128,6 +128,30 @@ func (m *AgentManifest) Validate() error {
 		return err
 	}
 
+	return nil
+}
+
+// validateIdentityName rejects agent names that would escape the directories
+// constle derives from them. identity.name is used unmodified as a path
+// element — the identity directory (~/.constle/identities/<name>/) and the
+// audit log filename (~/.constle/logs/<name>-<date>.jsonl) — so a name
+// carrying path separators or dot-segments relocates that state outside the
+// intended directory, where constle then creates and chowns it.
+//
+// This check runs for every manifest, signed or not: the identity-loading
+// path only validates the name when identity.did is declared, which leaves
+// unsigned manifests unchecked.
+//
+// The rules below must stay in sync with validateAgentName in
+// internal/identity/identity.go, which guards the same name on the identity
+// storage path.
+func validateIdentityName(name string) error {
+	if name == "" {
+		return fmt.Errorf("identity.name is required")
+	}
+	if strings.ContainsAny(name, "/\\") || name == "." || name == ".." || strings.HasPrefix(name, ".") {
+		return fmt.Errorf("identity.name %q is invalid: must not contain path separators or start with a dot", name)
+	}
 	return nil
 }
 
