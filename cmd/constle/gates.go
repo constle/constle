@@ -21,10 +21,10 @@ var gatesWarnOut io.Writer = os.Stdout
 // matches a tool name on a declared mcp.servers entry pauses that call at
 // the gate proxy for approval. What this function reports is the remainder:
 // entries that provably match no declared MCP tool (or any entry at all
-// when no MCP servers are declared). Like the kernel-isolation downgrade
-// warning in sandbox.DetectBestBackend, a declared protection must never
-// look real when it isn't — but a real protection must no longer be
-// reported as missing either.
+// when no MCP servers are declared). Like the isolation contract enforced in
+// sandbox.DetectBestBackend, a declared protection must never look real when
+// it isn't — but a real protection must no longer be reported as missing
+// either.
 //
 // Writes bypass printf so tests can swap the writer, but hold stdoutMu
 // directly to preserve the stdout serialisation invariant documented on

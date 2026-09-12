@@ -77,6 +77,17 @@ sandbox:
   # The capabilities in this file infer "network". `constle validate` prints
   # the level it resolved.
   #
+  # A value outside the four above is a validation error — matching is exact,
+  # so "kernal", "Kernel" and " kernel " are all rejected rather than guessed
+  # at. An unrecognized level would otherwise rank below every real one.
+  #
+  # Whichever way the level is arrived at, it is a MINIMUM CONTRACT. Docker
+  # provides "network"; Firecracker provides "kernel". If no available backend
+  # provides the required level, `constle run` refuses to start — it never
+  # downgrades on its own. An operator can accept a weaker boundary for one
+  # run with `constle run --accept-isolation=<level>`, which is recorded in
+  # the run's output and audit log.
+  #
   # isolation: network
 
   # Container image to run.

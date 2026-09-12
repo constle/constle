@@ -1,5 +1,7 @@
 package manifest
 
+import "fmt"
+
 // IsolationLevel defines the required sandbox isolation for an agent.
 // Values are ordered from weakest to strongest; Constle always picks the highest required.
 type IsolationLevel string
@@ -18,6 +20,52 @@ const (
 	// Required when the agent can transfer money, delete data, or spawn sub-agents.
 	IsolationKernel IsolationLevel = "kernel"
 )
+
+// IsValid reports whether l is one of the four defined levels. It is the
+// single definition of "a real isolation level"; ParseIsolationLevel and
+// Satisfies both defer to it rather than restating the set.
+//
+// Matching is exact: "Kernel", "kernal" and " kernel " are all invalid. An
+// unrecognized level must never be normalized into a real one — guessing
+// which boundary an operator meant is exactly how a declared protection ends
+// up weaker than it reads.
+func (l IsolationLevel) IsValid() bool {
+	switch l {
+	case IsolationNone, IsolationProcess, IsolationNetwork, IsolationKernel:
+		return true
+	default:
+		return false
+	}
+}
+
+// Satisfies reports whether l is at least as strong as required.
+//
+// A declared isolation level is a minimum contract, not a preference: the
+// runtime uses this to decide whether the boundary it can actually build
+// meets what the Agentfile asked for, and refuses to run when it does not.
+//
+// It fails closed on an invalid operand in EITHER position. An unrecognized
+// level ranks as nothing, so without this guard a typo like `kernal` would
+// rank below every real level and be "satisfied" by the weakest backend on
+// the host — the precise failure this contract exists to prevent. Validate()
+// already rejects such a manifest; this is the second line of defense, so a
+// malformed level cannot silently pass a comparison on any path that reaches
+// one without going through validation first.
+func (l IsolationLevel) Satisfies(required IsolationLevel) bool {
+	if !l.IsValid() || !required.IsValid() {
+		return false
+	}
+	return isolationRank(l) >= isolationRank(required)
+}
+
+// ParseIsolationLevel converts a user-supplied string into an IsolationLevel,
+// rejecting anything that is not one of the four defined levels.
+func ParseIsolationLevel(s string) (IsolationLevel, error) {
+	if level := IsolationLevel(s); level.IsValid() {
+		return level, nil
+	}
+	return "", fmt.Errorf("unknown isolation level %q — valid levels: none, process, network, kernel", s)
+}
 
 // Capability declares a named action the agent may perform.
 // Constle infers the required IsolationLevel from the declared capabilities.
@@ -74,6 +122,13 @@ type Identity struct {
 type Sandbox struct {
 	// Isolation is the required level. When empty, Constle infers it from Capabilities.
 	Isolation IsolationLevel `yaml:"isolation,omitempty"`
+
+	// IsolationInferred records that Isolation was derived from Capabilities
+	// rather than written in the Agentfile. It is set by Parse, never read
+	// from YAML, and exists so output never describes an explicitly declared
+	// level as "inferred" — a mislabel that hides operator intent, and hid a
+	// typo'd level behind a claim the runtime had chosen it.
+	IsolationInferred bool `yaml:"-"`
 
 	// Image is the Docker image to run (e.g. "python:3.11-slim").
 	Image string `yaml:"image,omitempty"`

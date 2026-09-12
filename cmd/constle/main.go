@@ -94,11 +94,11 @@ func main() {
 		}
 
 	case "run":
-		agentfile, backendOverride, err := parseRunArgs(os.Args[2:])
+		opts, err := parseRunArgs(os.Args[2:])
 		if err != nil {
 			die("%v", err)
 		}
-		if err := cmdRun(agentfile, backendOverride); err != nil {
+		if err := cmdRun(opts); err != nil {
 			die("%v", err)
 		}
 
@@ -160,28 +160,108 @@ func main() {
 	}
 }
 
-// parseRunArgs extracts the Agentfile path and the optional --backend flag
-// from `constle run` arguments.
-func parseRunArgs(args []string) (agentfile, backendOverride string, err error) {
+// runUsage is the one-line usage string for `constle run`, repeated by every
+// argument error so the flags are always discoverable at the point of failure.
+const runUsage = "usage: constle run [--backend=docker|firecracker] " +
+	"[--accept-isolation=<level>] <agentfile.yaml>"
+
+// runOptions is the parsed form of `constle run` arguments.
+type runOptions struct {
+	// agentfile is the path to the Agentfile to run.
+	agentfile string
+
+	// backendOverride forces a sandbox engine (--backend). It selects an
+	// engine only — it never relaxes the manifest's isolation contract.
+	backendOverride string
+
+	// acceptIsolation is the operator's explicit acknowledgement
+	// (--accept-isolation=<level>) that this run may proceed with a weaker
+	// boundary than the Agentfile declares. Empty means no downgrade is
+	// permitted and an unsatisfiable contract aborts the run.
+	acceptIsolation manifest.IsolationLevel
+}
+
+// parseRunArgs extracts the Agentfile path and the optional flags from
+// `constle run` arguments.
+//
+// --accept-isolation is validated here rather than at selection time: a typo
+// in the level must never be read as "some downgrade was requested", because
+// that is the one input that can weaken a declared boundary.
+func parseRunArgs(args []string) (runOptions, error) {
+	var opts runOptions
+
 	for _, arg := range args {
 		switch {
 		case strings.HasPrefix(arg, "--backend="):
-			backendOverride = strings.TrimPrefix(arg, "--backend=")
+			opts.backendOverride = strings.TrimPrefix(arg, "--backend=")
+		case strings.HasPrefix(arg, "--accept-isolation="):
+			level, err := manifest.ParseIsolationLevel(strings.TrimPrefix(arg, "--accept-isolation="))
+			if err != nil {
+				return runOptions{}, fmt.Errorf("--accept-isolation: %w", err)
+			}
+			opts.acceptIsolation = level
 		case strings.HasPrefix(arg, "-"):
-			return "", "", fmt.Errorf("unknown flag %q\nusage: constle run [--backend=docker|firecracker] <agentfile.yaml>", arg)
-		case agentfile == "":
-			agentfile = arg
+			return runOptions{}, fmt.Errorf("unknown flag %q\n%s", arg, runUsage)
+		case opts.agentfile == "":
+			opts.agentfile = arg
 		default:
-			return "", "", fmt.Errorf("unexpected argument %q", arg)
+			return runOptions{}, fmt.Errorf("unexpected argument %q", arg)
 		}
 	}
-	if agentfile == "" {
-		return "", "", fmt.Errorf("usage: constle run [--backend=docker|firecracker] <agentfile.yaml>")
+	if opts.agentfile == "" {
+		return runOptions{}, fmt.Errorf("%s", runUsage)
 	}
-	return agentfile, backendOverride, nil
+	return opts, nil
 }
 
-func cmdRun(agentfilePath, backendOverride string) error {
+// achievedLabel renders the boundary a run actually got, naming the requested
+// level alongside it when the two differ. A bare "network" on a run whose
+// manifest asked for "kernel" would be true and still misleading — the point
+// of the contract is that the gap stays visible wherever the level is shown.
+func achievedLabel(sel *sandbox.Selection) string {
+	if sel.Downgraded {
+		return fmt.Sprintf("%s (requested %s, downgrade accepted)", sel.Achieved, sel.Requested)
+	}
+	return string(sel.Achieved)
+}
+
+// isolationOrigin says where the manifest's isolation level came from, for
+// the one-word qualifier the validate output carries beside it.
+//
+// It used to be hardcoded to "inferred from capabilities", which was wrong
+// whenever the Agentfile declared a level — and actively misleading for a
+// malformed one, since it credited the runtime with a choice the operator had
+// actually written by hand. Validate now rejects a malformed level outright,
+// but the label stays honest either way.
+func isolationOrigin(m *manifest.AgentManifest) string {
+	if m.Sandbox.IsolationInferred {
+		return "inferred from capabilities"
+	}
+	return "declared in the Agentfile"
+}
+
+// runStartedDetails builds the details map for the run_started audit event.
+//
+// The entry's isolation_level records what the Agentfile REQUIRED;
+// isolation_achieved records what the sandbox actually delivers. They are
+// separate fields because they can legitimately differ — but only via an
+// explicit operator downgrade, which the entry then names outright. A reader
+// of the log can therefore never mistake a requested boundary for an
+// enforced one.
+func runStartedDetails(m *manifest.AgentManifest, sel *sandbox.Selection) map[string]any {
+	details := map[string]any{
+		"backend":            string(sel.Type),
+		"image":              m.Sandbox.Image,
+		"isolation_achieved": string(sel.Achieved),
+	}
+	if sel.Downgraded {
+		details["isolation_downgrade_accepted"] = true
+	}
+	return details
+}
+
+func cmdRun(opts runOptions) error {
+	agentfilePath := opts.agentfile
 	printHeader()
 
 	// Parsing is transient in styled mode: a self-clearing spinner that leaves
@@ -230,11 +310,14 @@ func cmdRun(agentfilePath, backendOverride string) error {
 
 	setup.step("detecting backend")
 
-	backend, backendType, err := sandbox.DetectBestBackend(m.Sandbox.Isolation, backendOverride)
+	sel, err := sandbox.DetectBestBackend(m.Sandbox.Isolation, opts.backendOverride, opts.acceptIsolation)
 	if err != nil {
 		return err
 	}
-	setup.ok("backend: %s", backendType)
+	backend, backendType := sel.Backend, sel.Type
+	// The backend name alone does not say what boundary the run got, so the
+	// achieved isolation rides with it.
+	setup.ok("backend: %s  ∙  isolation %s", backendType, achievedLabel(sel))
 	setup.gap()
 
 	logPath, err := audit.DefaultLogPath(m.Identity.Name)
@@ -448,10 +531,7 @@ func cmdRun(agentfilePath, backendOverride string) error {
 		runCtx.RunID, m.Identity.Name,
 		audit.EventRunStarted,
 		string(m.Sandbox.Isolation),
-		map[string]any{
-			"backend": string(backendType),
-			"image":   m.Sandbox.Image,
-		},
+		runStartedDetails(m, sel),
 	); err != nil {
 		audit.WarnWriteFailure(audit.EventRunStarted, err)
 	}
@@ -461,8 +541,15 @@ func cmdRun(agentfilePath, backendOverride string) error {
 	// Full run_id on the persistent settled line — this is the live line during
 	// execution, exactly when a second terminal would need it for `constle stop`.
 	// The post-run footer keeps a short handle (correlation only).
+	//
+	// The achieved isolation rides on this line because in styled mode it is
+	// the ONLY permanent setup row: setup.ok folds into the collapsing line
+	// and is overwritten, so the boundary the run actually got would otherwise
+	// survive nowhere on screen. The plain path already prints it as its own
+	// permanent ✓ row, so its bytes stay untouched here.
 	setup.settle(
-		fmt.Sprintf("sandbox ready  ∙  %s  ∙  run %s", backendType, runCtx.RunID),
+		fmt.Sprintf("sandbox ready  ∙  %s  ∙  isolation %s  ∙  run %s",
+			backendType, achievedLabel(sel), runCtx.RunID),
 		"sandbox started (run_id: %s)", runCtx.RunID)
 
 	// The signed-identity note (styled) rides just under the settled setup line
@@ -776,9 +863,15 @@ func a2aNames(m *manifest.AgentManifest) []string {
 
 // printRunSummaryPlain is the non-TTY run-summary block. It reproduces the
 // exact bytes constle has always emitted — do not restyle this path.
+//
+// The one deliberate exception is the "(requested)" qualifier on the isolation
+// row: this block is printed before backend selection, so the level it shows
+// is what the Agentfile asked for, which is not necessarily what the run gets.
+// Leaving it unqualified let a bare "isolation: kernel" read as an achieved
+// boundary. The achieved level is reported separately once it is known.
 func printRunSummaryPlain(m *manifest.AgentManifest) {
 	printf("     agent:     %s v%s\n", m.Identity.Name, m.Identity.Version)
-	printf("     isolation: %s\n", m.Sandbox.Isolation)
+	printf("     isolation: %s (requested)\n", m.Sandbox.Isolation)
 	printf("     memory:    %dMB\n", m.Sandbox.MemoryMB)
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		printf("     network:   restricted → %s\n",
@@ -811,7 +904,7 @@ func renderRunSummary(m *manifest.AgentManifest) {
 	subjectLine(m.Identity.Name, m.Identity.Version)
 
 	rows := []kv{
-		{"isolation", stInk.Render(string(m.Sandbox.Isolation))},
+		{"isolation", stInk.Render(string(m.Sandbox.Isolation)) + stMuted.Render("  ∙  requested")},
 		{"memory", stInk.Render(fmt.Sprintf("%d MB", m.Sandbox.MemoryMB))},
 	}
 	// KNOWN GAP (stated rather than implied, as elsewhere): the "restricted"
@@ -884,7 +977,7 @@ func printValidatePlain(agentfilePath string, m *manifest.AgentManifest) {
 	if m.Identity.DID != "" {
 		printf("  did:         %s\n", m.Identity.DID)
 	}
-	printf("  isolation:   %s (inferred from capabilities)\n", m.Sandbox.Isolation)
+	printf("  isolation:   %s (%s)\n", m.Sandbox.Isolation, isolationOrigin(m))
 	printf("  image:       %s\n", m.Sandbox.Image)
 	printf("  memory:      %dMB\n", m.Sandbox.MemoryMB)
 
@@ -923,7 +1016,8 @@ func renderValidateStyled(agentfilePath string, m *manifest.AgentManifest) {
 		rows = append(rows, kv{"did", stInk.Render(m.Identity.DID)})
 	}
 	rows = append(rows,
-		kv{"isolation", stInk.Render(string(m.Sandbox.Isolation)) + stMuted.Render("  ∙  inferred")},
+		kv{"isolation", stInk.Render(string(m.Sandbox.Isolation)) +
+			stMuted.Render("  ∙  "+isolationOrigin(m))},
 		kv{"image", stInk.Render(m.Sandbox.Image)},
 		kv{"memory", stInk.Render(fmt.Sprintf("%d MB", m.Sandbox.MemoryMB))},
 	)
@@ -955,6 +1049,8 @@ usage:
   constle init                  create agent.yaml with sensible defaults
   constle run <agentfile>       run an agent in a sandbox
     --backend=<name>            force a backend: docker or firecracker
+    --accept-isolation=<level>  run at a weaker isolation level than the
+                                Agentfile declares (none|process|network)
   constle validate <agentfile>  check if an Agentfile is valid
   constle identity create <name>  create a cryptographic agent identity (did:key)
     --owner=<email>             bind the identity to an owner
