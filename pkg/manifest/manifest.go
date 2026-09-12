@@ -151,6 +151,11 @@ type Network struct {
 	Egress string `yaml:"egress"`
 
 	// AllowedHosts lists permitted destinations when Egress is "restricted".
+	// Each entry is a plain hostname — lowercase ASCII letters, digits,
+	// hyphens, and dots, optionally with a leading "." covering subdomains —
+	// and nothing else: entries are written verbatim into the per-run Squid
+	// allowlist, so Validate rejects anything the hostname grammar does not
+	// admit (see ValidateAllowedHost).
 	AllowedHosts []string `yaml:"allowed_hosts,omitempty"`
 }
 

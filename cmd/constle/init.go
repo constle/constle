@@ -74,6 +74,8 @@ sandbox:
     # Hosts the agent is allowed to reach.
     # Only meaningful when egress is "restricted".
     # Add exactly the domains your agent needs; everything else is blocked.
+    # Lowercase hostnames only — no scheme, port, or path; ".example.com"
+    # covers every subdomain.
     allowed_hosts:
       - api.openai.com   # replace or extend with the APIs your agent uses
 

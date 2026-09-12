@@ -116,6 +116,10 @@ func (m *AgentManifest) Validate() error {
 		}
 	}
 
+	if err := m.validateNetwork(); err != nil {
+		return err
+	}
+
 	if err := m.validateMCP(); err != nil {
 		return err
 	}
