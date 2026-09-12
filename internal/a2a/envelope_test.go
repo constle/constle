@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -134,6 +135,73 @@ func TestOpenRejectsMalformed(t *testing.T) {
 			_, err := Open(wire)
 			assertReject(t, err, ReasonMalformed)
 		})
+	}
+}
+
+// oversizedDeadline bounds how long the oversized-DID regression tests wait
+// for a verdict. It is a sanity bound, not a performance assertion: the
+// fixed code answers in well under a second even under -race, while the
+// unbounded decoder these tests guard against needs over an hour for a
+// body-cap-sized DID, so the value only has to be generous enough for a
+// slow, loaded CI runner.
+const oversizedDeadline = 30 * time.Second
+
+// oversizedFromEnvelope builds the largest envelope that fits under the
+// public listener's body cap, with every byte after the prefix of its "from"
+// a valid base58 digit: nothing but a length bound can stop the DID decoder
+// from walking all of it. The envelope is otherwise well-framed, so the
+// sender DID is the first thing Open examines.
+func oversizedFromEnvelope(t *testing.T, to string) []byte {
+	t.Helper()
+	wire, err := json.Marshal(Envelope{
+		From:      did.Prefix + strings.Repeat("z", maxBodyBytes-1024),
+		To:        to,
+		MsgID:     "1",
+		Timestamp: time.Now().UTC(),
+		Sig:       "aaaa",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if len(wire) > maxBodyBytes {
+		t.Fatalf("test bug: wire is %d bytes, over the %d-byte cap", len(wire), maxBodyBytes)
+	}
+	return wire
+}
+
+// TestOpenRejectsOversizedSenderDIDBeforeVerifying is the a2a-side
+// regression test for the unbounded DID decode: Open recovers the
+// verification key from "from" BEFORE it can check any signature, and the
+// base58 decoder behind it was quadratic in the string length. A peer that
+// sent a body-cap-sized "from" used to pin a host core for on the order of
+// an hour per request, unauthenticated. It must now be refused on length,
+// immediately, without the value being echoed into the rejection detail
+// (which is written to the audit log).
+func TestOpenRejectsOversizedSenderDIDBeforeVerifying(t *testing.T) {
+	wire := oversizedFromEnvelope(t, newTestSigner(t, 2).DID())
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Open(wire)
+		done <- err
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(oversizedDeadline):
+		t.Fatalf("Open did not reject a %d-byte envelope within %s — the sender DID is decoded without a length bound", len(wire), oversizedDeadline)
+	}
+
+	assertReject(t, err, ReasonMalformed)
+	re, ok := err.(*RejectError)
+	if !ok {
+		t.Fatalf("expected *RejectError, got %T", err)
+	}
+	if len(re.Detail) > 256 {
+		t.Fatalf("rejection detail is %d bytes — it echoes the oversized DID: %.80s...", len(re.Detail), re.Detail)
+	}
+	if !strings.Contains(re.Detail, "sender DID") {
+		t.Fatalf("rejection detail %q does not attribute the failure to the sender DID", re.Detail)
 	}
 }
 

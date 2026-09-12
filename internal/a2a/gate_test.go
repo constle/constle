@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/constle/constle/pkg/manifest"
 )
@@ -194,6 +195,61 @@ func TestGateRejectsResponseFromWrongIdentity(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "rejected") {
 		t.Errorf("error text does not say the response was rejected: %s", body)
+	}
+}
+
+// TestGateRejectsOversizedResponseDIDBeforeVerifying covers the OUTBOUND
+// half of the unbounded-DID regression: a declared peer's HTTP 200 response
+// is read under the same body cap and Opened the same way, so its "from" was
+// decoded before its signature could be checked. A peer (or, over plain
+// http://, anyone on the path) answering with a body-cap-sized "from" used
+// to pin this side's host core; it must now be a prompt 502 whose body
+// reports the length, not the value.
+func TestGateRejectsOversizedResponseDIDBeforeVerifying(t *testing.T) {
+	alice := newTestSigner(t, 1)
+	bob := newTestSigner(t, 2)
+
+	peer := &stubPeer{t: t, signer: bob, respond: func(req *Envelope) []byte {
+		return oversizedFromEnvelope(t, req.From)
+	}}
+	srv := httptest.NewServer(peer.handler())
+	defer srv.Close()
+
+	_, base := newBoundGate(t, alice, bob, srv.URL)
+
+	type result struct {
+		code int
+		body string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := http.Post(base+"/send/bob", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		done <- result{code: resp.StatusCode, body: string(body)}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("POST: %v", res.err)
+		}
+		if res.code != http.StatusBadGateway {
+			t.Fatalf("oversized response DID = HTTP %d (%.120s), want 502", res.code, res.body)
+		}
+		if !strings.Contains(res.body, "rejected") {
+			t.Errorf("error text does not say the response was rejected: %.120s", res.body)
+		}
+		if len(res.body) > 512 {
+			t.Fatalf("sandbox-facing error is %d bytes — it echoes the oversized DID: %.120s...", len(res.body), res.body)
+		}
+	case <-time.After(oversizedDeadline):
+		t.Fatalf("no verdict within %s — the peer's response DID is decoded without a length bound", oversizedDeadline)
 	}
 }
 
