@@ -302,7 +302,14 @@ sandbox:
 The isolation level this agent requires. When omitted, the runtime infers the
 minimum sufficient level from `capabilities` (§7) and always picks the
 strongest level any declared capability requires. `constle validate` prints the
-level it resolved.
+level it resolved and whether it was declared or inferred.
+
+A value outside the four listed above is a **validation error**, not an
+unknown level to be worked around. Matching is exact, so `kernal`, `Kernel`
+and `" kernel "` are all rejected. Nothing tries to guess which level was
+meant: an unrecognized level would otherwise rank below every real one and be
+satisfied by the weakest backend on the host — a typo silently converting a
+kernel requirement into no requirement at all.
 
 | Level | What it provides | Use when |
 |-------|-----------------|----------|
@@ -311,11 +318,40 @@ level it resolved.
 | `network` | Network and process isolation | Agent makes outbound calls |
 | `kernel` | Hardware-level isolation via a Firecracker microVM | Agent can move money, delete data, or spawn sub-agents |
 
-The runtime selects the strongest **available** backend that satisfies the
-requirement. When the required level cannot be provided on this machine —
-Firecracker requires KVM and root — the runtime says so explicitly rather than
-silently downgrading, because a silent downgrade is precisely a protection that
-looks real when it isn't.
+A declared level is a **minimum contract, not a preference**. The runtime
+selects a backend that provides at least that level and **refuses to run**
+when it cannot — a silent downgrade is precisely a protection that looks real
+when it isn't.
+
+Each backend provides a fixed level, whatever the manifest asks for:
+
+| Backend | Provides |
+|---------|----------|
+| Docker | `network` — separate process and network namespaces, shared host kernel |
+| Firecracker | `kernel` — a guest kernel behind KVM |
+
+So `isolation: kernel` selects Firecracker, and when Firecracker is unusable
+on this machine (it requires KVM and root) the run aborts with the reason and
+the setup step, instead of continuing on Docker. `--backend=docker` chooses an
+engine; it does not relax the contract, and is refused the same way.
+
+The one way to proceed with a weaker boundary is for an operator to name it:
+
+```
+constle run --accept-isolation=network agent.yaml
+```
+
+The level must be strictly weaker than the declared minimum, and the selected
+backend must still provide at least the accepted level. The run then prints an
+`ISOLATION DOWNGRADE ACCEPTED` notice carrying both levels, and its
+`run_started` audit entry records the requested level in `isolation_level`,
+the delivered one in `details.isolation_achieved`, and
+`details.isolation_downgrade_accepted: true`. Requested and achieved isolation
+are never collapsed into a single field.
+
+The same separation holds in the CLI: the run summary labels the manifest
+level `requested`, and the settled sandbox line carries the isolation actually
+achieved, naming the requested level beside it whenever the two differ.
 
 ### 6.2 `sandbox.image`
 

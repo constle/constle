@@ -143,3 +143,22 @@ const (
 	BackendFirecracker BackendType = "firecracker"
 	BackendWasm        BackendType = "wasm"
 )
+
+// Provides returns the isolation level this backend actually delivers — the
+// *achieved* boundary, as opposed to the level an Agentfile requested.
+//
+// Docker separates the process and the network but shares the host kernel, so
+// it tops out at IsolationNetwork no matter what the manifest asked for.
+// Firecracker runs a real guest kernel behind KVM and provides the full set.
+// Any backend not listed here is treated as providing nothing, so an
+// unimplemented backend can never be mistaken for a satisfied contract.
+func (b BackendType) Provides() manifest.IsolationLevel {
+	switch b {
+	case BackendFirecracker:
+		return manifest.IsolationKernel
+	case BackendDocker:
+		return manifest.IsolationNetwork
+	default:
+		return manifest.IsolationNone
+	}
+}

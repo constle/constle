@@ -32,9 +32,12 @@ func Parse(data []byte) (*AgentManifest, error) {
 		return nil, fmt.Errorf("invalid YAML in Agentfile: %w", err)
 	}
 
-	// If isolation is not set explicitly, infer it from the declared capabilities.
+	// If isolation is not set explicitly, infer it from the declared
+	// capabilities. An explicitly written level is left exactly as authored —
+	// including a malformed one, which Validate rejects rather than repairing.
 	if m.Sandbox.Isolation == "" {
 		m.Sandbox.Isolation = InferIsolation(m.Capabilities)
+		m.Sandbox.IsolationInferred = true
 	}
 
 	if m.Sandbox.MemoryMB == 0 {
@@ -82,6 +85,24 @@ func (m *AgentManifest) Validate() error {
 	if m.Identity.DID != "" {
 		if err := did.Validate(m.Identity.DID); err != nil {
 			return fmt.Errorf("identity.did: %w", err)
+		}
+	}
+
+	// A malformed isolation level fails closed here rather than ranking as
+	// "none" downstream and quietly selecting the weakest backend on the
+	// host. `isolation: kernal` must be a rejected Agentfile, not a kernel
+	// requirement silently served by Docker.
+	//
+	// Empty is exempt because it is the pre-inference state, not a level:
+	// Parse fills it from Capabilities, so no parsed manifest reaches here
+	// empty, and a manifest built directly in Go may legitimately be
+	// validated for its policy content before a level is resolved. Nothing
+	// rests on that exemption — IsolationLevel.Satisfies fails closed on an
+	// invalid operand, so an unresolved level cannot satisfy a backend
+	// comparison either.
+	if m.Sandbox.Isolation != "" {
+		if _, err := ParseIsolationLevel(string(m.Sandbox.Isolation)); err != nil {
+			return fmt.Errorf("sandbox.isolation: %w", err)
 		}
 	}
 
