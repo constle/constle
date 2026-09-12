@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -44,13 +43,13 @@ import (
 // real home; resolves through sudo like the spending ledger, because a
 // Firecracker (sudo) run and a Docker run of the same identity must share
 // one seen set.
-var replayStateRoot = func() string {
-	return filepath.Join(homedir.InvokingUserHome(), ".constle", "a2a", "replay")
+var replayStateRoot = func() homedir.Location {
+	return homedir.Under(homedir.InvokingUserHome(), ".constle", "a2a", "replay")
 }
 
 // replayStore persists accepted msg_ids for one receiving identity.
 type replayStore struct {
-	dir string
+	dir homedir.Location
 }
 
 // replayRecord is one accepted envelope. The timestamp is forensic —
@@ -61,11 +60,12 @@ type replayRecord struct {
 }
 
 // openReplayStore opens (creating if needed) the replay directory for one
-// identity. Directories go through homedir.MkdirAllOwned so a sudo run
-// never leaves root-owned state in the invoking user's home.
+// identity. Directories go through homedir's MkdirAllOwned so a sudo run
+// never leaves root-owned state in the invoking user's home — and never
+// follows a symbolic link the user planted on the way there.
 func openReplayStore(did string) (*replayStore, error) {
-	dir := filepath.Join(replayStateRoot(), sanitizeDID(did))
-	if err := homedir.MkdirAllOwned(dir, 0755); err != nil {
+	dir := replayStateRoot().Join(sanitizeDID(did))
+	if err := dir.MkdirAllOwned(0755); err != nil {
 		return nil, fmt.Errorf("cannot create a2a replay state directory: %w", err)
 	}
 	return &replayStore{dir: dir}, nil
@@ -89,8 +89,8 @@ func sanitizeDID(did string) string {
 // bucketHourFormat names bucket files by the UTC hour of acceptance.
 const bucketHourFormat = "2006-01-02T15"
 
-func (s *replayStore) bucketPath(t time.Time) string {
-	return filepath.Join(s.dir, t.UTC().Format(bucketHourFormat)+".jsonl")
+func (s *replayStore) bucket(t time.Time) homedir.Location {
+	return s.dir.Join(t.UTC().Format(bucketHourFormat) + ".jsonl")
 }
 
 // checkAndRecord reports whether msgID was already accepted and, if not,
@@ -99,24 +99,23 @@ func (s *replayStore) bucketPath(t time.Time) string {
 // lock file is separate from the buckets because a lookup spans two bucket
 // files and the append may create a third; one lock covers them all.)
 func (s *replayStore) checkAndRecord(msgID string, now time.Time) (dup bool, err error) {
-	lockPath := filepath.Join(s.dir, "lock")
-	lf, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	// Opened through homedir: no symbolic link on the way is followed, and
+	// a lock file created by a sudo run is handed to the invoking user on
+	// the descriptor.
+	lf, err := s.dir.Join("lock").OpenFileOwned(os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return false, fmt.Errorf("cannot open a2a replay lock: %w", err)
 	}
 	// The handle exists only to carry the lock — closing releases it (and
 	// is also the unlock backstop), and there is no written data to lose.
 	defer func() { _ = lf.Close() }()
-	if err := homedir.ChownToInvokingUser(lockPath); err != nil {
-		return false, fmt.Errorf("cannot restore a2a replay lock ownership: %w", err)
-	}
 	if err := filelock.Exclusive(lf); err != nil {
 		return false, fmt.Errorf("cannot lock a2a replay state: %w", err)
 	}
 	defer func() { _ = filelock.Unlock(lf) }()
 
-	for _, path := range []string{s.bucketPath(now), s.bucketPath(now.Add(-time.Hour))} {
-		found, err := bucketContains(path, msgID)
+	for _, bucket := range []homedir.Location{s.bucket(now), s.bucket(now.Add(-time.Hour))} {
+		found, err := bucketContains(bucket, msgID)
 		if err != nil {
 			return false, err
 		}
@@ -138,8 +137,8 @@ func (s *replayStore) checkAndRecord(msgID string, now time.Time) (dup bool, err
 // never delivered — losing it re-admits at most that one undelivered
 // envelope, whereas failing closed here would reject ALL inbound A2A until
 // someone deletes the file by hand.
-func bucketContains(path, msgID string) (bool, error) {
-	f, err := os.Open(path)
+func bucketContains(bucket homedir.Location, msgID string) (bool, error) {
+	f, err := bucket.OpenFile(os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -161,7 +160,7 @@ func bucketContains(path, msgID string) (bool, error) {
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return false, fmt.Errorf("cannot read a2a replay bucket %s: %w", path, err)
+		return false, fmt.Errorf("cannot read a2a replay bucket %s: %w", bucket, err)
 	}
 	return false, nil
 }
@@ -171,8 +170,9 @@ func bucketContains(path, msgID string) (bool, error) {
 // a replay the next run would accept, so a deferred write failure must not
 // pass silently.
 func (s *replayStore) append(msgID string, now time.Time) (err error) {
-	path := s.bucketPath(now)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// As for the lock: opened without following any symbolic link, and
+	// handed to the invoking user on the descriptor.
+	f, err := s.bucket(now).OpenFileOwned(os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return fmt.Errorf("cannot open a2a replay bucket: %w", err)
 	}
@@ -181,9 +181,6 @@ func (s *replayStore) append(msgID string, now time.Time) (err error) {
 			err = fmt.Errorf("cannot flush a2a replay bucket: %w", cerr)
 		}
 	}()
-	if err := homedir.ChownToInvokingUser(path); err != nil {
-		return fmt.Errorf("cannot restore a2a replay bucket ownership: %w", err)
-	}
 
 	line, err := json.Marshal(replayRecord{TS: now.UTC(), MsgID: msgID})
 	if err != nil {
@@ -202,7 +199,9 @@ func (s *replayStore) append(msgID string, now time.Time) (err error) {
 // causes a false rejection — msg_ids are random, and a genuine replay of
 // its era is already stopped by the timestamp window.
 func (s *replayStore) pruneExpired(now time.Time) {
-	entries, err := os.ReadDir(s.dir)
+	// Listed and removed through homedir too: root must not unlink through
+	// a symbolic link the user swapped in, either.
+	entries, err := s.dir.ReadDir()
 	if err != nil {
 		return
 	}
@@ -218,7 +217,7 @@ func (s *replayStore) pruneExpired(now time.Time) {
 		// Bucket names sort chronologically, so a string compare against
 		// the cutoff's name is a time compare.
 		if name < cutoff {
-			_ = os.Remove(filepath.Join(s.dir, e.Name()))
+			_ = s.dir.Join(e.Name()).Remove()
 		}
 	}
 }

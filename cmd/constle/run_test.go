@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/homedir"
 	"github.com/constle/constle/internal/sandbox"
 	"github.com/constle/constle/pkg/manifest"
 )
@@ -293,8 +294,9 @@ sandbox:
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-			logger, err := audit.New(logPath)
+			logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+			logPath := logLoc.String()
+			logger, err := audit.New(logLoc)
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}

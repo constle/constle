@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -132,55 +133,56 @@ type Logger struct {
 	writeErr error
 }
 
-// New creates a Logger that writes to path, creating the directory if needed.
+// New creates a Logger that writes to loc, creating the directory if needed.
 // Entries are written unsigned; use NewSigned when the agent has an identity.
 //
-// Under sudo (required by the Firecracker backend) the log directory and
-// file are handed back to the invoking user, so a sudo run never blocks a
-// later non-sudo run from writing the same agent's log.
-func New(path string) (*Logger, error) {
-	dir := filepath.Dir(path)
-	if err := homedir.MkdirAllOwned(dir, 0755); err != nil {
+// Under sudo (required by the Firecracker backend) the log directory —
+// every level of it — and a log file this call creates are handed back to
+// the invoking user, so a sudo run never blocks a later non-sudo run from
+// writing the same agent's log; a log file that already exists keeps its
+// owner (see homedir.Location.OpenFileOwned for why). The log lives in a
+// tree that user controls, so loc's relative path is opened without ever
+// following a symbolic link and ownership is transferred on the descriptor
+// — a link planted at the log path (or at ~/.constle/logs itself) is refused
+// rather than followed to wherever it points.
+func New(loc homedir.Location) (*Logger, error) {
+	// Every level of the log directory is created or, when left root-owned
+	// by a run that predates ownership restoration, healed here. The file
+	// itself is handed over only when this run creates it.
+	if err := loc.Dir().MkdirAllOwned(0755); err != nil {
 		return nil, fmt.Errorf("cannot create log directory: %w", err)
 	}
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	// O_RDWR rather than O_WRONLY so NewSigned can resume the hash chain
+	// from this same descriptor instead of re-opening by pathname.
+	f, err := loc.OpenFileOwned(os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open log file %q: %w", path, err)
+		return nil, fmt.Errorf("cannot open log file %q: %w", loc, err)
 	}
 
-	// Chown the directory too (not only created levels): it heals a dir left
-	// root-owned by runs that predate this ownership restoration.
-	if err := homedir.ChownToInvokingUser(dir, path); err != nil {
-		// Nothing was written yet, so a failed close of the file we are
-		// abandoning adds nothing to the ownership error being returned.
-		_ = f.Close()
-		return nil, fmt.Errorf("cannot restore log ownership to the invoking user: %w", err)
-	}
-
-	return &Logger{file: f, path: path}, nil
+	return &Logger{file: f, path: loc.String()}, nil
 }
 
 // NewSigned creates a Logger that signs and hash-chains every entry with the
 // given signer. When the file already has entries (earlier runs the same
 // day), the chain resumes from the hash of the last existing line, so one
 // file holds one continuous chain across runs.
-func NewSigned(path string, signer Signer) (*Logger, error) {
+func NewSigned(loc homedir.Location, signer Signer) (*Logger, error) {
 	if signer == nil {
 		return nil, fmt.Errorf("NewSigned requires a signer")
 	}
 
-	l, err := New(path)
+	l, err := New(loc)
 	if err != nil {
 		return nil, err
 	}
 
-	lastHash, err := lastLineHash(path)
+	lastHash, err := lastLineHash(l.file)
 	if err != nil {
 		// Same as in New: the logger is being abandoned unused, so only the
 		// chain-resume failure is worth reporting.
 		_ = l.file.Close()
-		return nil, fmt.Errorf("cannot resume hash chain from %q: %w", path, err)
+		return nil, fmt.Errorf("cannot resume hash chain from %q: %w", loc, err)
 	}
 
 	l.signer = signer
@@ -261,13 +263,16 @@ func (l *Logger) Err() error {
 }
 
 // lastLineHash returns the SHA-256 hex of the last non-empty line of the
-// file, or GenesisHash when the file is empty or absent.
-func lastLineHash(path string) (string, error) {
-	data, err := os.ReadFile(path)
+// open log file, or GenesisHash when the file is empty. It reads the
+// descriptor New already verified rather than re-opening by pathname, so
+// the chain can only ever resume from the file that is being appended to.
+// (Reading moves the offset, which O_APPEND ignores on write.)
+func lastLineHash(f *os.File) (string, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	data, err := io.ReadAll(f)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return GenesisHash, nil
-		}
 		return "", err
 	}
 
@@ -336,7 +341,7 @@ func (l *Logger) Path() string {
 	return l.path
 }
 
-// DefaultLogPath returns the default log file path for an agent.
+// DefaultLogLocation returns the default log file location for an agent.
 //
 // When constle runs under sudo (required by the Firecracker backend), the
 // log still goes to the invoking user's home so all runs of an agent land
@@ -345,11 +350,15 @@ func (l *Logger) Path() string {
 // The agent name becomes part of the filename, so the result is checked to
 // still be a direct child of ~/.constle/logs before it is returned: New()
 // creates — and, under sudo, chowns to the invoking user — whatever
-// directory the returned path names, so a name that relocated the path
+// directory the returned location names, so a name that relocated the path
 // would relocate that chown with it. Manifest validation rejects such names
 // first (identity.name in pkg/manifest); this is the second line of
 // defence for any caller holding an unvalidated name.
-func DefaultLogPath(agentName string) (string, error) {
+//
+// The location's trusted base is the home directory itself: everything
+// below it, .constle and logs included, is the user's to tamper with and is
+// verified by New.
+func DefaultLogLocation(agentName string) (homedir.Location, error) {
 	home := homedir.InvokingUserHome()
 	logsDir := filepath.Join(home, ".constle", "logs")
 	date := time.Now().UTC().Format("2006-01-02")
@@ -362,10 +371,10 @@ func DefaultLogPath(agentName string) (string, error) {
 	// both the escape and the quieter case of a nested subdirectory.
 	rel, err := filepath.Rel(logsDir, path)
 	if err != nil || rel != filename || strings.ContainsAny(rel, `/\`) {
-		return "", fmt.Errorf(
+		return homedir.Location{}, fmt.Errorf(
 			"invalid agent name %q: audit log path %q is not inside %s",
 			agentName, path, logsDir,
 		)
 	}
-	return path, nil
+	return homedir.Under(home, ".constle", "logs", filename), nil
 }

@@ -5,45 +5,25 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/constle/constle/internal/homedir/homedirtest"
 )
 
 // The spending ledger is written as root under sudo and then handed back to
 // the invoking user, so a symlink planted at the ledger path — or at any
 // directory on the way to it — must be refused, never followed.
 
-func plantVictim(t *testing.T) string {
-	t.Helper()
-	victim := filepath.Join(t.TempDir(), "victim")
-	if err := os.WriteFile(victim, []byte("do not touch\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	return victim
-}
-
-func assertUntouched(t *testing.T, victim string) {
-	t.Helper()
-	data, err := os.ReadFile(victim)
-	if err != nil {
-		t.Fatalf("victim vanished: %v", err)
-	}
-	if string(data) != "do not touch\n" {
-		t.Errorf("victim was written through the symlink: %q", data)
-	}
-}
-
 func TestAppendRefusesSymlinkedLedger(t *testing.T) {
-	victim := plantVictim(t)
+	victim := homedirtest.PlantVictim(t)
 	dir := t.TempDir()
 	today := filepath.Join(dir, time.Now().UTC().Format("2006-01-02")+".jsonl")
-	if err := os.Symlink(victim, today); err != nil {
-		t.Fatal(err)
-	}
+	homedirtest.Symlink(t, victim, today)
 
 	s := StoreAt(dir)
 	if _, err := s.Append("run-1", "srv", 5); err == nil {
 		t.Errorf("Append followed the planted symlink at %q, want an error", today)
 	}
-	assertUntouched(t, victim)
+	homedirtest.AssertUntouched(t, victim)
 	if _, err := s.TodayTotal(); err == nil {
 		t.Errorf("TodayTotal read through the planted symlink at %q, want an error", today)
 	}
@@ -68,9 +48,7 @@ func TestOpenDailyStoreRefusesSymlinkedLedgerDir(t *testing.T) {
 			if err := os.MkdirAll(filepath.Dir(filepath.Join(home, link)), 0755); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.Symlink(elsewhere, filepath.Join(home, link)); err != nil {
-				t.Fatal(err)
-			}
+			homedirtest.Symlink(t, elsewhere, filepath.Join(home, link))
 
 			store, err := OpenDailyStore(did)
 			if err == nil {
