@@ -6,13 +6,13 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/homedir"
 	"github.com/constle/constle/internal/mcpgate"
 	"github.com/constle/constle/internal/spending"
 	"github.com/constle/constle/pkg/manifest"
@@ -122,8 +122,9 @@ func runSpendScenario(t *testing.T, backend SandboxBackend, m *manifest.AgentMan
 	limits spending.Limits, store *spending.DailyStore) (string, []audit.Entry) {
 	t.Helper()
 
-	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	logger, err := audit.New(logPath)
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logPath := logLoc.String()
+	logger, err := audit.New(logLoc)
 	if err != nil {
 		t.Fatalf("audit.New: %v", err)
 	}

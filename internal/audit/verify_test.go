@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/constle/constle/internal/homedir"
 	"github.com/constle/constle/pkg/did"
 )
 
@@ -40,9 +41,10 @@ func (s *testSigner) Sign(msg []byte) []byte { return ed25519.Sign(s.priv, msg) 
 // and returns its path.
 func writeSignedLog(t *testing.T, signer *testSigner, n int) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "signed.jsonl")
+	loc := homedir.Under(t.TempDir(), "signed.jsonl")
+	path := loc.String()
 
-	logger, err := NewSigned(path, signer)
+	logger, err := NewSigned(loc, signer)
 	if err != nil {
 		t.Fatalf("NewSigned() error: %v", err)
 	}
@@ -134,7 +136,7 @@ func TestVerifyChainResumesAcrossLoggerSessions(t *testing.T) {
 
 	// A second run the same day appends to the same file; the chain must
 	// continue from the last existing line, not restart at genesis.
-	logger, err := NewSigned(path, signer)
+	logger, err := NewSigned(homedir.Under(filepath.Dir(path), filepath.Base(path)), signer)
 	if err != nil {
 		t.Fatalf("NewSigned() reopen error: %v", err)
 	}
@@ -206,8 +208,9 @@ func TestVerifyDetectsDeletedFirstLine(t *testing.T) {
 }
 
 func TestVerifyRejectsUnsignedLog(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "unsigned.jsonl")
-	logger, err := New(path)
+	loc := homedir.Under(t.TempDir(), "unsigned.jsonl")
+	path := loc.String()
+	logger, err := New(loc)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}

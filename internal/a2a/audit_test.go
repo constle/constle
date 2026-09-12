@@ -10,12 +10,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/homedir"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -24,8 +24,9 @@ import (
 // not a fake.
 func newSignedLogger(t *testing.T, signer *testSigner) (*audit.Logger, string) {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "audit.jsonl")
-	l, err := audit.NewSigned(path, signer)
+	loc := homedir.Under(t.TempDir(), "audit.jsonl")
+	path := loc.String()
+	l, err := audit.NewSigned(loc, signer)
 	if err != nil {
 		t.Fatalf("NewSigned: %v", err)
 	}
