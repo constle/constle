@@ -459,24 +459,29 @@ func forwardedHostEnv() map[string]string {
 // proxyRunArgs builds the `docker run` argv for the Squid proxy. It is split
 // out from startProxyContainer so the labelling invariant cleanupAbandoned
 // depends on can be asserted by a unit test, with no Docker daemon involved.
-//
-// Labels are sorted so the argv is deterministic: Go randomises map iteration
-// order, which would otherwise make any assertion on this slice flaky.
+// Labels go through sortedKeys so the argv is deterministic.
 func proxyRunArgs(name, extNet, configPath string, labels map[string]string) []string {
 	args := []string{"run", "-d",
 		"--name", name,
 		"--network", extNet,
 		"-v", configPath + ":/etc/squid/squid.conf:ro",
 	}
-	keys := make([]string, 0, len(labels))
-	for k := range labels {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range sortedKeys(labels) {
 		args = append(args, "--label", k+"="+labels[k])
 	}
 	return append(args, "ubuntu/squid:latest")
+}
+
+// sortedKeys returns a map's keys in sorted order, so argv built from a map
+// is the same slice on every call. Go randomises map iteration, which would
+// otherwise make any assertion on such a slice flaky.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // startProxyContainer starts the Squid container on the external network and
@@ -534,7 +539,29 @@ func hasListenerOnPort(procNetTCP string, port int) bool {
 	return false
 }
 
-func startAgentContainer(name, intNet, image string, memoryMB int, command []string, labels map[string]string, envVars map[string]string) (string, error) {
+// agentRunArgs builds the `docker run` argv for the agent container. As with
+// proxyRunArgs, it is split out from the exec so a unit test can assert on
+// the argv with no daemon involved, and the map-derived options are sorted so
+// the slice is deterministic.
+//
+// The "--" before the image is a security boundary, not a nicety. The image
+// and command both come from the Agentfile, and docker run reads its argv
+// with ordinary option parsing: an image such as "-v" or "--privileged" is
+// taken as an option, and the command list then supplies that option's
+// operands and the real image. `image: "-v"` with `command: ["/:/host",
+// "alpine", "sh"]` became `docker run ... -v /:/host alpine sh` — a sandbox
+// with the host filesystem mounted inside it. "--" ends option parsing, so
+// whatever follows is read as IMAGE [COMMAND...] however it is spelled, and
+// docker then refuses "-v" as an invalid reference. manifest.Validate rejects
+// a dash-prefixed image as well, which gives the operator a clear error up
+// front; the separator is the guard that holds for a caller that never
+// validated.
+//
+// The command needs no check of its own: docker run stops reading options at
+// the first positional argument, the image, so command elements reach the
+// container verbatim — and they legitimately start with "-" when the image
+// has an ENTRYPOINT and the command is its arguments.
+func agentRunArgs(name, intNet, image string, memoryMB int, command []string, labels map[string]string, envVars map[string]string) []string {
 	if memoryMB == 0 {
 		memoryMB = 512
 	}
@@ -550,18 +577,20 @@ func startAgentContainer(name, intNet, image string, memoryMB int, command []str
 	}
 
 	// Caller-supplied env vars (e.g. ANTHROPIC_API_KEY forwarded from the host).
-	for k, v := range envVars {
-		args = append(args, "-e", k+"="+v)
+	for _, k := range sortedKeys(envVars) {
+		args = append(args, "-e", k+"="+envVars[k])
 	}
 
-	for k, v := range labels {
-		args = append(args, "--label", k+"="+v)
+	for _, k := range sortedKeys(labels) {
+		args = append(args, "--label", k+"="+labels[k])
 	}
 
-	args = append(args, image)
-	args = append(args, command...)
+	args = append(args, "--", image)
+	return append(args, command...)
+}
 
-	out, err := exec.Command("docker", args...).Output()
+func startAgentContainer(name, intNet, image string, memoryMB int, command []string, labels map[string]string, envVars map[string]string) (string, error) {
+	out, err := exec.Command("docker", agentRunArgs(name, intNet, image, memoryMB, command, labels, envVars)...).Output()
 	if err != nil {
 		return "", fmt.Errorf("docker run agent: %w", err)
 	}
