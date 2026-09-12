@@ -117,12 +117,18 @@ sandbox:
     # field that actually constrains the network. Everything not listed here
     # is refused. An entry starting with "." matches all subdomains.
     #
-    # Two entries are rejected at validate time rather than silently accepted:
+    # Entries must be plain hostnames (lowercase letters, digits, hyphens,
+    # dots, and an optional leading "."). They are written verbatim into the
+    # proxy config, so anything else is rejected at validate time rather than
+    # injected.
+    #
+    # Two further entries are rejected at validate time rather than silently
+    # accepted:
     #   - any host that also appears under mcp.servers[].url or
     #     a2a.peers[].endpoint — that would let the agent reach the server
     #     directly and bypass the gate proxy entirely;
-    #   - localhost / 127.0.0.1 / ::1 / host.docker.internal, when mcp or a2a
-    #     are declared — that would expose the gate transport and every other
+    #   - localhost / 127.0.0.1 / host.docker.internal, when mcp or a2a are
+    #     declared — that would expose the gate transport and every other
     #     host service to the sandbox.
     allowed_hosts:
       - "api.anthropic.com"
