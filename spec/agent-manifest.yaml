@@ -90,7 +90,9 @@ sandbox:
   #
   # isolation: network
 
-  # Container image to run.
+  # Container image to run. A value starting with "-" is a validation error:
+  # the Docker backend passes the image to `docker run` as a positional
+  # argument, and an option-shaped value would otherwise be read as an option.
   image: "python:3.11-slim"
 
   # Optional. Overrides the image CMD.
