@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/homedir"
 	"github.com/constle/constle/internal/spending"
 	"github.com/constle/constle/pkg/manifest"
 )
@@ -50,8 +50,9 @@ func newMeterHarness(t *testing.T, limits spending.Limits, store *spending.Daily
 	}))
 	t.Cleanup(up.Close)
 
-	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	logger, err := audit.New(logPath)
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logPath := logLoc.String()
+	logger, err := audit.New(logLoc)
 	if err != nil {
 		t.Fatalf("audit.New: %v", err)
 	}

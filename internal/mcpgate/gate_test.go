@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/homedir"
 	"github.com/constle/constle/pkg/did"
 	"github.com/constle/constle/pkg/manifest"
 )
@@ -67,8 +67,9 @@ func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness 
 	}))
 	t.Cleanup(up.Close)
 
-	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	logger, err := audit.New(logPath)
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logPath := logLoc.String()
+	logger, err := audit.New(logLoc)
 	if err != nil {
 		t.Fatalf("audit.New: %v", err)
 	}
@@ -574,8 +575,9 @@ func TestToolCallEventsPreserveSignedChain(t *testing.T) {
 	}))
 	t.Cleanup(up.Close)
 
-	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	logger, err := audit.NewSigned(logPath, signer)
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logPath := logLoc.String()
+	logger, err := audit.NewSigned(logLoc, signer)
 	if err != nil {
 		t.Fatalf("audit.NewSigned: %v", err)
 	}

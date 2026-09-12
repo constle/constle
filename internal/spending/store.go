@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -27,7 +26,7 @@ import (
 // behind internal/filelock's build-tagged files — never call a platform
 // syscall directly here.
 type DailyStore struct {
-	dir string
+	dir homedir.Location
 	did string
 }
 
@@ -39,32 +38,42 @@ type ledgerRecord struct {
 	MicroCents int64     `json:"microcents"`
 }
 
-// Root returns the base directory that holds all per-DID spending ledgers.
-// It resolves through sudo like the audit log: a Firecracker (sudo) run and
-// a Docker (non-sudo) run of the same agent must share one ledger.
+// root returns the location of the directory holding all per-DID spending
+// ledgers: ~/.constle/spending, with the home directory as the trusted base
+// and everything below it verified on every access (see homedir). It
+// resolves through sudo like the audit log: a Firecracker (sudo) run and a
+// Docker (non-sudo) run of the same agent must share one ledger.
+func root() homedir.Location {
+	return homedir.Under(homedir.InvokingUserHome(), ".constle", "spending")
+}
+
+// Root returns the path of the directory that holds all per-DID spending
+// ledgers, for display and for tests that inspect the layout.
 func Root() string {
-	return filepath.Join(homedir.InvokingUserHome(), ".constle", "spending")
+	return root().String()
 }
 
 // OpenDailyStore opens (creating if needed) the ledger directory for one
-// DID. Directories are created with homedir.MkdirAllOwned so a sudo run
-// never leaves root-owned state in the invoking user's home.
+// DID. Directories are created with homedir's MkdirAllOwned so a sudo run
+// never leaves root-owned state in the invoking user's home — and never
+// follows a symbolic link the user planted on the way there.
 func OpenDailyStore(did string) (*DailyStore, error) {
 	if did == "" {
 		return nil, fmt.Errorf("daily spending tracking requires the agent's DID")
 	}
-	dir := filepath.Join(Root(), sanitizeDID(did))
-	if err := homedir.MkdirAllOwned(dir, 0755); err != nil {
+	dir := root().Join(sanitizeDID(did))
+	if err := dir.MkdirAllOwned(0755); err != nil {
 		return nil, fmt.Errorf("cannot create spending ledger directory: %w", err)
 	}
 	return &DailyStore{dir: dir, did: did}, nil
 }
 
 // StoreAt returns a DailyStore rooted at an explicit directory, bypassing
-// the per-DID layout under Root(). Used by tests (a ledger outside the real
-// home) and usable by future tooling such as a spending report command.
+// the per-DID layout under Root(). The directory is trusted as-is (it is the
+// location's base). Used by tests (a ledger outside the real home) and
+// usable by future tooling such as a spending report command.
 func StoreAt(dir string) *DailyStore {
-	return &DailyStore{dir: dir, did: "explicit"}
+	return &DailyStore{dir: homedir.Under(dir), did: "explicit"}
 }
 
 // sanitizeDID maps a DID to a safe directory name (did:key:z6Mk… →
@@ -81,16 +90,16 @@ func sanitizeDID(did string) string {
 	}, did)
 }
 
-// dayPath returns the ledger file for the current UTC day. Computed per
+// dayFile returns the ledger file for the current UTC day. Computed per
 // call so a run that crosses UTC midnight charges into the new day's file.
-func (s *DailyStore) dayPath() string {
-	return filepath.Join(s.dir, time.Now().UTC().Format("2006-01-02")+".jsonl")
+func (s *DailyStore) dayFile() homedir.Location {
+	return s.dir.Join(time.Now().UTC().Format("2006-01-02") + ".jsonl")
 }
 
 // TodayTotal returns the accumulated spend already recorded for the
 // current UTC day, across every prior (and concurrent) run of this DID.
 func (s *DailyStore) TodayTotal() (MicroCents, error) {
-	f, err := os.OpenFile(s.dayPath(), os.O_RDONLY, 0)
+	f, err := s.dayFile().OpenFile(os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
@@ -118,9 +127,10 @@ func (s *DailyStore) Append(runID, serverID string, amount MicroCents) (dayTotal
 	if amount < 0 {
 		return 0, fmt.Errorf("negative charge %d", amount)
 	}
-	path := s.dayPath()
-
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	// Opened through homedir so no symbolic link on the way is followed,
+	// and a ledger this call creates is handed to the invoking user on the
+	// descriptor — as audit.New does for the log.
+	f, err := s.dayFile().OpenFileOwned(os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return 0, fmt.Errorf("cannot open spending ledger: %w", err)
 	}
@@ -136,12 +146,6 @@ func (s *DailyStore) Append(runID, serverID string, amount MicroCents) (dayTotal
 			dayTotal, err = 0, fmt.Errorf("cannot flush spending ledger: %w", cerr)
 		}
 	}()
-
-	// Hand a freshly created (or historically root-owned) ledger back to
-	// the invoking user — same healing behavior as audit.New.
-	if err := homedir.ChownToInvokingUser(path); err != nil {
-		return 0, fmt.Errorf("cannot restore spending ledger ownership: %w", err)
-	}
 
 	if err := filelock.Exclusive(f); err != nil {
 		return 0, fmt.Errorf("cannot lock spending ledger: %w", err)

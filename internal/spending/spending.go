@@ -52,8 +52,8 @@
 //     validation). Every append holds an exclusive flock and recomputes the
 //     day total from the file, so two concurrent runs of the same DID
 //     serialize their charges and enforce the shared cap correctly. All
-//     directories and files go through homedir.MkdirAllOwned /
-//     ChownToInvokingUser so a sudo (Firecracker) run never leaves
+//     directories and files go through homedir's MkdirAllOwned /
+//     OpenFileOwned so a sudo (Firecracker) run never leaves
 //     root-owned state in the invoking user's home.
 //
 //  5. EXACT ACCOUNTING — integer micro-cents (1 µ¢ = 1e-8 USD) in int64,

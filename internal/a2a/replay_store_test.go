@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/constle/constle/internal/homedir"
 )
 
 // TestMain points the durable replay store at a throwaway directory for the
@@ -15,7 +17,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	replayStateRoot = func() string { return dir }
+	replayStateRoot = func() homedir.Location { return homedir.Under(dir) }
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
@@ -100,11 +102,11 @@ func TestReplayStorePrunesExpiredBuckets(t *testing.T) {
 	}
 
 	now := time.Date(2026, 8, 30, 14, 0, 0, 0, time.UTC)
-	stale := store.bucketPath(now.Add(-3 * time.Hour))
+	stale := store.bucket(now.Add(-3 * time.Hour)).String()
 	if err := os.WriteFile(stale, []byte(`{"ts":"2026-08-30T11:00:00Z","msg_id":"old"}`+"\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	fresh := store.bucketPath(now.Add(-time.Hour))
+	fresh := store.bucket(now.Add(-time.Hour)).String()
 	if err := os.WriteFile(fresh, []byte(`{"ts":"2026-08-30T13:30:00Z","msg_id":"recent"}`+"\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +136,7 @@ func TestReplayStoreSkipsTornRecord(t *testing.T) {
 		t.Fatalf("first record: dup=%v err=%v", dup, err)
 	}
 	// Simulate the crash: a torn half-record at the end of the bucket.
-	f, err := os.OpenFile(store.bucketPath(now), os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(store.bucket(now).String(), os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +164,7 @@ func TestReplayGuardFailsClosedWhenStoreUnavailable(t *testing.T) {
 	if err := os.WriteFile(notADir, nil, 0644); err != nil {
 		t.Fatal(err)
 	}
-	guard := newReplayGuard(&replayStore{dir: filepath.Join(notADir, "x")})
+	guard := newReplayGuard(&replayStore{dir: homedir.Under(base, "not-a-dir", "x")})
 
 	alice := newTestSigner(t, 1)
 	wire, _, err := Seal(alice, newTestSigner(t, 2).DID(), "", []byte(`{"n":1}`))

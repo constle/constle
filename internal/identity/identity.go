@@ -19,8 +19,8 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -65,17 +65,25 @@ type metadata struct {
 // gatesWarnOut in cmd/constle).
 var rootOverride string
 
+// root returns the location of the directory that holds all agent
+// identities: ~/.constle/identities, with the home directory as the trusted
+// base and everything below it verified on every privileged access (see
+// homedir). A test override is trusted whole.
+func root() homedir.Location {
+	if rootOverride != "" {
+		return homedir.Under(rootOverride)
+	}
+	return homedir.Under(homedir.InvokingUserHome(), ".constle", "identities")
+}
+
 // Root returns the directory that holds all agent identities.
 func Root() string {
-	if rootOverride != "" {
-		return rootOverride
-	}
-	return filepath.Join(homedir.InvokingUserHome(), ".constle", "identities")
+	return root().String()
 }
 
 // Dir returns the storage directory for one agent's identity.
 func Dir(agentName string) string {
-	return filepath.Join(Root(), agentName)
+	return root().Join(agentName).String()
 }
 
 // DID returns the agent's did:key identifier.
@@ -94,8 +102,8 @@ func Create(agentName, owner string) (*Identity, error) {
 		return nil, err
 	}
 
-	dir := Dir(agentName)
-	if _, err := os.Stat(filepath.Join(dir, keyFileName)); err == nil {
+	dir := root().Join(agentName)
+	if _, err := os.Lstat(dir.Join(keyFileName).String()); err == nil {
 		return nil, fmt.Errorf("identity for agent %q already exists at %s", agentName, dir)
 	}
 
@@ -109,7 +117,11 @@ func Create(agentName, owner string) (*Identity, error) {
 		return nil, err
 	}
 
-	if err := homedir.MkdirAllOwned(dir, dirMode); err != nil {
+	// The directory (every level of it, under sudo) is created and handed
+	// to the invoking user here; the files below are handed over on their
+	// own descriptors. Nothing follows a symbolic link the user may have
+	// planted on the way.
+	if err := dir.MkdirAllOwned(dirMode); err != nil {
 		return nil, fmt.Errorf("cannot create identity directory: %w", err)
 	}
 
@@ -119,8 +131,7 @@ func Create(agentName, owner string) (*Identity, error) {
 	}
 	pemBytes := pem.EncodeToMemory(&pem.Block{Type: pemBlockType, Bytes: pkcs8})
 
-	keyPath := filepath.Join(dir, keyFileName)
-	if err := writeFileExclusive(keyPath, pemBytes, keyFileMode); err != nil {
+	if err := writeOwnedFile(dir.Join(keyFileName), os.O_CREATE|os.O_EXCL, pemBytes, keyFileMode); err != nil {
 		return nil, fmt.Errorf("cannot write private key: %w", err)
 	}
 
@@ -129,16 +140,8 @@ func Create(agentName, owner string) (*Identity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot marshal identity metadata: %w", err)
 	}
-	metaPath := filepath.Join(dir, metaFileName)
-	if err := os.WriteFile(metaPath, append(meta, '\n'), keyFileMode); err != nil {
+	if err := writeOwnedFile(dir.Join(metaFileName), os.O_CREATE|os.O_TRUNC, append(meta, '\n'), keyFileMode); err != nil {
 		return nil, fmt.Errorf("cannot write identity metadata: %w", err)
-	}
-
-	// Under sudo (the Firecracker backend requires it) the files above were
-	// created as root inside the invoking user's home. Hand them back, or
-	// the user's next non-sudo command finds an identity it cannot read.
-	if err := homedir.ChownToInvokingUser(dir, keyPath, metaPath); err != nil {
-		return nil, fmt.Errorf("cannot restore identity ownership to the invoking user: %w", err)
 	}
 
 	return &Identity{Name: agentName, Owner: owner, CreatedAt: now, did: didStr, priv: priv}, nil
@@ -158,17 +161,28 @@ func Load(agentName string) (*Identity, error) {
 		return nil, err
 	}
 
-	dir := Dir(agentName)
-	keyPath := filepath.Join(dir, keyFileName)
+	dir := root().Join(agentName)
+	keyLoc := dir.Join(keyFileName)
+	keyPath := keyLoc.String()
 
-	info, err := os.Stat(keyPath)
+	// Opened through homedir: under sudo this runs as root inside a tree the
+	// invoking user controls, so a link planted here to some other key must
+	// not be followed, and the mode is checked on the descriptor that is
+	// then read rather than on a pathname.
+	f, err := keyLoc.OpenFile(os.O_RDONLY, 0)
 	if os.IsNotExist(err) {
-		return nil, &NotFoundError{AgentName: agentName, Dir: dir}
+		return nil, &NotFoundError{AgentName: agentName, Dir: dir.String()}
 	}
+	if err != nil {
+		return nil, fmt.Errorf("cannot open private key %s: %w", keyPath, err)
+	}
+	// Read-only: closing cannot lose data.
+	defer func() { _ = f.Close() }()
+
+	info, err := f.Stat()
 	if err != nil {
 		return nil, fmt.Errorf("cannot stat private key %s: %w", keyPath, err)
 	}
-
 	if perm := info.Mode().Perm(); perm != keyFileMode {
 		return nil, fmt.Errorf(
 			"private key %s has mode %04o, want %04o — refusing to use a key readable by others; run: chmod 600 %s",
@@ -176,7 +190,7 @@ func Load(agentName string) (*Identity, error) {
 		)
 	}
 
-	pemBytes, err := os.ReadFile(keyPath)
+	pemBytes, err := io.ReadAll(f)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read private key %s: %w", keyPath, err)
 	}
@@ -202,7 +216,7 @@ func Load(agentName string) (*Identity, error) {
 
 	id := &Identity{Name: agentName, did: didStr, priv: priv}
 
-	metaBytes, err := os.ReadFile(filepath.Join(dir, metaFileName))
+	metaBytes, err := dir.Join(metaFileName).ReadFile()
 	if err != nil {
 		return nil, fmt.Errorf("cannot read identity metadata for agent %q: %w", agentName, err)
 	}
@@ -232,11 +246,15 @@ func (e *NotFoundError) Error() string {
 	return fmt.Sprintf("no local identity for agent %q (looked in %s)", e.AgentName, e.Dir)
 }
 
-// writeFileExclusive writes a new file with the given mode, failing if the
-// file already exists. O_EXCL plus an explicit mode guarantees the key never
-// exists with wider permissions, even transiently.
-func writeFileExclusive(path string, data []byte, mode os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+// writeOwnedFile writes data to loc, opened for writing with the given
+// creation flags and mode. With O_EXCL the file must not already exist —
+// that plus an explicit mode guarantees the key never exists with wider
+// permissions, even transiently. Under sudo (the Firecracker backend
+// requires it) the file is created as root inside the invoking user's home,
+// so it is handed back on its descriptor before anything is written, or the
+// user's next non-sudo command finds an identity it cannot read.
+func writeOwnedFile(loc homedir.Location, flag int, data []byte, mode os.FileMode) error {
+	f, err := loc.OpenFileOwned(os.O_WRONLY|flag, mode)
 	if err != nil {
 		return err
 	}

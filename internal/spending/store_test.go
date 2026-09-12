@@ -6,11 +6,13 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/constle/constle/internal/homedir"
 )
 
 func testStore(t *testing.T) *DailyStore {
 	t.Helper()
-	return &DailyStore{dir: t.TempDir(), did: "did:key:ztest"}
+	return &DailyStore{dir: homedir.Under(t.TempDir()), did: "did:key:ztest"}
 }
 
 func TestStoreAppendAndTotal(t *testing.T) {
@@ -49,7 +51,7 @@ func TestStoreFileIsPerUTCDay(t *testing.T) {
 	if _, err := s.Append("run1", "srv", 1); err != nil {
 		t.Fatal(err)
 	}
-	want := filepath.Join(s.dir, time.Now().UTC().Format("2006-01-02")+".jsonl")
+	want := filepath.Join(s.dir.String(), time.Now().UTC().Format("2006-01-02")+".jsonl")
 	if _, err := os.Stat(want); err != nil {
 		t.Errorf("expected ledger file %s: %v", want, err)
 	}
@@ -60,7 +62,7 @@ func TestStoreCorruptLedgerFailsClosed(t *testing.T) {
 	if _, err := s.Append("run1", "srv", 5); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(s.dayPath(), []byte("{not json\n"), 0644); err != nil {
+	if err := os.WriteFile(s.dayFile().String(), []byte("{not json\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.TodayTotal(); err == nil {
@@ -88,7 +90,7 @@ func TestStoreConcurrentHandles(t *testing.T) {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			s := &DailyStore{dir: dir, did: "did:key:ztest"}
+			s := &DailyStore{dir: homedir.Under(dir), did: "did:key:ztest"}
 			for i := 0; i < perWorker; i++ {
 				if _, err := s.Append("run", "srv", amount); err != nil {
 					errs <- err
@@ -103,7 +105,7 @@ func TestStoreConcurrentHandles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &DailyStore{dir: dir, did: "did:key:ztest"}
+	s := &DailyStore{dir: homedir.Under(dir), did: "did:key:ztest"}
 	total, err := s.TodayTotal()
 	if err != nil {
 		t.Fatal(err)

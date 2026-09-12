@@ -320,10 +320,11 @@ func cmdRun(opts runOptions) error {
 	setup.ok("backend: %s  ∙  isolation %s", backendType, achievedLabel(sel))
 	setup.gap()
 
-	logPath, err := audit.DefaultLogPath(m.Identity.Name)
+	logLoc, err := audit.DefaultLogLocation(m.Identity.Name)
 	if err != nil {
 		return err
 	}
+	logPath := logLoc.String()
 
 	// Fail closed on identity: when the Agentfile declares identity.did,
 	// every audit entry must be signed with the matching local key — running
@@ -343,7 +344,7 @@ func cmdRun(opts runOptions) error {
 		if err != nil {
 			return err
 		}
-		logger, err = audit.NewSigned(logPath, runIdentity)
+		logger, err = audit.NewSigned(logLoc, runIdentity)
 		if err != nil {
 			return fmt.Errorf("cannot open signed audit log: %w", err)
 		}
@@ -355,7 +356,7 @@ func cmdRun(opts runOptions) error {
 		}
 	} else {
 		var err error
-		logger, err = audit.New(logPath)
+		logger, err = audit.New(logLoc)
 		if err != nil {
 			return fmt.Errorf("cannot open audit log: %w", err)
 		}
@@ -418,7 +419,7 @@ func cmdRun(opts runOptions) error {
 			// nothing to verify, because no notify webhook URL resolved.
 			// Same principle as warnUnenforcedHumanGates — a declared
 			// protection must never look real when it isn't.
-			printf("⚠️  warning: human_gates.approver_pubkey is set but no notify "+
+			printf("⚠️  warning: human_gates.approver_pubkey is set but no notify " +
 				"webhook URL resolved — gated calls will only be decided at this terminal\n")
 		}
 

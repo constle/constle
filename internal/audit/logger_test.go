@@ -14,7 +14,7 @@ func TestLogWritesJSONL(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "test.jsonl")
 
-	logger, err := New(logPath)
+	logger, err := New(homedir.Under(dir, "test.jsonl"))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestLogCreatesDirectories(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "a", "b", "c", "test.jsonl")
 
-	logger, err := New(logPath)
+	logger, err := New(homedir.Under(dir, "a", "b", "c", "test.jsonl"))
 	if err != nil {
 		t.Fatalf("New() should create missing dirs, got error: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestLogWithIsolation(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "test.jsonl")
 
-	logger, _ := New(logPath)
+	logger, _ := New(homedir.Under(dir, "test.jsonl"))
 	defer func() { _ = logger.Close() }()
 
 	_ = logger.LogWithIsolation("run-456", "secure-agent", EventRunStarted, "kernel", nil)
@@ -110,10 +110,7 @@ func TestLogWithIsolation(t *testing.T) {
 // only way a caller learns the log is holed. It must report the FIRST failure
 // and keep reporting it, since that is the entry whose loss is unrecoverable.
 func TestErrRetainsFirstWriteFailure(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "test.jsonl")
-
-	logger, err := New(logPath)
+	logger, err := New(homedir.Under(t.TempDir(), "test.jsonl"))
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -149,12 +146,13 @@ func TestErrRetainsFirstWriteFailure(t *testing.T) {
 	}
 }
 
-func TestDefaultLogPath(t *testing.T) {
-	path, err := DefaultLogPath("my-agent")
+func TestDefaultLogLocation(t *testing.T) {
+	loc, err := DefaultLogLocation("my-agent")
 	if err != nil {
-		t.Fatalf("DefaultLogPath() error: %v", err)
+		t.Fatalf("DefaultLogLocation() error: %v", err)
 	}
 
+	path := loc.String()
 	if !strings.Contains(path, ".constle") {
 		t.Errorf("path %q should contain .constle", path)
 	}
@@ -164,13 +162,21 @@ func TestDefaultLogPath(t *testing.T) {
 	if !strings.Contains(path, "my-agent") {
 		t.Errorf("path %q should contain agent name", path)
 	}
+	// The home directory is the trusted base; .constle and logs are part of
+	// the verified relative path, since the user controls both.
+	if loc.Base != homedir.InvokingUserHome() {
+		t.Errorf("Base = %q, want the invoking user's home %q", loc.Base, homedir.InvokingUserHome())
+	}
+	if !strings.HasPrefix(loc.Rel, filepath.Join(".constle", "logs")+string(filepath.Separator)) {
+		t.Errorf("Rel = %q, want .constle/logs/<file>", loc.Rel)
+	}
 }
 
 // A name carrying path separators or dot-segments must not produce a path
 // outside ~/.constle/logs: New() creates that directory and, under sudo,
 // chowns it to the invoking user, so an escaped path hands the user
 // ownership of a directory it had no business touching.
-func TestDefaultLogPathRejectsEscapingNames(t *testing.T) {
+func TestDefaultLogLocationRejectsEscapingNames(t *testing.T) {
 	logsDir := filepath.Join(homedir.InvokingUserHome(), ".constle", "logs")
 
 	// Only separator-bearing names can relocate the path here: a name of "."
@@ -182,12 +188,12 @@ func TestDefaultLogPathRejectsEscapingNames(t *testing.T) {
 		"nested/agent",
 		`..\windows`,
 	} {
-		path, err := DefaultLogPath(name)
+		loc, err := DefaultLogLocation(name)
 		if err == nil {
-			t.Errorf("DefaultLogPath(%q) = %q, want an error — path escapes %s", name, path, logsDir)
+			t.Errorf("DefaultLogLocation(%q) = %q, want an error — path escapes %s", name, loc, logsDir)
 		}
-		if path != "" {
-			t.Errorf("DefaultLogPath(%q) returned path %q alongside its error, want \"\"", name, path)
+		if loc != (homedir.Location{}) {
+			t.Errorf("DefaultLogLocation(%q) returned %+v alongside its error, want the zero Location", name, loc)
 		}
 	}
 }

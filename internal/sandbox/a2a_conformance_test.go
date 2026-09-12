@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/constle/constle/internal/a2a"
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/homedir"
 	"github.com/constle/constle/pkg/did"
 	"github.com/constle/constle/pkg/manifest"
 )
@@ -136,8 +136,9 @@ func startA2AGate(t *testing.T, backend SandboxBackend, m *manifest.AgentManifes
 	signer a2a.Signer) (*RunContext, *a2a.Gate, string, func()) {
 	t.Helper()
 
-	logPath := filepath.Join(t.TempDir(), "audit.jsonl")
-	logger, err := audit.New(logPath)
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logPath := logLoc.String()
+	logger, err := audit.New(logLoc)
 	if err != nil {
 		t.Fatalf("audit.New: %v", err)
 	}
