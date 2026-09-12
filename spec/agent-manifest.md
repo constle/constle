@@ -368,6 +368,13 @@ Firecracker backend resolves it to a rootfs.
 can legitimately be validated for its policy content alone. A run without an
 image fails at the backend.
 
+`Validate()` does reject an image that starts with `-`. The Docker backend
+passes the image to `docker run` as its first positional argument, and a value
+spelled like an option (`-v`, `--privileged`) would otherwise be read as one,
+with `sandbox.command` supplying its operands. The backend also ends option
+parsing with `--` before the image, so this check is the early, named error
+rather than the only guard.
+
 ```yaml
 image: "python:3.11-slim"
 image: "ghcr.io/myorg/myagent:v1.2.0"
@@ -388,7 +395,9 @@ same.
 
 The command to run inside the sandbox, passed through as the container command.
 Exec form only — a list of arguments, not a shell string. There is no shell
-interpolation.
+interpolation. Elements may start with `-`: the command follows the image, past
+the point where `docker run` reads options, so they reach the container
+verbatim — as arguments to the image's `ENTRYPOINT`, for instance.
 
 ```yaml
 command: ["python", "/workspace/agent.py"]
@@ -1225,7 +1234,7 @@ private key is not available on this machine.
 | `identity.owner` | VALIDATED | Enforced as an equality check against the stored identity when both are set |
 | `identity.did` | **ENFORCED** | Signs and chains the audit log; run fails closed without the local key |
 | `sandbox.isolation` | **ENFORCED** | Inferred when absent; drives backend selection |
-| `sandbox.image` | **ENFORCED** | Pulled and run by the backend |
+| `sandbox.image` | **ENFORCED** | Pulled and run by the backend; a leading `-` is rejected at validate time |
 | `sandbox.command` | **ENFORCED** | Passed as the container command |
 | `sandbox.memory_mb` | **ENFORCED** | Container memory limit / microVM size |
 | `sandbox.disk_mb` | DECLARED | Parsed and defaulted; not applied |

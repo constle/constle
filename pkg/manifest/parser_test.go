@@ -329,6 +329,74 @@ func TestValidateIdentityNameRejectsPathTraversal(t *testing.T) {
 	}
 }
 
+// sandbox.image is the first positional argument of the Docker backend's
+// `docker run`, so a value spelled like an option — "-v", "--privileged" —
+// was parsed as one, with sandbox.command supplying its operands and the
+// real image: the host filesystem ended up mounted inside the sandbox. The
+// backend now ends option parsing with "--" before the image; this check is
+// the early refusal that names the field.
+func TestValidateSandboxImageRejectsOptionLikeValues(t *testing.T) {
+	base := func(image string) *AgentManifest {
+		return &AgentManifest{
+			APIVersion: "constle.dev/v1alpha1",
+			Kind:       "AgentManifest",
+			Identity:   Identity{Name: "argv-test"},
+			Sandbox:    Sandbox{Image: image},
+		}
+	}
+
+	for _, bad := range []string{"-v", "--privileged", "--network=host", "--", "-"} {
+		err := base(bad).Validate()
+		if err == nil {
+			t.Errorf("sandbox.image %q passed validation, want an error", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "sandbox.image") {
+			t.Errorf("sandbox.image %q: error %q does not name the offending field", bad, err)
+		}
+	}
+
+	// Real references, and the empty pre-choice state, still pass.
+	for _, good := range []string{
+		"",
+		"alpine:latest",
+		"python:3.11-slim",
+		"ghcr.io/myorg/agent:v1.2.0",
+		"localhost:5000/agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	} {
+		if err := base(good).Validate(); err != nil {
+			t.Errorf("sandbox.image %q failed validation: %v", good, err)
+		}
+	}
+
+	// sandbox.command is not subject to the check: its elements follow the
+	// image, past the point where docker run reads options, and they start
+	// with "-" legitimately when the image has an ENTRYPOINT.
+	withCmd := base("python:3.11-slim")
+	withCmd.Sandbox.Command = []string{"-c", "print('ok')"}
+	if err := withCmd.Validate(); err != nil {
+		t.Errorf("sandbox.command with a dash-prefixed element failed validation: %v", err)
+	}
+
+	// The same rejection must reach a manifest that arrives as YAML — the
+	// shape an attacker actually controls — since Parse does not validate.
+	doc := []byte(`apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity:
+  name: argv-test
+sandbox:
+  image: "-v"
+  command: ["/:/host", "alpine:latest", "sh"]
+`)
+	parsed, err := Parse(doc)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := parsed.Validate(); err == nil || !strings.Contains(err.Error(), "sandbox.image") {
+		t.Errorf("parsed Agentfile with image \"-v\" validated as %v, want a sandbox.image error", err)
+	}
+}
+
 func TestValidateIdentityDID(t *testing.T) {
 	base := func(did string) *AgentManifest {
 		return &AgentManifest{

@@ -106,6 +106,10 @@ func (m *AgentManifest) Validate() error {
 		}
 	}
 
+	if err := validateSandboxImage(m.Sandbox.Image); err != nil {
+		return err
+	}
+
 	for _, cap := range m.Capabilities {
 		if !isKnownCapability(cap) {
 			return fmt.Errorf("unknown capability %q — check the Constle docs for supported capabilities", cap)
@@ -151,6 +155,31 @@ func validateIdentityName(name string) error {
 	}
 	if strings.ContainsAny(name, "/\\") || name == "." || name == ".." || strings.HasPrefix(name, ".") {
 		return fmt.Errorf("identity.name %q is invalid: must not contain path separators or start with a dot", name)
+	}
+	return nil
+}
+
+// validateSandboxImage rejects an image reference that the Docker backend
+// would hand to `docker run` in the shape of an option. The image is the
+// first positional argument of that invocation, and an Agentfile value such
+// as "-v" or "--privileged" reads as a flag there, with sandbox.command
+// supplying its operands: `image: "-v"` plus `command: ["/:/host", "alpine",
+// "sh"]` mounts the host filesystem into the sandbox. The backend also ends
+// option parsing with "--" before the image (agentRunArgs in
+// internal/sandbox), so this check is the early refusal that names the
+// field rather than the only guard.
+//
+// Empty stays allowed for the same reason Validate exempts an empty
+// isolation level: a manifest may be validated for its policy content before
+// an image is chosen. No image reference legitimately starts with "-", so
+// nothing valid is refused.
+//
+// sandbox.command is deliberately not checked: its elements follow the
+// image, past the point where docker run reads options, and they start with
+// "-" legitimately when they are arguments to the image's ENTRYPOINT.
+func validateSandboxImage(image string) error {
+	if strings.HasPrefix(image, "-") {
+		return fmt.Errorf("sandbox.image %q is invalid: an image reference cannot start with \"-\"", image)
 	}
 	return nil
 }
