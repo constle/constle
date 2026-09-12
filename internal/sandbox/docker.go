@@ -1,7 +1,6 @@
 package sandbox
 
 import (
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -603,14 +602,6 @@ func dockerRun(args ...string) error {
 		return cmdError("docker "+strings.Join(args, " "), err, out)
 	}
 	return nil
-}
-
-func newRunID() (string, error) {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", b), nil
 }
 
 // cleanupAbandoned removes Docker resources left behind by constle runs that
