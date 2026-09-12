@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -122,6 +123,48 @@ func TestValidate(t *testing.T) {
 	}
 	if err := noName.Validate(); err == nil {
 		t.Error("expected error for missing name, got nil")
+	}
+}
+
+// identity.name is used unmodified as a path element — the identity
+// directory and the audit log filename — so a name carrying path separators
+// or dot-segments relocates that state outside ~/.constle, where constle
+// then creates and (under sudo) chowns it. The check must hold for every
+// manifest, not only the signed ones: identity.did is optional, and the
+// identity-loading path is the only other place the name is validated.
+func TestValidateIdentityNameRejectsPathTraversal(t *testing.T) {
+	base := func(name string) *AgentManifest {
+		return &AgentManifest{
+			APIVersion: "constle.dev/v1alpha1",
+			Kind:       "AgentManifest",
+			Identity:   Identity{Name: name},
+		}
+	}
+
+	for _, bad := range []string{
+		"../../../etc/passwd",
+		"../../../../etc/constle",
+		"nested/agent",
+		`..\windows\system32`,
+		"..",
+		".",
+		".hidden",
+	} {
+		err := base(bad).Validate()
+		if err == nil {
+			t.Errorf("identity.name %q passed validation, want an error", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "identity.name") {
+			t.Errorf("identity.name %q: error %q does not name the offending field", bad, err)
+		}
+	}
+
+	// Ordinary names still pass, with no identity.did declared.
+	for _, good := range []string{"my-agent", "agent.v2", "Agent_1"} {
+		if err := base(good).Validate(); err != nil {
+			t.Errorf("identity.name %q failed validation: %v", good, err)
+		}
 	}
 }
 

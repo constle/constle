@@ -53,7 +53,9 @@ func freshSpendIdentity(t *testing.T, tag string) (name, did string) {
 	t.Cleanup(func() {
 		_ = os.RemoveAll(filepath.Join(identity.Root(), name))
 		_ = os.RemoveAll(ledgerDirFor(did))
-		_ = os.Remove(audit.DefaultLogPath(name))
+		if logPath, err := audit.DefaultLogPath(name); err == nil {
+			_ = os.Remove(logPath)
+		}
 	})
 	return name, did
 }
@@ -241,7 +243,10 @@ sleep 1
 			// ---- The signed audit log carries the whole story and verifies:
 			// spending events are Ed25519-signed and hash-chained like every
 			// other event.
-			logPath := audit.DefaultLogPath(agentName)
+			logPath, err := audit.DefaultLogPath(agentName)
+			if err != nil {
+				t.Fatalf("default log path for %q: %v", agentName, err)
+			}
 			verifyOut, verifyErr := exec.Command(bin, "audit", "verify", "--did="+did, logPath).CombinedOutput()
 			if verifyErr != nil {
 				t.Errorf("[%s] audit verify failed: %v\n%s", name, verifyErr, verifyOut)
