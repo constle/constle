@@ -8,7 +8,10 @@ package main
 //   constle-int-{id}    constle-ext-{id}    (networks)
 //
 // Resource names are derived from the run_id by convention — the same
-// convention used in docker.go — so no Docker API query is needed.
+// convention used in docker.go — so no Docker API query is needed. The
+// run_id itself comes straight from the command line and is checked
+// against the shape the sandbox package mints — 16 lowercase hex
+// characters — before it is used for anything; see sandbox.ValidateRunID.
 //
 // The command is idempotent: "No such container/network" errors are
 // silently ignored, so calling it on a partially-cleaned run is safe.
@@ -23,6 +26,16 @@ import (
 )
 
 func cmdStop(runID string) error {
+	// Every resource stopped below is named after the ID — Docker
+	// containers and networks, the Firecracker TAP device and nftables
+	// table by concatenation, and the Firecracker state directory and
+	// chroot as path elements that are removed as root. filepath.Join
+	// cleans "../" segments silently, so an unchecked ID would name a
+	// directory anywhere on the host as the one to read state from and
+	// remove.
+	if err := sandbox.ValidateRunID(runID); err != nil {
+		return err
+	}
 	printf("\nconstle stop %s\n\n", runID)
 
 	// Firecracker-backed runs are recognized by their state directory and

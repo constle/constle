@@ -45,8 +45,6 @@ const (
 	constleVarDir = "/var/lib/constle"
 	fcKernelPath  = constleVarDir + "/firecracker/vmlinux"
 	fcImagesDir   = constleVarDir + "/firecracker/images"
-	fcRunsDir     = constleVarDir + "/runs"
-	fcJailDir     = constleVarDir + "/jail"
 
 	// fcUser is the unprivileged user jailer drops the VMM into.
 	// Created by scripts/setup-firecracker.
@@ -54,6 +52,14 @@ const (
 
 	// fcSquidPort is the proxy port on the per-run TAP gateway address.
 	fcSquidPort = 3128
+)
+
+// fcRunsDir holds the per-run state directories and fcJailDir the jailer
+// chroot base. They are variables only so tests can point them at a
+// temporary tree; nothing outside tests assigns them.
+var (
+	fcRunsDir = constleVarDir + "/runs"
+	fcJailDir = constleVarDir + "/jail"
 )
 
 // FirecrackerBackend implements SandboxBackend using Firecracker microVMs.
@@ -302,11 +308,10 @@ func (f *FirecrackerBackend) Kill(ctx *RunContext) error {
 // Stop force-terminates the VM if still running and removes all host
 // resources for this run: squid, TAP device, nftables table, chroot, state.
 func (f *FirecrackerBackend) Stop(ctx *RunContext) error {
-	errs := teardownFirecrackerRun(&fcRunState{
-		RunID:     ctx.RunID,
-		VMPid:     ctx.VMPid,
-		SquidPID:  ctx.SquidPID,
-		TAPDevice: ctx.TAPDevice,
+	errs := teardownFirecrackerRun(ctx.RunID, &fcRunState{
+		RunID:    ctx.RunID,
+		VMPid:    ctx.VMPid,
+		SquidPID: ctx.SquidPID,
 	})
 
 	// Reap the child if this process started it, so no zombie remains.
