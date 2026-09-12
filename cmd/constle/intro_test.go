@@ -428,6 +428,41 @@ func TestBootFinalFrameContainsFullLogoAndRuntimeStatus(t *testing.T) {
 	}
 }
 
+func TestBootScreenSequencesUseDefaultBackground(t *testing.T) {
+	tests := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{
+			name: "enter",
+			got:  bootScreenEnter,
+			want: "\x1b[?1049h\x1b[0m\x1b[49m\x1b[2J\x1b[H\x1b[?25l",
+		},
+		{
+			name: "resize clear",
+			got:  bootScreenClear,
+			want: "\x1b[0m\x1b[49m\x1b[2J\x1b[H",
+		},
+		{
+			name: "leave",
+			got:  bootScreenLeave,
+			want: "\x1b[0m\x1b[?1049l\x1b[0m",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.got != tt.want {
+				t.Errorf("sequence = %q, want %q", tt.got, tt.want)
+			}
+			if strings.Contains(tt.got, "\x1b[48;") {
+				t.Errorf("sequence contains an explicit background color: %q", tt.got)
+			}
+		})
+	}
+}
+
 func TestEncodeBootFrameUsesViewportDimensionsWithoutNewlines(t *testing.T) {
 	frame := newBootFrame(4, 2)
 	frame.put(0, 0, 'A', bootLavender, 1)
@@ -443,8 +478,11 @@ func TestEncodeBootFrameUsesViewportDimensionsWithoutNewlines(t *testing.T) {
 	if gotRows := strings.Count(got, "H"); gotRows != frame.height {
 		t.Errorf("encoded cursor rows = %d, want frame height %d", gotRows, frame.height)
 	}
-	if clears := strings.Count(got, "\x1b[K"); clears != frame.height {
-		t.Errorf("encoded line clears = %d, want frame height %d", clears, frame.height)
+	if clears := strings.Count(got, bootDefaultBackground+"\x1b[K"); clears != frame.height {
+		t.Errorf("default-background line clears = %d, want frame height %d", clears, frame.height)
+	}
+	if strings.Contains(got, "\x1b[48;") {
+		t.Errorf("encoded frame contains an explicit background color: %q", got)
 	}
 
 	firstRowAt := "\x1b[3;8H"
@@ -457,7 +495,7 @@ func TestEncodeBootFrameUsesViewportDimensionsWithoutNewlines(t *testing.T) {
 		t.Fatalf("encoded frame omits its second viewport row: %q", got)
 	}
 	visibleFirstRow := got[len(firstRowAt):second]
-	for _, control := range []string{"<lav>", "\x1b[39m", "\x1b[K"} {
+	for _, control := range []string{"<lav>", "\x1b[39m", bootDefaultBackground, "\x1b[K"} {
 		visibleFirstRow = strings.ReplaceAll(visibleFirstRow, control, "")
 	}
 	if visibleFirstRow != "A  D" {
