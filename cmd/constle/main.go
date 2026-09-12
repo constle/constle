@@ -81,12 +81,28 @@ func killAgent(backend sandbox.SandboxBackend, runCtx *sandbox.RunContext, reaso
 }
 
 func main() {
-	if len(os.Args) < 2 {
+	args, noAnimation := parseGlobalArgs(os.Args[1:])
+	if len(args) == 0 {
+		if shouldPlayBootAnimation(args, noAnimation) {
+			switch playBootAnimation(constleVersion) {
+			case bootAnimationComplete:
+				printPostIntroHelp()
+			case bootAnimationInterrupted:
+				os.Exit(130)
+			case bootAnimationTerminated:
+				os.Exit(143)
+			default:
+				// The intro is decorative: a resize or write failure must never
+				// prevent the CLI's real help from being available.
+				printHelp()
+			}
+			return
+		}
 		printHelp()
-		os.Exit(0)
+		return
 	}
 
-	switch os.Args[1] {
+	switch args[0] {
 
 	case "init":
 		if err := cmdInit(); err != nil {
@@ -94,7 +110,7 @@ func main() {
 		}
 
 	case "run":
-		opts, err := parseRunArgs(os.Args[2:])
+		opts, err := parseRunArgs(args[1:])
 		if err != nil {
 			die("%v", err)
 		}
@@ -103,20 +119,20 @@ func main() {
 		}
 
 	case "validate":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			die("usage: constle validate <agentfile.yaml>")
 		}
-		if err := cmdValidate(os.Args[2]); err != nil {
+		if err := cmdValidate(args[1]); err != nil {
 			die("%v", err)
 		}
 
 	case "identity":
-		if err := cmdIdentity(os.Args[2:]); err != nil {
+		if err := cmdIdentity(args[1:]); err != nil {
 			die("%v", err)
 		}
 
 	case "webhook-keygen":
-		name, err := parseWebhookKeygenArgs(os.Args[2:])
+		name, err := parseWebhookKeygenArgs(args[1:])
 		if err != nil {
 			die("%v", err)
 		}
@@ -125,10 +141,10 @@ func main() {
 		}
 
 	case "audit":
-		if len(os.Args) < 3 || os.Args[2] != "verify" {
+		if len(args) < 2 || args[1] != "verify" {
 			die("usage: constle audit verify [--did=<did:key:…>] <logfile>")
 		}
-		logPath, expectedDID, err := parseAuditVerifyArgs(os.Args[3:])
+		logPath, expectedDID, err := parseAuditVerifyArgs(args[2:])
 		if err != nil {
 			die("%v", err)
 		}
@@ -142,10 +158,10 @@ func main() {
 		}
 
 	case "stop":
-		if len(os.Args) < 3 {
+		if len(args) < 2 {
 			die("usage: constle stop <run_id>")
 		}
-		if err := cmdStop(os.Args[2]); err != nil {
+		if err := cmdStop(args[1]); err != nil {
 			die("%v", err)
 		}
 
@@ -156,8 +172,19 @@ func main() {
 		printHelp()
 
 	default:
-		die("unknown command %q\nrun 'constle help' for usage", os.Args[1])
+		die("unknown command %q\nrun 'constle help' for usage", args[0])
 	}
+}
+
+// parseGlobalArgs consumes only flags that apply before command dispatch.
+// Keeping the flag global prevents it from leaking into subcommand parsers,
+// while preserving every existing subcommand argument contract.
+func parseGlobalArgs(args []string) (remaining []string, noAnimation bool) {
+	for len(args) > 0 && args[0] == "--no-animation" {
+		args = args[1:]
+		noAnimation = true
+	}
+	return args, noAnimation
 }
 
 // runUsage is the one-line usage string for `constle run`, repeated by every
@@ -1047,6 +1074,7 @@ func printHelp() {
 	fmt.Printf(`constle v%s — AI agent runtime
 
 usage:
+  constle [--no-animation]      show this screen (the flag skips the animated intro)
   constle init                  create agent.yaml with sensible defaults
   constle run <agentfile>       run an agent in a sandbox
     --backend=<name>            force a backend: docker or firecracker
