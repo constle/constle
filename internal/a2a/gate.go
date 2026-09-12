@@ -291,6 +291,12 @@ func (g *Gate) serveSend(w http.ResponseWriter, r *http.Request, peerName string
 // verifyResponse checks a peer's signed response envelope: valid signature
 // (Open), signed by exactly the declared peer, addressed to this agent, and
 // bound to the request it answers. Order matters for audit precision.
+//
+// The response is untrusted input just like an inbound call: it is read
+// under the same body cap, and Open decodes its "from" before any signature
+// check, so pkg/did's length bound is what keeps a peer (or anyone on the
+// path of a plain-http endpoint) from making this side do quadratic work on
+// an unverified reply.
 func (g *Gate) verifyResponse(wire []byte, peer manifest.A2APeer, requestMsgID string) (*Envelope, error) {
 	env, err := Open(wire)
 	if err != nil {

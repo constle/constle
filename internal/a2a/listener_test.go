@@ -297,6 +297,49 @@ func TestInboundOversizedBodyCappedBeforeParse(t *testing.T) {
 	assertInboxEmpty(t, g, sandboxURL)
 }
 
+// TestInboundOversizedSenderDIDRejectedBeforeVerification drives the
+// unbounded-DID regression through the public listener: the request is
+// under the body cap, so readCapped admits it, and the only thing between
+// an unauthenticated peer and a quadratic base58 decode on the host is
+// pkg/did's length bound. The verdict must be a prompt 403 and the sandbox
+// side must never see anything.
+func TestInboundOversizedSenderDIDRejectedBeforeVerification(t *testing.T) {
+	bob := newTestSigner(t, 2)
+	alice := newTestSigner(t, 1)
+	g, publicURL, sandboxURL := newInboundGate(t, bob, alice)
+
+	wire := oversizedFromEnvelope(t, bob.DID())
+
+	type result struct {
+		code int
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := http.Post(publicURL, "application/json", bytes.NewReader(wire))
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		_ = resp.Body.Close()
+		done <- result{code: resp.StatusCode}
+	}()
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatalf("POST: %v", res.err)
+		}
+		if res.code != http.StatusForbidden {
+			t.Fatalf("oversized sender DID = HTTP %d, want 403", res.code)
+		}
+	case <-time.After(oversizedDeadline):
+		t.Fatalf("no verdict within %s on a %d-byte envelope — the listener is decoding the sender DID without a length bound", oversizedDeadline, len(wire))
+	}
+
+	assertInboxEmpty(t, g, sandboxURL)
+}
+
 // zeroReader yields n zero bytes.
 type zeroReader struct{ n int }
 

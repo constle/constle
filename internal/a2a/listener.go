@@ -30,6 +30,12 @@ import (
 //   4. Malformed input (bad JSON, bad framing, bad base64, bad DID) is
 //      rejected via error returns — no panics, and net/http's per-connection
 //      recovery contains anything unexpected without killing the process.
+//   5. Sender DID length bounded before decoding — enforced in
+//      pkg/did.PublicKey, which this listener relies on. The sender DID is
+//      decoded BEFORE any signature check (its verification key comes from
+//      the DID itself), so an oversized "from" that fits under the body cap
+//      is refused on byte count alone, never walked by the base58 decoder,
+//      whose cost is quadratic in the input.
 //
 // Only after all of that does verification run, in a fixed order — envelope
 // signature (Open), sender ∈ declared peers, correct recipient, replay —

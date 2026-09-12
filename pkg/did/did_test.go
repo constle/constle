@@ -5,9 +5,18 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
+
+// oversizedDeadline bounds how long the oversized-input regression test
+// waits for a verdict. It is a sanity bound, not a performance assertion:
+// the fixed code answers in microseconds, while the unbounded decoder it
+// guards against needs over an hour for the 10 MiB case, so the value only
+// has to be generous enough for a slow, loaded CI runner.
+const oversizedDeadline = 30 * time.Second
 
 // base58Vectors cross-checks the in-house base58btc implementation against
 // vectors computed with an independent implementation (and, for the longer
@@ -130,6 +139,9 @@ func TestRoundTripRandomKeys(t *testing.T) {
 		if !strings.HasPrefix(d, Prefix) {
 			t.Fatalf("DID %q does not start with %q", d, Prefix)
 		}
+		if len(d) != MaxLen {
+			t.Fatalf("DID %q is %d bytes, want exactly MaxLen (%d)", d, len(d), MaxLen)
+		}
 
 		recovered, err := PublicKey(d)
 		if err != nil {
@@ -163,5 +175,115 @@ func TestPublicKeyRejectsMalformedDIDs(t *testing.T) {
 func TestFromPublicKeyRejectsWrongLength(t *testing.T) {
 	if _, err := FromPublicKey(make([]byte, 16)); err == nil {
 		t.Error("FromPublicKey(16 bytes) succeeded, want error")
+	}
+}
+
+// TestEncodedLenIsExact pins encodedLen (and so MaxLen) against the encoder
+// at both extremes of the payload space: the all-zero key gives the smallest
+// integer any ed25519-pub payload can encode, the all-0xff key the largest.
+// Both must land on exactly encodedLen digits with no leading '1', which is
+// what lets PublicKey reject on length alone without turning away any
+// valid identifier. The published vectors are checked the same way.
+func TestEncodedLenIsExact(t *testing.T) {
+	for name, key := range map[string][]byte{
+		"all-zero key": make([]byte, ed25519.PublicKeySize),
+		"all-0xff key": bytes.Repeat([]byte{0xff}, ed25519.PublicKeySize),
+	} {
+		payload := append(append([]byte{}, ed25519PubMulticodec...), key...)
+		enc := base58Encode(payload)
+		if len(enc) != encodedLen {
+			t.Errorf("%s: encodes to %d base58 digits, want encodedLen = %d", name, len(enc), encodedLen)
+		}
+		if enc[0] == '1' {
+			t.Errorf("%s: encoding %q starts with '1' — a leading zero byte is impossible after the 0xed multicodec", name, enc)
+		}
+		d, err := FromPublicKey(ed25519.PublicKey(key))
+		if err != nil {
+			t.Fatalf("%s: FromPublicKey: %v", name, err)
+		}
+		if len(d) != MaxLen {
+			t.Errorf("%s: DID is %d bytes, want MaxLen = %d", name, len(d), MaxLen)
+		}
+	}
+	for _, v := range didKeyVectors {
+		if len(v.did) != MaxLen {
+			t.Errorf("vector %q is %d bytes, want MaxLen = %d", v.did, len(v.did), MaxLen)
+		}
+	}
+}
+
+// TestPublicKeyRejectsOversizedDIDBeforeDecoding is the regression test for
+// the unbounded-decode CPU exhaustion: base58Decode's cost is quadratic in
+// the input length, and an A2A peer controls the "from" DID that reaches it
+// before any signature check. Before the length bound, decoding a 10 MiB
+// string (the A2A body cap) pinned a core for on the order of an hour
+// before the value was finally rejected; now it must be rejected on byte
+// count alone, immediately, and the error must describe the length without
+// echoing the input.
+func TestPublicKeyRejectsOversizedDIDBeforeDecoding(t *testing.T) {
+	// Every byte after the prefix is a valid base58 digit, so nothing but
+	// the length bound can stop the decoder from doing the full quadratic
+	// walk.
+	cases := map[string]string{
+		"one byte over": Prefix + strings.Repeat("z", encodedLen+1),
+		"10 MiB":        Prefix + strings.Repeat("z", 10<<20),
+	}
+	for name, d := range cases {
+		t.Run(name, func(t *testing.T) {
+			type result struct {
+				err   error
+				taken time.Duration
+			}
+			done := make(chan result, 1)
+			go func() {
+				start := time.Now()
+				_, err := PublicKey(d)
+				done <- result{err, time.Since(start)}
+			}()
+
+			var res result
+			select {
+			case res = <-done:
+			case <-time.After(oversizedDeadline):
+				// The old decoder is still spinning at this point (and will
+				// for a long while) — the bound is not being applied before
+				// the decode.
+				t.Fatalf("PublicKey on a %d-byte DID did not return within %s — input length is not bounded before decoding", len(d), oversizedDeadline)
+			}
+
+			if res.err == nil {
+				t.Fatalf("PublicKey accepted a %d-byte DID", len(d))
+			}
+			msg := res.err.Error()
+			if len(msg) > 256 {
+				t.Fatalf("error is %d bytes — it echoes the oversized input: %.80s...", len(msg), msg)
+			}
+			if !strings.Contains(msg, strconv.Itoa(len(d))+" bytes") || !strings.Contains(msg, strconv.Itoa(MaxLen)) {
+				t.Fatalf("error %q does not report the input length and the %d-byte bound", msg, MaxLen)
+			}
+			if err := Validate(d); err == nil {
+				t.Fatalf("Validate accepted a %d-byte DID", len(d))
+			}
+			t.Logf("rejected %d bytes in %s: %v", len(d), res.taken, res.err)
+		})
+	}
+}
+
+// TestBase58DecodeBoundsInputLength checks the decoder's own guard, which
+// holds even for a caller that skips PublicKey: exactly encodedLen digits
+// decode, one more is refused before any arithmetic.
+func TestBase58DecodeBoundsInputLength(t *testing.T) {
+	if _, err := base58Decode(strings.Repeat("z", encodedLen)); err != nil {
+		t.Errorf("base58Decode(%d digits) error: %v", encodedLen, err)
+	}
+	for _, n := range []int{encodedLen + 1, 1 << 16} {
+		_, err := base58Decode(strings.Repeat("z", n))
+		if err == nil {
+			t.Errorf("base58Decode(%d digits) succeeded, want length error", n)
+			continue
+		}
+		if len(err.Error()) > 256 || !strings.Contains(err.Error(), "bytes") {
+			t.Errorf("base58Decode(%d digits) error %.80q does not report the length bound", n, err.Error())
+		}
 	}
 }
