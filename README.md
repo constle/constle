@@ -98,7 +98,14 @@ cd constle
 go build -o constle ./cmd/constle
 ```
 
-Pre-built binaries for Linux, macOS, and Windows are on the [releases page](https://github.com/constle/constle/releases); see [Verifying a release](#verifying-a-release) before you trust one.
+Pre-built binaries for Linux, macOS, and Windows are on the [releases page](https://github.com/constle/constle/releases). The one-line installer takes those same archives and checks them for you:
+
+```bash
+curl -fsSL https://constle.dev/install | sh        # Linux, macOS
+iwr -useb https://constle.dev/install.ps1 | iex    # Windows PowerShell
+```
+
+It fetches `checksums.txt` for the release it is installing and refuses to unpack an archive whose SHA-256 does not match. When `cosign` is on your PATH it checks the release workflow's signature over `checksums.txt` first, pinned to the identity in [Verifying a release](#verifying-a-release), and aborts if that fails; without `cosign` it says so on the terminal and enforces the checksum alone. `CONSTLE_REQUIRE_SIGNATURE=1` makes the signature mandatory - note that no release publishes one yet, so today that setting refuses every install; it becomes useful from the first signed release onwards. Downloading an archive by hand skips all of this - see [Verifying a release](#verifying-a-release) before you trust one.
 
 **2. Check the example manifest without running anything:**
 
@@ -427,6 +434,8 @@ Each archive also carries a SLSA build-provenance attestation:
 ```bash
 gh attestation verify constle_<version>_linux_amd64.tar.gz --repo constle/constle
 ```
+
+The one-line installer does the checksum half of this on every run: it fetches `checksums.txt` for the release it is installing and refuses to unpack an archive whose SHA-256 does not match. When `cosign` is on your PATH it runs the `cosign verify-blob` command above first - same `--certificate-identity-regexp`, same `--certificate-oidc-issuer` - and refuses to trust `checksums.txt` if that fails. When `cosign` is absent, or the release publishes no signature, it prints that the signature was not checked and continues on the checksum alone, which catches a corrupted or swapped archive but not a release page an attacker controls outright. `CONSTLE_REQUIRE_SIGNATURE=1` makes the signature mandatory; no release publishes one yet, so that setting currently refuses every install. The installer does not check the build-provenance attestation - run `gh attestation verify` yourself for that.
 <!-- --8<-- [end:verify] -->
 
 ---

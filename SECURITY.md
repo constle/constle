@@ -61,6 +61,7 @@ The following are in scope for security reports:
 - Command injection via manifest fields parsed by the CLI
 - Path traversal when processing manifest file paths
 - Privilege escalation during sandbox provisioning
+- Installer integrity bypass: `scripts/install` or `scripts/install.ps1` installing an archive whose SHA-256 is not the one in the release's `checksums.txt`, or accepting a `checksums.txt` that fails cosign verification
 
 ### Agent Manifest & Spec
 - Fields whose semantics create an exploitable gap between what the manifest declares and what the runtime enforces

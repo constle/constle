@@ -111,5 +111,15 @@ jobs:
       - name: Build
         run: go build -v ./...
 
+      # The installer regression tests live here rather than only in
+      # lint-and-test because that job runs on ubuntu-latest alone. The Windows
+      # leg is the only place scripts/install.ps1 runs under the Windows
+      # PowerShell its own #Requires targets, and the macOS leg is the only
+      # place the real shasum digest path and BSD mktemp are exercised - macOS
+      # has no sha256sum at all. -v so that a leg which skipped everything
+      # reads as skipped in the log rather than as a pass.
+      - name: Test installers
+        run: go test ./scripts/... -v
+
       - name: Verify binary runs
         run: go run ./cmd/constle version
