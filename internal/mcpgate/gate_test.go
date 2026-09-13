@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -779,5 +780,396 @@ func TestStaleKeystrokeDoesNotApproveNextGate(t *testing.T) {
 	decision := approver.Decide(ctx, Request{Tool: "send_email", TimeoutSeconds: 1, OnTimeout: "abort"})
 	if decision != DecisionNone {
 		t.Fatalf("stale keystroke resolved the gate: decision=%v, want DecisionNone (timeout)", decision)
+	}
+}
+
+// doRequest issues one request with an arbitrary method and body, and returns
+// the status, body, and response headers. Unlike postJSON it never assumes the
+// method carries a JSON-RPC payload.
+func doRequest(t *testing.T, method, url, body string) (int, string, http.Header) {
+	t.Helper()
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, rdr)
+	if err != nil {
+		t.Fatalf("%s %s: build: %v", method, url, err)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(data), resp.Header
+}
+
+// TestGatedToolUnreachableByAnyMethod is the regression test for the
+// method-shaped bypass: servePOST inspected only POST, so every other method
+// was reverse-proxied straight through. The upstream in newHarness routes on
+// path alone and answers whatever arrives — the shape of a hand-rolled MCP
+// server, and of net/http's own ServeMux, whose patterns match every method —
+// so on the previous code each request below executed the gated tool while the
+// approver was never consulted and the audit log stayed empty.
+//
+// The gated tool must now be unreachable by every method, including the
+// lowercase spelling of POST that net/http accepts as a distinct method.
+func TestGatedToolUnreachableByAnyMethod(t *testing.T) {
+	for _, method := range []string{"GET", "DELETE", "PUT", "PATCH", "HEAD", "OPTIONS", "post", "FROBNICATE"} {
+		t.Run(method, func(t *testing.T) {
+			// Approver would APPROVE, so a gate that ran at all would still
+			// forward: reaching the upstream here can only mean no gate ran.
+			h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+			status, _, _ := doRequest(t, method, h.baseURL, toolCallBody("send_email"))
+			if status == http.StatusOK {
+				t.Errorf("%s carrying a gated tools/call got 200 — it reached the upstream", method)
+			}
+			if h.calls.Load() != 0 {
+				t.Errorf("%s carrying a gated tools/call reached the upstream %d time(s)", method, h.calls.Load())
+			}
+
+			entries := auditEvents(t, h)
+			if n := len(eventsOfType(entries, audit.EventToolCallStart)); n != 0 {
+				t.Errorf("%s: %d tool_call_start events for a call that never ran", method, n)
+			}
+			if n := len(eventsOfType(entries, audit.EventGateApproved)); n != 0 {
+				t.Errorf("%s: %d gate_approved events — a refused request must not consume a decision", method, n)
+			}
+			if n := len(eventsOfType(entries, audit.EventMCPRequestBlocked)); n != 1 {
+				t.Errorf("%s: want 1 mcp_request_blocked, got %+v", method, entries)
+			}
+		})
+	}
+}
+
+// TestUndeclaredToolUnreachableByAnyMethod: the Agentfile's tools allowlist
+// was bypassable the same way the human gate was — a tool the manifest never
+// declared reached the upstream as long as the request was not a POST.
+func TestUndeclaredToolUnreachableByAnyMethod(t *testing.T) {
+	for _, method := range []string{"GET", "DELETE", "PUT", "FROBNICATE"} {
+		t.Run(method, func(t *testing.T) {
+			h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+			doRequest(t, method, h.baseURL, toolCallBody("delete_everything"))
+			if h.calls.Load() != 0 {
+				t.Errorf("%s carrying an undeclared tools/call reached the upstream %d time(s)",
+					method, h.calls.Load())
+			}
+		})
+	}
+}
+
+// TestMethodsOutsideTheTransportAreRefused: Streamable HTTP defines POST, GET
+// and DELETE on the MCP endpoint and nothing else, so anything else is refused
+// with 405 and the Allow header RFC 9110 §15.5.6 requires — never forwarded,
+// with or without a body.
+func TestMethodsOutsideTheTransportAreRefused(t *testing.T) {
+	h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+	for _, method := range []string{"PUT", "PATCH", "HEAD", "OPTIONS", "TRACE", "post", "get", "FROBNICATE"} {
+		status, _, header := doRequest(t, method, h.baseURL, "")
+		if status != http.StatusMethodNotAllowed {
+			t.Errorf("%s: status=%d, want 405", method, status)
+		}
+		if got := header.Get("Allow"); got != "GET, POST, DELETE" {
+			t.Errorf("%s: Allow=%q, want %q", method, got, "GET, POST, DELETE")
+		}
+	}
+	if h.calls.Load() != 0 {
+		t.Errorf("a method outside the transport reached the upstream: %d calls", h.calls.Load())
+	}
+}
+
+// TestBodilessGETAndDELETEStillReachTheUpstream guards the other direction of
+// the fix. GET opens the server→client SSE stream and DELETE terminates the
+// session; both are ordinary MCP traffic that carries no JSON-RPC message, and
+// routing them through the POST path's parser would reject every one of them
+// as an "empty JSON-RPC body" and break the transport outright.
+func TestBodilessGETAndDELETEStillReachTheUpstream(t *testing.T) {
+	for _, method := range []string{"GET", "DELETE"} {
+		t.Run(method, func(t *testing.T) {
+			h := newHarness(t, &fixedApprover{decision: DecisionDenied}, "abort")
+
+			status, body, _ := doRequest(t, method, h.baseURL, "")
+			if status != http.StatusOK {
+				t.Fatalf("bodiless %s: status=%d body=%s, want 200", method, status, body)
+			}
+			if h.calls.Load() != 1 {
+				t.Fatalf("bodiless %s: upstream calls = %d, want 1", method, h.calls.Load())
+			}
+
+			entries := auditEvents(t, h)
+			if n := len(eventsOfType(entries, audit.EventMCPRequestBlocked)); n != 0 {
+				t.Errorf("bodiless %s must not be recorded as blocked, got %d", method, n)
+			}
+			if n := len(eventsOfType(entries, audit.EventToolCallStart)); n != 0 {
+				t.Errorf("bodiless %s is not a tool call and must not be bracketed as one, got %d", method, n)
+			}
+		})
+	}
+}
+
+// TestBodilessGETIsForwardedWithNoBodyFraming pins the wire shape of the
+// forwarded stream-open. The gate reads the body to prove it is empty, so it
+// must hand the proxy an explicitly empty one: a consumed reader left in place
+// with a chunked framing would reach the upstream as a lone terminating chunk,
+// which strict SSE endpoints reject.
+func TestBodilessGETIsForwardedWithNoBodyFraming(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Clone()
+		h.Set("X-Test-Transfer-Encoding", strings.Join(r.TransferEncoding, ","))
+		h.Set("X-Test-Content-Length", fmt.Sprint(r.ContentLength))
+		seen <- h
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: message\ndata: {}\n\n")
+	}))
+	t.Cleanup(up.Close)
+
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New(logLoc)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "sse-agent"},
+		MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: up.URL}}},
+	}
+	g, err := New(m, nil, nil, logger, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	port, token, err := g.Bind("ssearun01", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/%s/servers/email", port, token)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("SSE GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE GET: status=%d, want 200", resp.StatusCode)
+	}
+
+	got := <-seen
+	if te := got.Get("X-Test-Transfer-Encoding"); te != "" {
+		t.Errorf("upstream saw Transfer-Encoding %q on a bodiless GET, want none", te)
+	}
+	if cl := got.Get("X-Test-Content-Length"); cl != "0" {
+		t.Errorf("upstream saw ContentLength %s on a bodiless GET, want 0", cl)
+	}
+	if got.Get("Accept") != "text/event-stream" {
+		t.Errorf("Accept header not forwarded: %q", got.Get("Accept"))
+	}
+}
+
+// TestRefusedMethodIsNotLoggedBeforeAuthentication: the method check is an
+// enforcement decision worth recording, but it runs only once a request has
+// presented the gate token and named a declared server. An unauthenticated
+// prober must not be able to drive audit writes.
+func TestRefusedMethodIsNotLoggedBeforeAuthentication(t *testing.T) {
+	h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+	badToken := strings.Replace(h.baseURL, h.gate.token, strings.Repeat("0", 32), 1)
+	if status, _, _ := doRequest(t, "PUT", badToken, ""); status != http.StatusNotFound {
+		t.Errorf("PUT with a wrong token: status=%d, want 404", status)
+	}
+	badServer := strings.Replace(h.baseURL, "/servers/email", "/servers/other", 1)
+	if status, _, _ := doRequest(t, "PUT", badServer, ""); status != http.StatusForbidden {
+		t.Errorf("PUT to an undeclared server: status=%d, want 403", status)
+	}
+
+	if _, err := os.ReadFile(h.logPath); err == nil {
+		if n := len(eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)); n != 0 {
+			t.Errorf("unauthenticated probes wrote %d audit entries", n)
+		}
+	}
+}
+
+// chunkedRequest sends a request whose body is chunk-framed, so it arrives
+// with no Content-Length and ContentLength -1. net/http's client uses chunked
+// framing for any body whose length it cannot know in advance, which an
+// io.Reader that is not one of its recognised types gives it.
+func chunkedRequest(t *testing.T, method, url, body string) (int, string) {
+	t.Helper()
+	pr, pw := io.Pipe()
+	go func() {
+		if body != "" {
+			_, _ = io.WriteString(pw, body)
+		}
+		_ = pw.Close()
+	}()
+	req, err := http.NewRequest(method, url, pr)
+	if err != nil {
+		t.Fatalf("%s %s: build: %v", method, url, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.Request != nil && resp.Request.ContentLength > 0 {
+		t.Fatalf("%s was not sent chunked: ContentLength=%d", method, resp.Request.ContentLength)
+	}
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(data)
+}
+
+// TestChunkedBodyOnNonPOSTIsRefused closes the framing half of the bypass. A
+// chunked request declares no length — ContentLength is -1, not the body size
+// — so a gate that decided "does this carry a body?" from the declared length
+// would read every chunked GET as empty and forward it, tool call and all.
+// The decision must come from bytes actually read, and this pins that: the
+// same gated call the Content-Length form is refused for must be refused when
+// the length is withheld.
+func TestChunkedBodyOnNonPOSTIsRefused(t *testing.T) {
+	for _, method := range []string{"GET", "DELETE"} {
+		t.Run(method, func(t *testing.T) {
+			h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+			status, body := chunkedRequest(t, method, h.baseURL, toolCallBody("send_email"))
+			if status != http.StatusBadRequest {
+				t.Errorf("chunked %s carrying a gated tools/call: status=%d body=%s, want 400",
+					method, status, body)
+			}
+			if h.calls.Load() != 0 {
+				t.Errorf("chunked %s reached the upstream %d time(s)", method, h.calls.Load())
+			}
+			if n := len(eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)); n != 1 {
+				t.Errorf("chunked %s: want 1 mcp_request_blocked, got %d", method, n)
+			}
+		})
+	}
+}
+
+// TestChunkedEmptyBodyIsForwardedWithoutFraming is what the NoBody
+// normalisation exists for. A GET whose body is chunk-framed but empty
+// arrives with ContentLength -1 and a non-nil body, so without normalisation
+// ReverseProxy forwards it still marked chunked and emits a lone terminating
+// chunk on a GET — which strict SSE endpoints reject. Reading the body proves
+// it empty; handing the proxy http.NoBody is what makes the forwarded request
+// bodiless again.
+//
+// The request is written on a raw socket because net/http's client will not
+// produce this shape: given a body of unknown length it probes the first read
+// and, finding it empty, drops the chunked framing itself.
+func TestChunkedEmptyBodyIsForwardedWithoutFraming(t *testing.T) {
+	seen := make(chan []string, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- append([]string{fmt.Sprint(r.ContentLength)}, r.TransferEncoding...)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "event: message\ndata: {}\n\n")
+	}))
+	t.Cleanup(up.Close)
+
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New(logLoc)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "sse-agent"},
+		MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: up.URL}}},
+	}
+	g, err := New(m, nil, nil, logger, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	port, token, err := g.Bind("chunkrun01", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, err = fmt.Fprintf(conn,
+		"GET /%s/servers/email HTTP/1.1\r\nHost: %s\r\nAccept: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+		token, addr)
+	if err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chunk-framed empty GET: status=%d, want 200", resp.StatusCode)
+	}
+
+	select {
+	case got := <-seen:
+		if got[0] != "0" {
+			t.Errorf("upstream saw ContentLength %s on a chunk-framed empty GET, want 0", got[0])
+		}
+		if len(got) > 1 {
+			t.Errorf("upstream saw Transfer-Encoding %v on a chunk-framed empty GET, want none", got[1:])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never received the forwarded GET")
+	}
+}
+
+// TestClampMethod: a method reaches the audit log, so its length is bounded
+// there the way compactRPCID bounds a JSON-RPC id.
+func TestClampMethod(t *testing.T) {
+	if got := clampMethod("GET"); got != "GET" {
+		t.Errorf("clampMethod(GET) = %q, want GET", got)
+	}
+	long := strings.Repeat("A", 500)
+	if got := clampMethod(long); len(got) != 32 {
+		t.Errorf("clampMethod(500 chars) length = %d, want 32", len(got))
+	}
+}
+
+// TestNonPOSTBodyRefusalIsPinned fixes the shape of the refusal itself — the
+// status an agent sees and the audit line an operator reads — so neither can
+// drift into something less legible without a test saying so.
+func TestNonPOSTBodyRefusalIsPinned(t *testing.T) {
+	h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+	status, body, _ := doRequest(t, "GET", h.baseURL, toolCallBody("send_email"))
+	if status != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", status)
+	}
+	if !strings.Contains(body, "carries no MCP message") {
+		t.Errorf("body = %q, want it to explain that GET carries no MCP message", body)
+	}
+
+	blocked := eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)
+	if len(blocked) != 1 {
+		t.Fatalf("want 1 mcp_request_blocked, got %d", len(blocked))
+	}
+	e := blocked[0]
+	if e.RunID != "testrun01" || e.AgentName != "test-agent" {
+		t.Errorf("attribution: run_id=%q agent=%q", e.RunID, e.AgentName)
+	}
+	if e.Details["server"] != "email" || e.Details["method"] != "GET" {
+		t.Errorf("details = %+v", e.Details)
+	}
+	if _, leaked := e.Details["body"]; leaked {
+		t.Error("the refused body must not be copied into the audit log")
 	}
 }

@@ -387,6 +387,74 @@ echo "$RESP" | grep -q '"result"' && echo "GATE_APPROVED: YES" || echo "GATE_APP
 	}
 }
 
+// TestMCPGateMethodBypass proves end to end, through a real sandbox, that a
+// gated tool cannot be reached by re-sending the same tools/call on a
+// different HTTP method. The gate used to inspect only POST and reverse-proxy
+// everything else untouched, so an agent that changed one word of its request
+// line got the call executed with no approval prompt, no allowlist check and
+// no audit record.
+//
+// The stub is the shape that makes this reachable: mux.HandleFunc("/mcp", …)
+// is a path-only pattern, which net/http matches for every method, and it
+// decodes JSON-RPC from whatever body arrives — a hand-rolled MCP server, and
+// the default shape of one written with the standard library.
+//
+// The approver APPROVES, so the POST is a positive control: it proves the
+// route, the stub and the recording all work, and every later attempt that
+// does NOT appear in the stub's list is a refusal rather than a broken test.
+func TestMCPGateMethodBypass(t *testing.T) {
+	requireE2E(t)
+
+	for name, backend := range conformanceBackends(t) {
+		t.Run(name, func(t *testing.T) {
+			stub := startMCPStub(t)
+
+			script := mcpCallHelper + `
+callAs() {
+  curl -s -o /dev/null -w '%{http_code}' --max-time 20 -X "$2" -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$3\",\"arguments\":{\"n\":1}}}" \
+    "$1" 2>&1
+}
+
+echo "=== positive control: the gated tool over POST, approved ==="
+RESP=$(call "$CONSTLE_MCP_TESTSRV_URL" gated_tool)
+echo "$RESP" | grep -q '"result"' && echo "POST_APPROVED: YES" || echo "POST_APPROVED: NO — $RESP"
+
+echo "=== the same call on every other method ==="
+for M in GET DELETE PUT PATCH FROBNICATE; do
+  echo "METHOD_$M: $(callAs "$CONSTLE_MCP_TESTSRV_URL" "$M" gated_tool)"
+done
+`
+			m := mcpTestManifest(script, 300)
+			m.MCP.Servers[0].URL = fmt.Sprintf("http://127.0.0.1:%d/mcp", stub.port())
+
+			output, events := runMCPScenario(t, backend,
+				m, &scriptedApprover{decision: mcpgate.DecisionApproved}, nil)
+
+			if !strings.Contains(output, "POST_APPROVED: YES") {
+				t.Fatalf("[%s] positive control failed — the approved POST did not reach the server:\n%s",
+					name, output)
+			}
+
+			// The only enforcement claim that matters, proved host-side: the
+			// real server executed the gated tool exactly once, for the one
+			// call a human approved.
+			if tools := stub.calledTools(); len(tools) != 1 || tools[0] != "gated_tool" {
+				t.Errorf("[%s] real MCP server saw %v, want exactly [gated_tool] — a non-POST method reached it",
+					name, tools)
+			}
+			if n := countEvents(events, audit.EventGateApproved); n != 1 {
+				t.Errorf("[%s] want exactly 1 gate_approved (the POST), got %d — a bypass would consume no gate",
+					name, n)
+			}
+			if n := countEvents(events, audit.EventMCPRequestBlocked); n != 5 {
+				t.Errorf("[%s] want 5 mcp_request_blocked (one per refused method), got %d:\n%s",
+					name, n, output)
+			}
+		})
+	}
+}
+
 // TestMCPGateTimeoutAbort proves an unanswered gate times out, the call
 // never reaches the real server, and on_timeout: abort terminates the run.
 func TestMCPGateTimeoutAbort(t *testing.T) {
