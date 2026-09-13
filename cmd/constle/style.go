@@ -78,11 +78,18 @@ var styled = detectStyled()
 
 func detectStyled() bool {
 	// Honour the de-facto standards for suppressing colour.
-	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+	if noColorRequested() || os.Getenv("TERM") == "dumb" {
 		return false
 	}
 	fd := os.Stdout.Fd()
 	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
+}
+
+// NO_COLOR is presence-based: even an explicitly empty value requests plain
+// output. LookupEnv preserves that distinction; Getenv does not.
+func noColorRequested() bool {
+	_, present := os.LookupEnv("NO_COLOR")
+	return present
 }
 
 // Lazily-built styles. Only constructed on the styled path (initStyles),
@@ -162,9 +169,26 @@ func printStyledHelp() {
 	printBigMascot()
 	printf("\n%s%s %s\n\n", indent, stWord.Render("constle"),
 		stVer.Render("v"+constleVersion+"  ∙  AI agent runtime"))
+	printStyledHelpBody()
+}
 
+// printPostIntroHelp follows the persistent settled lockup emitted during the
+// alternate-screen handoff with the useful part of the help screen.
+func printPostIntroHelp() {
+	if !styled {
+		return
+	}
+	initStyles()
+	printStyledHelpBody()
+}
+
+// printStyledHelpBody renders the shared usage, command list, and docs link.
+// It deliberately owns all spacing inside that block so the explicit styled
+// help screen remains visually identical when the block is reused.
+func printStyledHelpBody() {
+	initStyles()
 	printf("%s%s %s\n\n", indent, stMuted.Render("usage"),
-		stVer.Render("constle <command> [args]"))
+		stVer.Render("constle [--no-animation] [command] [args]"))
 
 	cmds := [][2]string{
 		{"init", "create agent.yaml with sensible defaults"},

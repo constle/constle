@@ -388,6 +388,7 @@ If a document the agent reads contains a hidden instruction to exfiltrate data t
 <!-- --8<-- [start:cli] -->
 | Command | Description |
 |---|---|
+| `constle [--no-animation]` | Show the startup screen and command overview |
 | `constle run [--backend=docker\|firecracker] [--accept-isolation=<level>] <agentfile>` | Run an agent in an isolated sandbox |
 | `constle validate <agentfile>` | Validate an Agentfile without running it |
 | `constle init` | Scaffold a starter Agentfile in the current directory |
@@ -397,6 +398,8 @@ If a document the agent reads contains a hidden instruction to exfiltrate data t
 | `constle identity show <name>` | Show an agent's DID and key location |
 | `constle audit verify [--did=<did:key:…>] <logfile>` | Verify an audit log's signatures and hash chain |
 | `constle version` | Print the version |
+
+Running bare `constle` in an interactive terminal plays the startup animation before the command overview. Use `constle --no-animation` to skip it for one invocation, or set `CONSTLE_ANIMATION` to `auto` (the default), `never`, or `always`. The animation is always suppressed for non-interactive output, `NO_COLOR`, `TERM=dumb`, or terminals smaller than 80×24; `always` overrides CI detection only.
 <!-- --8<-- [end:cli] -->
 
 ---
