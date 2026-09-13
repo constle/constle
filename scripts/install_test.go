@@ -489,16 +489,34 @@ func run(t *testing.T, g *fakeGitHub, argv []string, o *runOpts) result {
 		stubMarker = "1"
 	}
 
+	tmp := t.TempDir()
 	env := map[string]string{
 		"PATH":        path,
 		"HOME":        t.TempDir(),
-		"TMPDIR":      t.TempDir(),
+		"TMPDIR":      tmp,
 		envInstallDir: installDir,
 		envBaseURL:    g.URL,
 		envAPIURL:     g.URL,
 		stubEnv:       stubMarker,
 		stubArgvEnv:   o.argvLog,
 	}
+	// Windows needs a handful of variables that a POSIX child does not, and
+	// leaving them out fails in a way that looks like the script's fault. In
+	// particular PATHEXT is what makes PowerShell's Get-Command resolve the
+	// bare name "cosign" to the stub's cosign.exe; without it the signature
+	// branch silently takes the cosign-is-not-installed path and the cosign
+	// cases pass an installer that never called cosign at all.
+	if runtime.GOOS == "windows" {
+		env["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
+		env["TEMP"] = tmp
+		env["TMP"] = tmp
+		for _, name := range []string{"SystemRoot", "windir", "COMSPEC", "USERPROFILE"} {
+			if v := os.Getenv(name); v != "" {
+				env[name] = v
+			}
+		}
+	}
+
 	for k, v := range o.env {
 		env[k] = v
 	}
