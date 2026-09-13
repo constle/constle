@@ -358,3 +358,35 @@ func TestMeterWarnThresholdEvent(t *testing.T) {
 		t.Errorf("want exactly 1 warning event, got %d", warns)
 	}
 }
+
+// TestPricedCallCannotBeServedFreeByMethod is the spending half of the
+// method-bypass regression. The metering job is attached during inspection,
+// and meterResponse no-ops when it finds none — so a priced tools/call that
+// skipped inspection was delivered to the agent complete with its usage
+// figures and charged nothing: a free, unlogged, uncapped call to a metered
+// server. Previously every method but POST took that path.
+//
+// The invariant is not "the total stayed 0" — an unmetered call leaves it at 0
+// too. It is that no priced result reached the agent at all.
+func TestPricedCallCannotBeServedFreeByMethod(t *testing.T) {
+	for _, method := range []string{"GET", "DELETE", "PUT", "FROBNICATE"} {
+		t.Run(method, func(t *testing.T) {
+			h := newMeterHarness(t, spending.Limits{PerRun: 1_000_000}, nil)
+
+			status, body, _ := doRequest(t, method, h.baseURL, toolCallBody("ask"))
+			if status == http.StatusOK || strings.Contains(body, `"ok":true`) {
+				t.Errorf("%s: a priced tools/call was served (status=%d body=%s) without being metered",
+					method, status, body)
+			}
+			if h.calls.Load() != 0 {
+				t.Errorf("%s: priced upstream was called %d time(s) outside the metered path",
+					method, h.calls.Load())
+			}
+			time.Sleep(50 * time.Millisecond)
+			if h.tracker.RunTotal() != 0 {
+				t.Errorf("%s: run total = %d µ¢, want 0 — nothing should have been billable",
+					method, h.tracker.RunTotal())
+			}
+		})
+	}
+}
