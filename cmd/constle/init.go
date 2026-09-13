@@ -6,7 +6,7 @@ package main
 // and inline comments explaining every field.
 //
 // The generated file is intentionally conservative:
-//   - isolation is inferred from capabilities (read_file + write_file → process)
+//   - isolation is left to the capability floor (read_file + write_file → process)
 //   - network egress is restricted with a placeholder allowlist
 //   - human gates are enabled with approval required for the three highest-risk actions
 //   - spending caps and a 5-minute timeout are set so the agent cannot run indefinitely
@@ -82,12 +82,19 @@ sandbox:
 # ---------------------------------------------------------------------------
 # capabilities — what the agent is permitted to do
 # ---------------------------------------------------------------------------
-# Constle infers the minimum required sandbox isolation from this list:
+# Constle derives the minimum required sandbox isolation from this list:
 #
 #   read_file / write_file                → process isolation
 #   web_search / external_api            → network isolation
 #   spawn_subagent / external_transfer /
 #   delete_records                        → kernel isolation (Firecracker)
+#
+# That minimum is a FLOOR, not just a default. This file omits
+# sandbox.isolation, so Constle uses the derived level. Writing the field
+# instead is allowed, but only to go STRONGER — a level weaker than these
+# capabilities require is a validation error naming the capability that
+# forces the floor, because otherwise writing the line would make the
+# boundary weaker than leaving it out.
 #
 # Capabilities not listed here are denied at runtime.
 #

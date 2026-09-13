@@ -167,7 +167,16 @@ func TestRunStartedDetailsSeparatesRequestedFromAchieved(t *testing.T) {
 // writeIsolationAgentfile writes a complete Agentfile whose sandbox block
 // declares the given isolation level verbatim, so a malformed level reaches
 // the real parse/validate path exactly as an operator would have typed it.
+// The agent declares external_transfer, so its capability floor is "kernel".
 func writeIsolationAgentfile(t *testing.T, level string) string {
+	t.Helper()
+	return writeCapabilityAgentfile(t, level, "external_transfer")
+}
+
+// writeCapabilityAgentfile is the same fixture with the declared capabilities
+// under the caller's control, so a test can put the capability floor at a
+// chosen level — or, by declaring none, out of the way entirely.
+func writeCapabilityAgentfile(t *testing.T, level string, caps ...string) string {
 	t.Helper()
 
 	content := `apiVersion: constle.dev/v1alpha1
@@ -175,9 +184,14 @@ kind: AgentManifest
 identity:
   name: isolation-contract-test
   version: "0.0.1"
-capabilities:
-  - external_transfer
-sandbox:
+`
+	if len(caps) > 0 {
+		content += "capabilities:\n"
+		for _, cap := range caps {
+			content += "  - " + cap + "\n"
+		}
+	}
+	content += `sandbox:
   isolation: ` + level + `
   image: "python:3.11-slim"
 `
@@ -232,12 +246,89 @@ func TestValidateRejectsMalformedIsolationViaCLI(t *testing.T) {
 	}
 }
 
-// TestValidateAcceptsWellFormedIsolationViaCLI keeps the rejection from
-// having narrowed what a legitimate Agentfile may declare.
+// TestValidateAcceptsWellFormedIsolationViaCLI keeps the rejections from
+// having narrowed what a legitimate Agentfile may declare. Two rejections now
+// sit on this field — a malformed level, and one below the capability floor —
+// so acceptance is proved on both axes: every defined level is still legal
+// when no capability forces a floor, and a level at or above the floor is
+// still legal when one does.
 func TestValidateAcceptsWellFormedIsolationViaCLI(t *testing.T) {
-	for _, level := range []string{"none", "process", "network", "kernel"} {
-		if err := cmdValidate(writeIsolationAgentfile(t, level)); err != nil {
-			t.Errorf("cmdValidate() rejected the valid level %q: %v", level, err)
+	t.Run("no capabilities declared", func(t *testing.T) {
+		for _, level := range []string{"none", "process", "network", "kernel"} {
+			if err := cmdValidate(writeCapabilityAgentfile(t, level)); err != nil {
+				t.Errorf("cmdValidate() rejected the valid level %q: %v", level, err)
+			}
+		}
+	})
+
+	t.Run("at or above the capability floor", func(t *testing.T) {
+		for _, tc := range []struct {
+			level string
+			caps  []string
+		}{
+			{"kernel", []string{"external_transfer"}},
+			{"network", []string{"send_email"}},
+			{"kernel", []string{"send_email"}},
+			{"process", []string{"read_file"}},
+			{"kernel", []string{"read_file", "write_file"}},
+		} {
+			if err := cmdValidate(writeCapabilityAgentfile(t, tc.level, tc.caps...)); err != nil {
+				t.Errorf("cmdValidate() rejected %q with %v: %v", tc.level, tc.caps, err)
+			}
+		}
+	})
+}
+
+// TestRunRejectsBelowFloorIsolationBeforeBackendSelection is the CLI-path
+// regression guard for the blocking hole this change closes. An agent
+// declaring external_transfer — which demands kernel — with
+// `isolation: network` written by hand used to validate cleanly: the
+// capability minimum was computed only when the field was ABSENT, so writing
+// a weaker level skipped it entirely. Docker then satisfied "network"
+// outright, so the run was not even a downgrade: no acceptance, no notice,
+// and a signed audit entry claiming "network" for a money mover on a shared
+// host kernel.
+//
+// The bogus --backend value is what proves the ORDERING, exactly as in the
+// malformed-level guard above: if the manifest were still accepted, cmdRun
+// would reach backend selection and fail with "unknown backend" instead.
+// Getting the isolation error back means the run aborted at validation —
+// before any backend was chosen, and so before Start created a sandbox or
+// wrote a run_started entry.
+func TestRunRejectsBelowFloorIsolationBeforeBackendSelection(t *testing.T) {
+	for _, level := range []string{"none", "process", "network"} {
+		t.Run(level, func(t *testing.T) {
+			path := writeIsolationAgentfile(t, level)
+
+			err := cmdRun(runOptions{agentfile: path, backendOverride: "no-such-backend"})
+			if err == nil {
+				t.Fatal("cmdRun() error = nil, want a rejection for an isolation level below the capability floor")
+			}
+			for _, want := range []string{"sandbox.isolation", level, "kernel", "external_transfer"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error should mention %q, got: %v", want, err)
+				}
+			}
+			if strings.Contains(err.Error(), "unknown backend") {
+				t.Errorf("run reached backend selection before rejecting the manifest — "+
+					"an isolation level below the capability floor must abort first, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidateRejectsBelowFloorIsolationViaCLI covers the same hole through
+// `constle validate`, which is where an author would expect a contradiction
+// between two fields of their own Agentfile to be caught before ever
+// attempting a run.
+func TestValidateRejectsBelowFloorIsolationViaCLI(t *testing.T) {
+	err := cmdValidate(writeIsolationAgentfile(t, "network"))
+	if err == nil {
+		t.Fatal("cmdValidate() error = nil, want a rejection for isolation: network under external_transfer")
+	}
+	for _, want := range []string{"sandbox.isolation", `"network"`, `"kernel"`, `"external_transfer"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should mention %s, got: %v", want, err)
 		}
 	}
 }
