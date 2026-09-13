@@ -12,15 +12,37 @@
 # What this script does, step by step:
 #   1. Detect the OS (Linux or macOS)
 #   2. Detect the CPU architecture (amd64 or arm64)
-#   3. Resolve what to install: the requested ref, or the latest release tag
+#   3. Check for the tools this script needs, including one that can compute
+#      a SHA-256
+#   4. Resolve what to install: the requested ref, or the latest release tag
 #      from the GitHub API
-#   4. Get the binary:
+#   5. Get the binary:
 #        release tag  → download the prebuilt archive for this OS/arch
 #        commit sha   → build from source with `go install` (prebuilt
 #                       archives only exist for tagged releases, so a pinned
 #                       commit needs a Go toolchain on this machine)
-#   5. Install it to /usr/local/bin/constle (using sudo if needed);
+#   6. Verify the downloaded archive against the release's checksums.txt, and
+#      verify cosign's signature over that file when cosign is available
+#   7. Install it to /usr/local/bin/constle (using sudo if needed);
 #      CONSTLE_INSTALL_DIR overrides the destination.
+#
+# Environment variables:
+#   CONSTLE_VERSION             ref to install (same as the positional argument)
+#   CONSTLE_INSTALL_DIR         where to put the binary (default /usr/local/bin)
+#   CONSTLE_REQUIRE_SIGNATURE   set to 1 to refuse to install unless the cosign
+#                               signature over checksums.txt was verified
+#   CONSTLE_INSTALL_BASE_URL    release download host (default https://github.com)
+#   CONSTLE_INSTALL_API_URL     release metadata host (default https://api.github.com)
+#
+# The last two exist so that this script can be pointed at a mirror, and so
+# that its regression test can serve a fake release from a local HTTP server.
+# Be clear about what they are: they choose WHERE the bytes come from, which
+# means whoever sets them chooses the publisher. A host that serves a tampered
+# archive together with a checksums.txt that agrees with it passes the checksum
+# comparison below, because the two files agree with each other and with
+# nothing else. What an override cannot reach is the pinned signing identity,
+# which is a literal in this file. That is why they are held to HTTPS, and why
+# nothing here can switch the checks off.
 
 set -e  # Exit immediately if any command returns a non-zero exit code.
         # Without this, a failed curl would let the script continue with
@@ -32,6 +54,37 @@ set -e  # Exit immediately if any command returns a non-zero exit code.
 REPO="constle/constle"
 BINARY="constle"
 INSTALL_DIR="${CONSTLE_INSTALL_DIR:-/usr/local/bin}"
+
+# Where releases are fetched from. Overridable for mirrors and for the
+# regression test; see the note in the header about what this does and does
+# not change.
+BASE_URL="${CONSTLE_INSTALL_BASE_URL:-https://github.com}"
+API_BASE_URL="${CONSTLE_INSTALL_API_URL:-https://api.github.com}"
+
+# Whether a missing cosign signature is fatal. Unset (the default) means a
+# missing signature downgrades to a printed warning; a signature that is
+# present and FAILS to verify is always fatal, whatever this is set to.
+#
+# Anything that is not empty, 0, false or no counts as set. Someone who writes
+# CONSTLE_REQUIRE_SIGNATURE: true in a CI file is asking for the strict
+# behaviour, and handing them the lenient one — with output identical to an
+# unconfigured run — is the worst of the available answers. tr is given
+# explicit alphabets rather than [:upper:] so it stays correct in any locale.
+case "$(printf '%s' "${CONSTLE_REQUIRE_SIGNATURE:-}" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" in
+  '' | 0 | false | no) REQUIRE_SIGNATURE=0 ;;
+  *)                   REQUIRE_SIGNATURE=1 ;;
+esac
+
+# The identity the release signature must carry. Keyless signing has no fixed
+# public key - anyone can get a valid certificate from Fulcio and sign
+# anything - so a signature only means something once it is pinned to the
+# workflow that was supposed to have produced it. These two values are the
+# pin, and they are deliberately literals: interpolating $REPO into a regular
+# expression would need escaping to stay exact, and a mis-escaped pin is a
+# pin that matches strangers. Keep them in step with README.md's
+# "Verifying a release" section.
+COSIGN_IDENTITY_REGEXP='^https://github\.com/constle/constle/\.github/workflows/release\.yaml@refs/tags/v'
+COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
 
 # The ref to install: first positional argument wins, then $CONSTLE_VERSION,
 # and with neither the latest release is used. A ref starting with "v" and a
@@ -47,6 +100,35 @@ ok()    { printf "  \033[32m✓\033[0m %s\n" "$*"; }  # green check
 error() { printf "\n\033[31merror:\033[0m %b\n\n" "$*" >&2; exit 1; }
 
 printf "\n\033[1mconstle installer\033[0m\n\n"
+
+# ---------------------------------------------------------------------------
+# Where the bytes may come from
+#
+# An installer that will fetch over plain HTTP has no integrity left to offer:
+# whoever can rewrite the archive on the wire rewrites checksums.txt in the
+# same breath, and the comparison further down then passes on two files that
+# agree with each other and with nothing else. Loopback is the one exception,
+# because scripts/install_test.go serves a fake release from 127.0.0.1, and
+# because anyone who can point this at your own machine is already running
+# code on it.
+#
+# This runs here, rather than beside the assignments, because error() has to
+# exist before anything can call it.
+# ---------------------------------------------------------------------------
+for _url in "$BASE_URL" "$API_BASE_URL"; do
+  case "$_url" in
+    https://*) ;;
+    'http://127.0.0.1' | 'http://127.0.0.1:'* | 'http://127.0.0.1/'*) ;;
+    'http://localhost' | 'http://localhost:'* | 'http://localhost/'*) ;;
+    'http://[::1]'     | 'http://[::1]:'*     | 'http://[::1]/'*)     ;;
+    *) error "refusing to download from ${_url}\nCONSTLE_INSTALL_BASE_URL and CONSTLE_INSTALL_API_URL must be https:// URLs\n(or a loopback http:// address). Nothing has been installed." ;;
+  esac
+done
+
+# An overridden install must never read like a github.com install.
+if [ "$BASE_URL" != "https://github.com" ] || [ "$API_BASE_URL" != "https://api.github.com" ]; then
+  printf "  \033[33m!\033[0m release artifacts will be fetched from %s, not github.com\n" "$BASE_URL"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1: Detect OS
@@ -84,6 +166,83 @@ if ! command -v curl > /dev/null 2>&1; then
   error "curl is required but not found. Install it with your package manager:\n  Ubuntu/Debian: sudo apt install curl\n  Fedora/RHEL:   sudo dnf install curl\n  macOS:         brew install curl"
 fi
 
+# Something has to be able to compute a SHA-256, because the archive is checked
+# against the release's checksums.txt before it is unpacked. Which tool that is
+# varies by system: Linux has sha256sum from coreutils, macOS ships shasum
+# (Perl) and no sha256sum at all, and openssl is on nearly everything. Pick one
+# here so that a machine with none of them fails now, with an actionable
+# message, rather than after a download and with a vaguer one.
+if command -v sha256sum > /dev/null 2>&1; then
+  SHA_TOOL="sha256sum"
+elif command -v shasum > /dev/null 2>&1; then
+  SHA_TOOL="shasum"
+elif command -v openssl > /dev/null 2>&1; then
+  SHA_TOOL="openssl"
+else
+  error "no SHA-256 tool found, so the download cannot be verified.\nInstall one of coreutils (sha256sum), perl (shasum), or openssl, then run this again.\nThis script will not install an unverified binary."
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers used by the verification step
+# ---------------------------------------------------------------------------
+
+# fetch URL writes the body of URL to stdout, and returns non-zero if the
+# request fails.
+#
+# curl flags:
+#   -f  fail fast (exit non-zero on HTTP 4xx/5xx, don't write the error page)
+#   -s  silent (no progress bar)
+#   -S  still show error messages even with -s
+#   -L  follow redirects (GitHub sends release assets to a storage host)
+#
+# --proto and --proto-redir hold the transfer to HTTPS, the second one across
+# those redirects. curl's own default allows a redirect to drop to plain HTTP,
+# and plain HTTP is exactly the position from which someone could serve a
+# matching pair of archive and checksums.txt. The pin is applied per URL, so
+# pointing this script at a non-HTTPS mirror or at the test server still works
+# — there is nothing to downgrade from in that case.
+fetch() {
+  case "$1" in
+    https://*) curl -fsSL --proto '=https' --proto-redir '=https' "$1" ;;
+    *)         curl -fsSL "$1" ;;
+  esac
+}
+
+# sha256_of prints the SHA-256 of the file named by $1, as lowercase hex.
+#
+# Each tool is handed the file on stdin rather than as an argument. With no
+# filename to echo back, the output is the hash plus a fixed label, so the
+# extraction below does not have to care that OpenSSL 3 prints
+# "SHA2-256(stdin)=" where OpenSSL 1 printed "SHA256(stdin)=":
+#
+#   sha256sum      <hash>  -
+#   shasum -a 256  <hash>  -
+#   openssl dgst   SHA2-256(stdin)= <hash>
+#
+# ${out%% *} is everything before the first space (the first two forms);
+# ${out##* } is everything after the last space (the OpenSSL form).
+sha256_of() {
+  case "$SHA_TOOL" in
+    sha256sum) out="$(sha256sum        < "$1")" ; printf '%s' "${out%% *}" ;;
+    shasum)    out="$(shasum -a 256    < "$1")" ; printf '%s' "${out%% *}" ;;
+    openssl)   out="$(openssl dgst -sha256 < "$1")" ; printf '%s' "${out##* }" ;;
+  esac
+}
+
+# is_sha256 succeeds only for exactly 64 lowercase hex characters.
+#
+# Every hash this script compares is run through it first. Without that, the
+# two ways a hash can come back empty — a tool that printed nothing, a
+# checksums.txt with no line for our archive — would compare equal to each
+# other and the comparison would pass on two empty strings. An empty hash is
+# not a match; it is a failure, and this is what turns it into one.
+is_sha256() {
+  case "$1" in
+    "" | *[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 64 ]
+}
+
 # ---------------------------------------------------------------------------
 # Step 4: Resolve what to install
 #
@@ -98,22 +257,17 @@ fi
 #   { "tag_name": "v0.5.0", "name": "Release v0.5.0", ... }
 #
 # We extract tag_name with grep + sed, which are available on all POSIX
-# systems without needing jq.
-#
-# curl flags:
-#   -f  fail fast (exit non-zero on HTTP 4xx/5xx, not print error page)
-#   -s  silent (no progress bar)
-#   -S  still show error messages even with -s
-#   -L  follow redirects
+# systems without needing jq. See fetch() above for the curl flags.
 # ---------------------------------------------------------------------------
 FROM_SOURCE=0
 case "$REF" in
   "")
     info "fetching latest release from GitHub..."
-    API_URL="https://api.github.com/repos/${REPO}/releases/latest"
-    VERSION="$(curl -fsSL "$API_URL" \
+    API_URL="${API_BASE_URL}/repos/${REPO}/releases/latest"
+    VERSION="$(fetch "$API_URL" \
       | grep '"tag_name"' \
-      | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
+      | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' \
+      | head -1)"
 
     if [ -z "$VERSION" ]; then
       error "could not determine latest release version.\nCheck your internet connection or visit: https://github.com/${REPO}/releases"
@@ -131,15 +285,41 @@ case "$REF" in
     ;;
 esac
 
+# A release tag becomes part of a URL, part of a filename on this machine, and
+# — once the archive is downloaded — the key looked up in checksums.txt. It is
+# also not entirely ours: with no argument it is whatever the GitHub API
+# replied with. Constrain it to the characters a version tag can actually
+# contain, so that none of those three uses can be steered somewhere else by a
+# tag containing a slash or a "..".
+if [ "$FROM_SOURCE" = 0 ]; then
+  case "$VERSION" in
+    v[0-9]*) ;;
+    *) error "refusing to install: $VERSION does not look like a release tag." ;;
+  esac
+  case "$VERSION" in
+    *[!0-9A-Za-z.+_-]*) error "refusing to install: release tag $VERSION contains characters a tag cannot have." ;;
+  esac
+fi
+
 # ---------------------------------------------------------------------------
 # Step 5: Get the binary into a temporary directory
 #
 # mktemp -d creates a new temporary directory with a random name, e.g.
 # /tmp/tmp.a3Bx9q.  The `trap` ensures we delete it on exit — whether the
 # script succeeds, fails, or the user presses Ctrl+C.
+#
+# INT/HUP/TERM are listed alongside EXIT because dash — which is /bin/sh on
+# Debian and Ubuntu — does not run an EXIT-only trap when the script is
+# interrupted, and would leave the download behind.
+#
+# For a release tag this step only DOWNLOADS. Nothing is unpacked here; that
+# waits for Step 6, on the other side of the checks.
 # ---------------------------------------------------------------------------
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT   # cleanup on any exit
+# BSD mktemp (macOS) has no form that takes neither a template nor -t, so
+# the bare call GNU accepts fails there. Everything past this point hangs
+# off TMP_DIR, so a failure here would surface as a verification bug.
+TMP_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t constle)"
+trap 'rm -rf "$TMP_DIR"' EXIT INT HUP TERM   # cleanup on any exit
 
 if [ "$FROM_SOURCE" = 1 ]; then
   # -------------------------------------------------------------------------
@@ -160,8 +340,24 @@ if [ "$FROM_SOURCE" = 1 ]; then
     error "installing a specific commit builds from source, which needs Go.\nInstall Go (https://go.dev/dl) or pick a tagged release instead:\n  curl -fsSL https://constle.dev/install | sh -s -- v0.5.0"
   fi
 
+  # The environment is cleared of everything that can switch the Go checksum
+  # database off, because that database is the only thing verifying this path
+  # — there is no archive here to checksum and no checksums.txt to read. A
+  # user or CI runner with GOSUMDB=off or GOPRIVATE=github.com/* set would
+  # otherwise get an unverified build and the same success message.
+  #
+  # GOENV=off is the load-bearing part, and it is not obvious. Go treats a
+  # variable set to the EMPTY string as unset and falls back to the file
+  # named by GOENV, so GOPRIVATE= alone does NOT undo a persisted
+  # `go env -w GOPRIVATE=github.com/*` — and that pattern excludes this
+  # module from checksum-database verification entirely, while
+  # GOSUMDB=sum.golang.org sits next to it looking reassuring. GOENV=off
+  # disables that file, and `go env -w GOENV=...` is itself refused, so it
+  # cannot be poisoned the same way. The empty assignments still matter:
+  # they cover the variables inherited from the calling process.
   info "building github.com/${REPO}@${REF} from source (go install)..."
-  if ! GOBIN="$TMP_DIR" GOFLAGS= go install \
+  if ! GOBIN="$TMP_DIR" GOENV=off GOFLAGS= GOPRIVATE= GONOPROXY= GONOSUMDB= GOINSECURE= \
+      GOSUMDB=sum.golang.org go install \
       -ldflags "-X main.constleVersion=0.0.0-${REF}" \
       "github.com/${REPO}/cmd/${BINARY}@${REF}"; then
     error "go install failed for commit ${REF}.\nCheck that the commit exists on https://github.com/${REPO} and is spelled fully enough to be unambiguous."
@@ -181,32 +377,168 @@ else
   # -------------------------------------------------------------------------
   VERSION_NO_V="${VERSION#v}"   # strip the leading "v": "v0.5.0" → "0.5.0"
   ARCHIVE="constle_${VERSION_NO_V}_${OS}_${ARCH}.tar.gz"
-  URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARCHIVE}"
+  RELEASE_URL="${BASE_URL}/${REPO}/releases/download/${VERSION}"
+
+  # The archive is saved under a fixed local name rather than under $ARCHIVE.
+  # $ARCHIVE is the key we will look up in checksums.txt, and keeping it out
+  # of any path this script writes to means the lookup key and the filesystem
+  # never have to agree about anything.
+  ARCHIVE_PATH="$TMP_DIR/archive.tar.gz"
 
   info "downloading $ARCHIVE..."
-  if ! curl -fsSL "$URL" -o "$TMP_DIR/$ARCHIVE"; then
+  if ! fetch "${RELEASE_URL}/${ARCHIVE}" > "$ARCHIVE_PATH"; then
     error "cannot download ${ARCHIVE}.\nDoes release ${VERSION} exist? See: https://github.com/${REPO}/releases"
   fi
+fi
 
+# ---------------------------------------------------------------------------
+# Step 6: Verify the download, then unpack it
+#
+# Up to this point the archive is just bytes off the network. Two independent
+# things have to hold before any of it is unpacked, made executable, or moved
+# anywhere:
+#
+#   1. checksums.txt has to be the one this project published. Every release
+#      carries a cosign signature over that file, so when cosign is on this
+#      machine we check it, pinned to the identity of the release workflow.
+#   2. The archive's SHA-256 has to equal the line checksums.txt has for it.
+#
+# They are checked in that order on purpose. A checksum is worth exactly as
+# much as the file it was read from: someone who can replace the archive on a
+# release can replace checksums.txt next to it just as easily, and would.
+# Checking the signature first is what makes step 2 mean something.
+#
+# What happens when a link is missing rather than broken:
+#
+#   cosign not installed       → say so, continue with the checksum only
+#   release has no signature   → say so, continue with the checksum only
+#   signature present, FAILS   → stop, always, with no way to override
+#
+# The first two are the reason CONSTLE_REQUIRE_SIGNATURE exists: set it to 1
+# and they become failures too. The third is never negotiable, because an
+# override there would turn every blocked network into a silent downgrade.
+#
+# The from-source path skips all of this. There is no archive and no
+# checksums.txt for an untagged commit; what protects it instead is the Go
+# module checksum database, which `go install` consults on its own.
+# ---------------------------------------------------------------------------
+if [ "$FROM_SOURCE" = 1 ]; then
+  ok "source build fetched with sum.golang.org verification enabled"
+else
+  info "downloading checksums.txt..."
+  if ! fetch "${RELEASE_URL}/checksums.txt" > "$TMP_DIR/checksums.txt"; then
+    error "release ${VERSION} has no checksums.txt, so ${ARCHIVE} cannot be verified.\nThis script will not install an unverified binary.\nSee: https://github.com/${REPO}/releases/tag/${VERSION}"
+  fi
+
+  # ---- Link 1: is checksums.txt the file this project published? ----------
+  #
+  # cosign exits non-zero when it cannot prove that, and that exit status is
+  # the whole answer. We deliberately do not read what it printed: its output
+  # is derived from a file an attacker may have written, and a trust decision
+  # that greps attacker-influenced text is not a trust decision.
+  if ! command -v cosign > /dev/null 2>&1; then
+    SIGNATURE_STATE="cosign is not installed"
+  elif ! fetch "${RELEASE_URL}/checksums.txt.sig" > "$TMP_DIR/checksums.txt.sig" ||
+       ! fetch "${RELEASE_URL}/checksums.txt.pem" > "$TMP_DIR/checksums.txt.pem"; then
+    SIGNATURE_STATE="release ${VERSION} was published without a signature"
+  else
+    info "verifying the signature over checksums.txt..."
+    # `command cosign`, not a bare `cosign`: a shell FUNCTION named cosign
+    # would be found by `command -v` above and dispatched to by a bare call.
+    # install.ps1 closes the same hole with -CommandType Application.
+    if ! command cosign verify-blob \
+        --certificate "$TMP_DIR/checksums.txt.pem" \
+        --signature "$TMP_DIR/checksums.txt.sig" \
+        --certificate-identity-regexp "$COSIGN_IDENTITY_REGEXP" \
+        --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+        "$TMP_DIR/checksums.txt" > /dev/null 2>&1; then
+      error "SIGNATURE VERIFICATION FAILED for checksums.txt of release ${VERSION}.\n\nThe signature does not prove this file came from ${REPO}'s release workflow.\nNothing has been installed.\n\nIf you can reproduce this, please report it privately:\n  https://github.com/${REPO}/security/advisories/new"
+    fi
+    SIGNATURE_STATE=""
+    ok "signature verified: checksums.txt came from ${REPO}'s release workflow"
+  fi
+
+  # A signature that could not be checked is a weaker install, not a safe one,
+  # so it is stated on the terminal rather than passed over in silence — and
+  # CONSTLE_REQUIRE_SIGNATURE=1 turns it into a refusal.
+  if [ -n "${SIGNATURE_STATE:-}" ]; then
+    if [ "$REQUIRE_SIGNATURE" = 1 ]; then
+      error "CONSTLE_REQUIRE_SIGNATURE is set, but the signature could not be checked:\n  ${SIGNATURE_STATE}.\nNothing has been installed."
+    fi
+    info "signature not checked (${SIGNATURE_STATE}); verifying the checksum only"
+  fi
+
+  # ---- Link 2: is this archive the one checksums.txt names? --------------
+  #
+  # GoReleaser writes one line per archive, as a lowercase SHA-256, two
+  # spaces, and the bare filename:
+  #
+  #   c5efc3c4…a429  constle_0.5.0_linux_amd64.tar.gz
+  #
+  # The line is found by comparing the whole second field for equality, not
+  # by searching for the name inside the file. A search would also match a
+  # line an attacker appended for a name that merely contains ours, and would
+  # let a prepended duplicate decide the answer. `n != 1` at the end means a
+  # missing entry and a duplicated entry both come back empty, and the check
+  # below turns both into a refusal.
+  #
+  # tr -d '\r' first, so a checksums.txt that ever picks up CRLF line endings
+  # does not leave a stray carriage return welded to the filename.
+  # The trailing tr lowercases the digest. GoReleaser writes lowercase, but
+  # PowerShell's Get-FileHash returns uppercase, and any tool that regenerated
+  # this file could write either. Normalising here means the two installers
+  # accept exactly the same checksums.txt - a divergence the shared table in
+  # scripts/install_test.go would otherwise let through.
+  EXPECTED="$(tr -d '\r' < "$TMP_DIR/checksums.txt" \
+    | awk -v want="$ARCHIVE" 'NF == 2 && $2 == want { hash = $1; n++ } END { if (n == 1) print hash }' \
+    | tr 'ABCDEF' 'abcdef')"
+
+  if ! is_sha256 "$EXPECTED"; then
+    error "checksums.txt for release ${VERSION} has no single entry for ${ARCHIVE}.\nThe archive cannot be verified, so it will not be installed."
+  fi
+
+  info "verifying the checksum of ${ARCHIVE}..."
+  # `|| ACTUAL=""` is not decoration. Under set -e a command substitution
+  # that fails inside an assignment kills the script on the spot, so a hash
+  # tool that exists but FAILS — a full disk, an unreadable file — would
+  # exit with that tool's status and the message below, which is the only
+  # thing that would tell anyone what happened, would never print. Forcing
+  # the empty string routes it into is_sha256 instead, which refuses.
+  ACTUAL="$(sha256_of "$ARCHIVE_PATH")" || ACTUAL=""
+  if ! is_sha256 "$ACTUAL"; then
+    error "could not compute the SHA-256 of the downloaded archive using ${SHA_TOOL}.\nNothing has been installed."
+  fi
+
+  if [ "$ACTUAL" != "$EXPECTED" ]; then
+    error "CHECKSUM MISMATCH for ${ARCHIVE}.\n\n  expected: ${EXPECTED}\n  actual:   ${ACTUAL}\n\nThe downloaded file is not the one this release published. That is either a\ncorrupted download or a tampered one. Nothing has been installed.\n\nIf it happens again, please report it privately:\n  https://github.com/${REPO}/security/advisories/new"
+  fi
+  ok "checksum verified: ${ARCHIVE}"
+
+  # Only now is the archive unpacked.
+  #
   # tar flags:
   #   -x  extract
   #   -z  decompress with gzip (.tar.gz)
   #   -f  read from this file
   #   -C  change to this directory before extracting
   #
-  # After extraction, find the binary anywhere in the temp dir (handles the
-  # case where GoReleaser wraps files in a subdirectory).
+  # It goes into its own subdirectory so that what comes out cannot land on
+  # top of checksums.txt or the archive itself, and the binary is then taken
+  # from the one path GoReleaser puts it at rather than searched for. Both of
+  # those only matter because the bytes are already verified — an archive that
+  # gets to choose which file becomes /usr/local/bin/constle has already won.
   info "extracting..."
-  tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"
+  mkdir "$TMP_DIR/unpacked"
+  tar -xzf "$ARCHIVE_PATH" -C "$TMP_DIR/unpacked"
 
-  BINARY_PATH="$(find "$TMP_DIR" -name "$BINARY" -type f | head -1)"
-  if [ -z "$BINARY_PATH" ]; then
+  BINARY_PATH="$TMP_DIR/unpacked/$BINARY"
+  if [ ! -f "$BINARY_PATH" ]; then
     error "binary '$BINARY' not found in archive — please report this at https://github.com/${REPO}/issues"
   fi
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Install
+# Step 7: Install
 #
 # Try writing to INSTALL_DIR directly.  If that fails (permission denied),
 # retry with sudo.  This way users who run as root or have write access don't
@@ -229,7 +561,16 @@ fi
 # Done!
 # ---------------------------------------------------------------------------
 printf "\n"
-ok "constle ${VERSION} installed to ${INSTALL_DIR}/${BINARY}"
+# Say which guarantee was actually obtained. For every release published so far
+# and for anyone without cosign, this reduces to a corruption check, and the
+# last line before the binary is on PATH is the wrong place to be vague.
+if [ "$FROM_SOURCE" = 1 ]; then
+  ok "constle ${VERSION} installed to ${INSTALL_DIR}/${BINARY} (built from source)"
+elif [ -n "${SIGNATURE_STATE:-}" ]; then
+  ok "constle ${VERSION} installed to ${INSTALL_DIR}/${BINARY} (checksum verified; signature NOT checked)"
+else
+  ok "constle ${VERSION} installed to ${INSTALL_DIR}/${BINARY} (checksum and signature verified)"
+fi
 printf "\n  Get started:\n"
 printf "    constle --help\n"
 printf "    constle validate agent.yaml\n\n"
