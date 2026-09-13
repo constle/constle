@@ -97,13 +97,16 @@ scan_stream() {
     content="$2"     # path to a file holding the content to scan
     clean=0
 
-    hits=$(LC_ALL=C grep -inE -f "$PATTERN_FILE" "$content" | head -20) || true
+    # 2>&1: GNU grep reports a binary-file match ("binary file X matches")
+    # on stderr with nothing on stdout, so a binary file with a hit would
+    # read as clean unless stderr is captured too.
+    hits=$(LC_ALL=C grep -inE -f "$PATTERN_FILE" "$content" 2>&1 | head -20) || true
     if [ -n "$hits" ]; then
         printf '✗ %s: identity/attribution pattern hits:\n%s\n' "$label" "$hits"
         clean=1
     fi
 
-    heb=$(LC_ALL=C grep -nE "$HEBREW_RE" "$content" | head -5) || true
+    heb=$(LC_ALL=C grep -nE "$HEBREW_RE" "$content" 2>&1 | head -5) || true
     if [ -n "$heb" ]; then
         printf '✗ %s: Hebrew characters found:\n%s\n' "$label" "$heb"
         clean=1
