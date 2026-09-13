@@ -24,6 +24,11 @@ const (
 	bootMinimumHeight = 24
 	bootMaximumWidth  = 100
 	bootMaximumHeight = 23
+
+	bootDefaultBackground = "\x1b[49m"
+	bootScreenEnter       = "\x1b[?1049h\x1b[0m" + bootDefaultBackground + "\x1b[2J\x1b[H\x1b[?25l"
+	bootScreenClear       = "\x1b[0m" + bootDefaultBackground + "\x1b[2J\x1b[H"
+	bootScreenLeave       = "\x1b[0m\x1b[?1049l\x1b[0m"
 )
 
 // bootAnimationOutcome describes whether the cinematic reached its authored
@@ -341,7 +346,6 @@ func newBootViewport(terminalWidth, terminalHeight int) bootViewport {
 
 type bootANSI struct {
 	foreground [bootColorCount]string
-	background string
 }
 
 func newBootANSI(profile termenv.Profile) bootANSI {
@@ -351,9 +355,6 @@ func newBootANSI(profile termenv.Profile) bootANSI {
 		if sequence != "" {
 			ansi.foreground[index] = "\x1b[" + sequence + "m"
 		}
-	}
-	if sequence := profile.Color("#050710").Sequence(true); sequence != "" {
-		ansi.background = "\x1b[" + sequence + "m"
 	}
 	return ansi
 }
@@ -379,9 +380,6 @@ func playBootAnimation(version string) (outcome bootAnimationOutcome) {
 		return bootAnimationAborted
 	}
 	ansi := newBootANSI(profile)
-	if ansi.background == "" {
-		return bootAnimationAborted
-	}
 	version = safeBootVersion(version)
 
 	signals := make(chan os.Signal, 1)
@@ -394,7 +392,7 @@ func playBootAnimation(version string) (outcome bootAnimationOutcome) {
 	// restores the primary buffer, avoiding a flash of the old prompt between
 	// the cinematic and its persistent settled state.
 	defer func() {
-		cleanup := "\x1b[0m\x1b[?1049l"
+		cleanup := bootScreenLeave
 		if outcome == bootAnimationComplete {
 			cleanup += encodeBootPrimaryLockup(version, terminalWidth, ansi)
 		}
@@ -403,7 +401,7 @@ func playBootAnimation(version string) (outcome bootAnimationOutcome) {
 			outcome = bootAnimationAborted
 		}
 	}()
-	if err := writeBootOutput("\x1b[?1049h" + ansi.background + "\x1b[2J\x1b[H\x1b[?25l"); err != nil {
+	if err := writeBootOutput(bootScreenEnter); err != nil {
 		return bootAnimationAborted
 	}
 
@@ -434,7 +432,7 @@ func playBootAnimation(version string) (outcome bootAnimationOutcome) {
 				terminalWidth, terminalHeight = newWidth, newHeight
 				viewport = newBootViewport(newWidth, newHeight)
 				frame = newBootFrame(viewport.width, viewport.height)
-				if err := writeBootOutput(ansi.background + "\x1b[2J\x1b[H"); err != nil {
+				if err := writeBootOutput(bootScreenClear); err != nil {
 					return bootAnimationAborted
 				}
 			}
@@ -1198,6 +1196,7 @@ func encodeBootFrame(frame *bootFrame, viewport bootViewport, ansi bootANSI) str
 		if activeColor != bootColorCount {
 			output.WriteString("\x1b[39m")
 		}
+		output.WriteString(bootDefaultBackground)
 		output.WriteString("\x1b[K")
 	}
 	return output.String()
