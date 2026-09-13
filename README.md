@@ -435,7 +435,7 @@ sha256sum --check --ignore-missing checksums.txt
 ```
 
 > [!CAUTION]
-> The two `--certificate-*` flags are not optional. Keyless signing has no fixed public key — without pinning the identity, cosign will report `Verified OK` for a file signed by anyone. Pinning to `constle/constle`'s release workflow is what turns the signature into proof it came from here.
+> The two `--certificate-*` flags are **not optional.** Keyless signing has no fixed public key — without pinning the identity, cosign will report `Verified OK` for a file signed by anyone. Pinning to `constle/constle`'s release workflow is what turns the signature into proof it came from here.
 
 Provenance attestation: `gh attestation verify constle_<version>_linux_amd64.tar.gz --repo constle/constle`.
 
