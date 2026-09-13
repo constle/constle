@@ -429,7 +429,7 @@ func playBootAnimation(version string) (outcome bootAnimationOutcome) {
 				return bootAnimationAborted
 			}
 			if newWidth != viewport.terminalWidth || newHeight != viewport.terminalHeight {
-				terminalWidth, terminalHeight = newWidth, newHeight
+				terminalWidth, _ = newWidth, newHeight
 				viewport = newBootViewport(newWidth, newHeight)
 				frame = newBootFrame(viewport.width, viewport.height)
 				if err := writeBootOutput(bootScreenClear); err != nil {
