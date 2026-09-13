@@ -90,7 +90,7 @@ Constle is **not a framework.** It doesn't decide how an agent reasons or plans 
 
 ## What Constle enforces
 
-<details>
+<details markdown="1">
 <summary><strong>All nine capabilities — mechanism and status</strong></summary>
 
 <!-- --8<-- [start:enforces] -->
@@ -113,7 +113,7 @@ Constle is **not a framework.** It doesn't decide how an agent reasons or plans 
 
 ## How network isolation actually works
 
-<details>
+<details markdown="1">
 <summary><strong>No default route, a <code>dstdomain</code> allowlist, and why the proxy cannot be skipped</strong></summary>
 
 <!-- The docs site draws this next hop as a diagram, so the snippet it pulls
@@ -177,7 +177,14 @@ cd constle
 go build -o constle ./cmd/constle
 ```
 
-Pre-built binaries for Linux, macOS, and Windows are on the [releases page](https://github.com/constle/constle/releases) — see [Verifying a release](#verifying-a-release) before you trust one.
+Or install a pre-built binary for Linux, macOS, or Windows:
+
+```
+curl -fsSL https://constle.dev/install | sh        # Linux, macOS
+iwr -useb https://constle.dev/install.ps1 | iex    # Windows PowerShell
+```
+
+The installer fetches `checksums.txt` for the release it is installing and refuses to unpack an archive whose SHA-256 does not match. When `cosign` is on your PATH it checks the release workflow's signature over `checksums.txt` first, pinned to the identity in [Verifying a release](#verifying-a-release), and aborts if that fails; without `cosign` it says so on the terminal and enforces the checksum alone. Downloading an archive by hand from the [releases page](https://github.com/constle/constle/releases) skips all of this — see [Verifying a release](#verifying-a-release) before you trust one.
 
 **2. Check the example manifest without running anything:**
 
@@ -239,7 +246,38 @@ constle v0.4.0
 > [!NOTE]
 > `constle run` takes no `--env` flag. Exactly three host variables are forwarded into the sandbox — `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, and `AGENT_TASK` — and they're never written into the image or the manifest.
 
-**4. Sign the audit trail** (optional, ~20 seconds more): `constle identity create`, paste the DID into the manifest, run again, then `constle audit verify` catches a single edited byte. Walkthrough: [docs.constle.dev/quickstart](https://docs.constle.dev/quickstart/#sign-the-audit-trail).
+**4. Sign the audit trail** (optional, ~20 seconds more): `constle identity create`, paste the DID into the manifest, run again, then `constle audit verify` catches a single edited byte.
+
+<details markdown="1">
+<summary><strong>The four commands, and what tampering looks like when it is caught</strong></summary>
+
+```
+./constle identity create my-agent --owner=you@example.com
+```
+
+Paste the printed `did:key:...` into the manifest under `identity.did`, run again, then:
+
+```
+./constle audit verify ~/.constle/logs/my-agent-$(date -u +%F).jsonl
+```
+
+```
+✓ audit log verified: ~/.constle/logs/my-agent-2026-08-08.jsonl
+
+  entries:   2 (all signatures valid, hash chain intact)
+  signed by: did:key:z6MkgroKowQYDZjDmqbn82mJv4YFPKowS2xDhxGYrp4u3P1o
+```
+
+Edit a single byte of that file and re-run it:
+
+```
+error: TAMPERING DETECTED in ~/.constle/logs/my-agent-2026-08-08.jsonl
+  line 1: invalid_signature — signature does not verify against did:key:z6Mkg… — the entry was edited after signing
+```
+
+With `identity.did` set, `constle run` also **fails closed**: if the manifest names a DID with no matching private key on this machine, the run refuses to start rather than proceeding under an identity it cannot actually prove.
+
+</details>
 <!-- --8<-- [end:quickstart] -->
 
 ---
@@ -327,7 +365,7 @@ Five gaps, all documented and deliberate rather than discovered later. Each one 
 4. **The A2A replay guard is in-memory and per-run** — it doesn't survive a `constle` restart.
 5. **`sandbox.network.egress` is declared but has no consumer** — `allowed_hosts` is the entire network policy; treat an empty list as "deny all."
 
-<details>
+<details markdown="1">
 <summary><strong>Full explanation and source reference for each</strong></summary>
 
 <!-- --8<-- [start:limitations-detail] -->
@@ -396,7 +434,7 @@ Also on the docs site: [docs.constle.dev/limitations](https://docs.constle.dev/l
 
 ## CLI reference
 
-<details>
+<details markdown="1">
 <summary><strong>Every <code>constle</code> subcommand</strong></summary>
 
 <!-- --8<-- [start:cli] -->
