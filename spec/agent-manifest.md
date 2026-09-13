@@ -698,6 +698,21 @@ the sandbox, and the sandbox network blocks every direct path to it (§7.2).
 The gate is what makes tool allowlists, human gates, and spending metering
 enforceable: the call must physically traverse it.
 
+**Transport surface.** The gate accepts only the three HTTP methods Streamable
+HTTP defines on an MCP endpoint — `POST`, which carries every JSON-RPC message,
+`GET`, which opens the server→client SSE stream, and `DELETE`, which terminates
+the session. Any other method is refused with `405 Method Not Allowed` and an
+`Allow: GET, POST, DELETE` header, and is never forwarded. Because the spec
+puts every JSON-RPC message on a `POST` — "Every JSON-RPC message sent from
+the client MUST be a new HTTP POST request to the MCP endpoint" — a `GET` or
+`DELETE` carrying a request body is refused with `400`. Both refusals are
+recorded as `mcp_request_blocked` audit events.
+
+This matters because the gate's checks are driven by the JSON-RPC it reads: a
+`tools/call` smuggled onto a method the gate did not inspect would reach the
+upstream with the tool allowlist, the human gate, spending metering, and the
+`tool_call_start` / `tool_call_end` records all skipped.
+
 ### 9.1 `mcp.servers[].id`
 
 | | |

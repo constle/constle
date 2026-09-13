@@ -54,9 +54,15 @@ import (
 	"github.com/constle/constle/pkg/manifest"
 )
 
-// maxBodyBytes caps how much of a POST body the gate reads for inspection.
+// maxBodyBytes caps how much of a request body the gate reads for inspection.
 // Requests above the cap fail closed — an uninspectable call is never forwarded.
 const maxBodyBytes = 10 << 20 // 10 MB
+
+// allowedMethods is the Allow header the gate answers a rejected method with,
+// and the set ServeHTTP admits: the three methods Streamable HTTP defines on
+// the MCP endpoint. Spelled in the header's canonical order, matching what the
+// reference MCP server implementations advertise.
+const allowedMethods = "GET, POST, DELETE"
 
 // Decision is the outcome of a human approval request.
 type Decision int
@@ -324,9 +330,26 @@ func (g *Gate) Close() error {
 }
 
 // ServeHTTP routes /{token}/servers/{id}[/...] to the matching upstream,
-// inspecting POSTed JSON-RPC for gated tools/call requests. Everything that
-// cannot be positively attributed to a declared server — wrong token,
-// unknown id, uninspectable body — fails closed.
+// inspecting JSON-RPC for gated tools/call requests. Everything that cannot be
+// positively attributed to a declared server and a method of the MCP transport
+// — wrong token, unknown id, undefined method, uninspectable body — fails
+// closed.
+//
+// Inspection is not conditioned on the HTTP method. A JSON-RPC tools/call is
+// the same request whether it is POSTed or attached to a GET, and an upstream
+// that routes on path alone will run it either way, so a method-shaped hole
+// here is a hole in the allowlist, the human gate, the spending meter and the
+// audit trail at once.
+//
+// KNOWN GAPS, in this handler, neither closed by the method allowlist:
+// the sub-path after the server id is forwarded without normalising dot
+// segments, so a client can address paths on the upstream origin other than
+// the declared endpoint; and a request carrying Connection: Upgrade is
+// forwarded on an admitted method like any other, so an upstream that answers
+// 101 leaves the gate splicing a raw tunnel it cannot inspect. Both predate
+// the method allowlist and both are tracked separately — the guarantee this
+// handler makes is over the JSON-RPC a request carries, not yet over every
+// byte it can move.
 func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rest, ok := strings.CutPrefix(r.URL.Path, "/"+g.token+"/servers/")
 	if !ok {
@@ -352,6 +375,41 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Method allowlist. Streamable HTTP — the only MCP transport Constle
+	// supports — defines exactly three methods on the endpoint: POST carries
+	// every JSON-RPC message, GET opens the server→client SSE stream, DELETE
+	// terminates the session. Nothing else is an MCP operation, so nothing
+	// else is forwarded: a method outside the set is refused here rather than
+	// proxied, because the gate cannot enforce a policy on a request whose
+	// protocol it does not model.
+	//
+	// The comparison must stay exact and case-sensitive (RFC 9110 §9.1: "the
+	// method token is case-sensitive"). net/http admits any valid token as a
+	// method, so a lowercase "post" is a different method than POST — folding
+	// case here would hand it the POST path's parse and re-open the bypass
+	// from the other side.
+	//
+	// 405 rather than this repo's usual fail-closed 404 (internal/a2a/gate.go)
+	// because the client is an MCP client and MCP gives both codes meanings:
+	// 405 is what the transport itself prescribes for a method the endpoint
+	// does not serve, and what both reference SDKs answer, while 404 means
+	// "this session was terminated" — on which a conforming client starts a
+	// new session, turning a refusal into a reconnect loop. RFC 9110 §15.5.6
+	// requires the Allow header on a 405.
+	switch r.Method {
+	case http.MethodPost, http.MethodGet, http.MethodDelete:
+	default:
+		g.log(audit.EventMCPRequestBlocked, map[string]any{
+			"server": up.id,
+			"method": clampMethod(r.Method),
+			"reason": "method not defined by the MCP transport",
+		})
+		w.Header().Set("Allow", allowedMethods)
+		http.Error(w, "constle mcp gate: "+allowedMethods+" are the only methods the MCP transport defines",
+			http.StatusMethodNotAllowed)
+		return
+	}
+
 	// Rewrite the path so the upstream sees exactly its own endpoint path,
 	// plus any sub-path the client appended after the server id.
 	r.URL.Path = up.path
@@ -359,29 +417,94 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path = strings.TrimSuffix(up.path, "/") + "/" + remainder
 	}
 
-	if r.Method != http.MethodPost {
-		// GET (server→client SSE stream) and DELETE (session termination)
-		// carry no client tool calls; pass through.
-		up.proxy.ServeHTTP(w, r)
-		return
-	}
-
-	g.servePOST(w, r, up)
+	g.serveInspected(w, r, up)
 }
 
-// servePOST inspects one JSON-RPC POST and applies allowlist + gate policy.
-func (g *Gate) servePOST(w http.ResponseWriter, r *http.Request, up *upstream) {
+// serveInspected inspects one request — whatever its method — and applies
+// allowlist + gate policy before any MCP message reaches the upstream.
+//
+// Every method the gate forwards arrives here, because the checks below are
+// what make the gate a gate: skipping them for a method is skipping the tool
+// allowlist, the human gate, spending metering and the tool_call audit
+// bracketing all at once, and the JSON-RPC body that selects a tool is
+// carried just as well by a GET as by a POST.
+//
+// The split between methods is therefore not "which ones are inspected" but
+// "what a legitimate body looks like for this one": POST carries the
+// JSON-RPC message, and GET and DELETE carry no message at all.
+func (g *Gate) serveInspected(w http.ResponseWriter, r *http.Request, up *upstream) {
 	// A body we cannot inspect is a body we do not forward.
 	if enc := r.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 		http.Error(w, "constle mcp gate: Content-Encoding not supported", http.StatusUnsupportedMediaType)
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	// net/http guarantees a non-nil Body on a server request; the fallback
+	// covers a hand-built Request that reaches ServeHTTP directly.
+	src := r.Body
+	if src == nil {
+		src = http.NoBody
+	}
+
+	// Only a POST can carry an MCP message, so only a POST needs its body
+	// read: on any other method the first byte already settles the question,
+	// and stopping there keeps a body the gate is about to refuse from being
+	// buffered, and keeps every non-POST refusal on the one audited path
+	// below rather than splitting it across the size cap.
+	//
+	// The decision has to come from bytes actually read, never from
+	// ContentLength: a chunked request declares no length (ContentLength -1),
+	// so a length-based test reads "no body" on exactly the framing an
+	// attacker controls.
+	limit := int64(maxBodyBytes) + 1
+	if r.Method != http.MethodPost {
+		limit = 1
+	}
+	body, err := io.ReadAll(io.LimitReader(src, limit))
 	if err != nil {
 		http.Error(w, "constle mcp gate: cannot read request body", http.StatusBadRequest)
 		return
 	}
+
+	if r.Method != http.MethodPost {
+		// GET and DELETE, the two non-POST methods the transport defines,
+		// carry no JSON-RPC message in any revision of it: "Every JSON-RPC
+		// message sent from the client MUST be a new HTTP POST request to the
+		// MCP endpoint." GET opens the server→client stream and DELETE names
+		// its session in a header, so for both of them a legitimate body is
+		// an absent one, and that is all there is to inspect in the JSON-RPC
+		// a request of theirs can carry. (It is not all a request can carry —
+		// see the KNOWN GAPS on ServeHTTP.)
+		//
+		// A body on one of them is refused rather than run through the gate
+		// below. It cannot have come from a conforming client, and gating it
+		// would be worse than refusing it: many servers ignore a GET body
+		// entirely, so the gate would prompt a human, bracket the call in the
+		// signed audit log, and meter the response — all for a tool call the
+		// upstream never ran, letting a sandboxed agent write fiction into
+		// the log and the spending ledger.
+		if len(body) > 0 {
+			g.log(audit.EventMCPRequestBlocked, map[string]any{
+				"server": up.id,
+				"method": clampMethod(r.Method),
+				"reason": "body on a method that carries no MCP message",
+			})
+			http.Error(w, fmt.Sprintf(
+				"constle mcp gate: %s carries no MCP message — a JSON-RPC body must be POSTed so the gate can inspect it",
+				clampMethod(r.Method)), http.StatusBadRequest)
+			return
+		}
+		// The body has been consumed to prove it was empty, so hand the proxy
+		// an explicitly empty one. http.NoBody with ContentLength 0 makes
+		// ReverseProxy send no body framing at all, which is what a bodiless
+		// GET looked like before it was read — a chunked empty body would
+		// otherwise be re-emitted as a lone terminating chunk that strict SSE
+		// endpoints reject.
+		r.Body, r.ContentLength, r.TransferEncoding = http.NoBody, 0, nil
+		up.proxy.ServeHTTP(w, r)
+		return
+	}
+
 	if len(body) > maxBodyBytes {
 		http.Error(w, "constle mcp gate: request body too large to inspect", http.StatusRequestEntityTooLarge)
 		return
@@ -649,6 +772,18 @@ func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter 
 // which for a proxied call means the upstream connection failed before any
 // response reached the agent.
 func (s *statusRecorder) status() int { return s.code }
+
+// clampMethod bounds a request method before it is logged or echoed. net/http
+// already rejects anything that is not a valid HTTP token, so the value is
+// safe to render; the cap keeps a long one from bloating an audit line, the
+// same principle as compactRPCID.
+func clampMethod(method string) string {
+	const maxMethodLen = 32
+	if len(method) > maxMethodLen {
+		return method[:maxMethodLen]
+	}
+	return method
+}
 
 // compactRPCID renders a JSON-RPC id for audit details: the raw JSON token
 // (`1`, `"abc"`), capped so a hostile id cannot bloat the log, and empty for

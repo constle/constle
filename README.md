@@ -251,7 +251,7 @@ So `egress: open` and `egress: none` both parse cleanly, change nothing about wh
 | **Max duration** | The agent is killed when `limits.max_duration_seconds` elapses; the kill is recorded as `terminated_by_limit`. | Shipped |
 | **Audit log** | JSONL per agent per UTC day. With `identity.did` set, every entry is Ed25519-signed and hash-chained; `constle audit verify` detects tampering and reports the offending line. | Shipped |
 | **Spending limits** | Hard `max_per_run_usd` and `max_per_day_usd`. Metered at the MCP gate against each server's declared `pricing`. The daily ledger is durable across runs, keyed by DID so a rename can't reset it. A priced server whose response omits a declared usage value kills the run - a server that could omit its usage field could zero its own bill. **Scope caveats: limitations 2 and 3.** | Shipped |
-| **Human gates** | Declared MCP servers are reachable only through a protocol-aware gate proxy. A matching `tools/call` pauses for a terminal approval; `on_timeout` defaults to `abort`. Non-interactive stdin (CI, piped input, backgrounded runs) is detected up front and announced, rather than blocking on a read that never resolves - the call then waits out its deadline and `on_timeout` decides. **Matching caveat: limitation 1.** | Shipped |
+| **Human gates** | Declared MCP servers are reachable only through a protocol-aware gate proxy. A matching `tools/call` pauses for a terminal approval; `on_timeout` defaults to `abort`. Non-interactive stdin (CI, piped input, backgrounded runs) is detected up front and announced, rather than blocking on a read that never resolves - the call then waits out its deadline and `on_timeout` decides. The gate accepts only the three methods the MCP transport defines (`POST`, `GET`, `DELETE`) and only accepts a JSON-RPC body on a `POST`, so a tool call cannot be re-sent on a method that skips inspection. **Matching caveat: limitation 1.** | Shipped |
 | **Cryptographic identity** | W3C `did:key` (Ed25519). The private key stays at `~/.constle/identities/<name>/` (mode 0600) and never enters the sandbox. `constle run` fails closed on a declared DID with no local key. | Shipped |
 | **Agent-to-agent messaging** | Signed envelopes to explicitly declared peers only. The host signs and verifies; the sandbox does no cryptography and never sees a peer's real endpoint. No discovery mechanism exists, by design. **Replay caveat: limitation 4.** | Shipped |
 | **Agent commerce** | - | Not built |
@@ -388,6 +388,7 @@ If a document the agent reads contains a hidden instruction to exfiltrate data t
 <!-- --8<-- [start:cli] -->
 | Command | Description |
 |---|---|
+| `constle [--no-animation]` | Show the startup screen and command overview |
 | `constle run [--backend=docker\|firecracker] [--accept-isolation=<level>] <agentfile>` | Run an agent in an isolated sandbox |
 | `constle validate <agentfile>` | Validate an Agentfile without running it |
 | `constle init` | Scaffold a starter Agentfile in the current directory |
@@ -397,6 +398,8 @@ If a document the agent reads contains a hidden instruction to exfiltrate data t
 | `constle identity show <name>` | Show an agent's DID and key location |
 | `constle audit verify [--did=<did:key:…>] <logfile>` | Verify an audit log's signatures and hash chain |
 | `constle version` | Print the version |
+
+Running bare `constle` in an interactive terminal plays the startup animation before the command overview. Use `constle --no-animation` to skip it for one invocation, or set `CONSTLE_ANIMATION` to `auto` (the default), `never`, or `always`. The animation is always suppressed for non-interactive output, `NO_COLOR`, `TERM=dumb`, or terminals smaller than 80×24; `always` overrides CI detection only.
 <!-- --8<-- [end:cli] -->
 
 ---
