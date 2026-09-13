@@ -144,7 +144,7 @@ constle v0.4.0
   → parsing examples/basic-agent/agent.yaml
   ✓ Agentfile valid
      agent:     basic-agent v0.1.0
-     isolation: network
+     isolation: network (requested)
      memory:    512MB
      network:   restricted → api.groq.com
      spending:  run≤$0.10 (NOT ENFORCED - no priced MCP servers)
@@ -253,12 +253,12 @@ So `egress: open` and `egress: none` both parse cleanly, change nothing about wh
 <!-- --8<-- [start:enforces] -->
 | Capability | Mechanism | Status |
 |---|---|---|
-| **Sandboxed execution** | Firecracker microVM (hardware isolation) or a two-network Docker sandbox with no default gateway. Auto-detected, or forced with `--backend=docker\|firecracker`. A declared `isolation:` level is a minimum contract: `isolation: kernel` selects Firecracker and the run **fails closed** if Firecracker is unavailable, unless an operator explicitly accepts a weaker boundary with `--accept-isolation=<level>`. | Shipped |
+| **Sandboxed execution** | Firecracker microVM (hardware isolation) or a two-network Docker sandbox with no default gateway. Auto-detected, or forced with `--backend=docker\|firecracker`. A declared `isolation:` level is a minimum contract on two axes. Against `capabilities`: it may be stronger than they require but never weaker, or the Agentfile is rejected at validate time naming the capability that forces the floor. Against the host: `isolation: kernel` selects Firecracker and the run **fails closed** if Firecracker is unavailable, unless an operator explicitly accepts a weaker boundary with `--accept-isolation=<level>` - which covers that axis only and cannot waive the capability-floor rejection, though it can still put one run on a weaker boundary, named by the operator and recorded. | Shipped |
 | **Network egress** | All egress traverses a Squid proxy allowlisting `network.allowed_hosts`. Matching is name-based (`dstdomain`), and a separate rule denies destinations given as raw IPs - including the real IP of an allowed host - so resolving a name yourself and connecting to the address is not a way around the allowlist. Every allow and every block is an audit event. | Shipped |
 | **Max duration** | The agent is killed when `limits.max_duration_seconds` elapses; the kill is recorded as `terminated_by_limit`. | Shipped |
 | **Audit log** | JSONL per agent per UTC day. With `identity.did` set, every entry is Ed25519-signed and hash-chained; `constle audit verify` detects tampering and reports the offending line. | Shipped |
 | **Spending limits** | Hard `max_per_run_usd` and `max_per_day_usd`. Metered at the MCP gate against each server's declared `pricing`. The daily ledger is durable across runs, keyed by DID so a rename can't reset it. A priced server whose response omits a declared usage value kills the run - a server that could omit its usage field could zero its own bill. **Scope caveats: limitations 2 and 3.** | Shipped |
-| **Human gates** | Declared MCP servers are reachable only through a protocol-aware gate proxy. A matching `tools/call` pauses for a terminal approval; `on_timeout` defaults to `abort`. Non-interactive stdin (CI, piped input, backgrounded runs) is detected up front and announced, rather than blocking on a read that never resolves - the call then waits out its deadline and `on_timeout` decides. **Matching caveat: limitation 1.** | Shipped |
+| **Human gates** | Declared MCP servers are reachable only through a protocol-aware gate proxy. A matching `tools/call` pauses for a terminal approval; `on_timeout` defaults to `abort`. Non-interactive stdin (CI, piped input, backgrounded runs) is detected up front and announced, rather than blocking on a read that never resolves - the call then waits out its deadline and `on_timeout` decides. The gate accepts only the three methods the MCP transport defines (`POST`, `GET`, `DELETE`) and only accepts a JSON-RPC body on a `POST`, so a tool call cannot be re-sent on a method that skips inspection. **Matching caveat: limitation 1.** | Shipped |
 | **Cryptographic identity** | W3C `did:key` (Ed25519). The private key stays at `~/.constle/identities/<name>/` (mode 0600) and never enters the sandbox. `constle run` fails closed on a declared DID with no local key. | Shipped |
 | **Agent-to-agent messaging** | Signed envelopes to explicitly declared peers only. The host signs and verifies; the sandbox does no cryptography and never sees a peer's real endpoint. No discovery mechanism exists, by design. **Replay caveat: limitation 4.** | Shipped |
 | **Agent commerce** | - | Not built |
@@ -285,7 +285,7 @@ identity:
 
 sandbox:
   image: invoice-processor:latest
-  isolation: kernel               # or omit - inferred from capabilities
+  isolation: kernel               # or omit - derived from capabilities; never weaker than they require
   memory_mb: 512
   network:
     egress: restricted            # declared only - see limitation 5

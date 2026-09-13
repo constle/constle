@@ -5,9 +5,12 @@
 //
 // Verification (VerifyDecision) never recomputes a digest — it only
 // compares the response's echoed request_id and subject_digest against the
-// ones already sent, byte for byte (§7 steps 4-5) — so SubjectDigest has
-// exactly one caller in this codebase: whatever builds the outbound request,
+// ones already sent, byte for byte (§7 steps 4-5). Only one caller's digest
+// is ever load-bearing, therefore: whatever builds the outbound request,
 // which is also what holds the request_id both halves are checked against.
+// mcpgate.runGate calls SubjectDigest a second time, for the terminal prompt
+// and the audit trail; that copy names the call for a human and is never
+// compared against a signature.
 package humangate
 
 import (

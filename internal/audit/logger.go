@@ -50,6 +50,15 @@ const (
 	EventNetworkBlocked        EventType = "network_blocked"
 	EventNetworkAllowed        EventType = "network_allowed"
 	EventMCPToolBlocked        EventType = "mcp_tool_blocked"
+	// EventMCPRequestBlocked records a request the MCP gate refused before it
+	// could identify a tool: an HTTP method the MCP transport does not define,
+	// or a body on a method that carries no MCP message. Distinct from
+	// EventMCPToolBlocked, which names the tool the Agentfile's allowlist
+	// rejected — here the gate never learns a tool name, and recording one
+	// would be a guess. It is written only after the request has cleared the
+	// gate token and named a declared server, so an unauthenticated prober
+	// cannot drive audit writes.
+	EventMCPRequestBlocked EventType = "mcp_request_blocked"
 	// EventToolCallStart and EventToolCallEnd bracket every MCP tools/call
 	// the gate actually forwards to an upstream — including a gated call once
 	// it is approved (so for those the order is gate_triggered, gate_approved,

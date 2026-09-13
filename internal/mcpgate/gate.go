@@ -50,13 +50,20 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/humangate"
 	"github.com/constle/constle/internal/spending"
 	"github.com/constle/constle/pkg/manifest"
 )
 
-// maxBodyBytes caps how much of a POST body the gate reads for inspection.
+// maxBodyBytes caps how much of a request body the gate reads for inspection.
 // Requests above the cap fail closed — an uninspectable call is never forwarded.
 const maxBodyBytes = 10 << 20 // 10 MB
+
+// allowedMethods is the Allow header the gate answers a rejected method with,
+// and the set ServeHTTP admits: the three methods Streamable HTTP defines on
+// the MCP endpoint. Spelled in the header's canonical order, matching what the
+// reference MCP server implementations advertise.
+const allowedMethods = "GET, POST, DELETE"
 
 // Decision is the outcome of a human approval request.
 type Decision int
@@ -75,8 +82,28 @@ type Request struct {
 	AgentName string
 	ServerID  string
 	Tool      string
-	// Arguments is the raw params.arguments JSON (may be long; consumers truncate).
+	// Arguments is the raw params.arguments JSON, as parsed out of the body
+	// that will be forwarded verbatim on approval. An approver that shows a
+	// human less than all of it is collecting consent for a call that is not
+	// the one that runs, so every consumer must present it whole or refuse.
+	//
+	// It is what the gate INSPECTED, which is not quite the same as what the
+	// upstream will act on: parseJSONRPC resolves a body with a duplicated
+	// params or arguments key last-wins, while forward() replays the original
+	// bytes, so an upstream that resolves duplicates differently can see
+	// something else. That divergence predates this field and is tracked
+	// separately; it is noted here so the comment above is not read as a
+	// guarantee it cannot give.
 	Arguments json.RawMessage
+
+	// SubjectDigest is spec/human-gates-webhook.md §5's digest over Tool and
+	// Arguments — the short string that names which call this gate is about,
+	// shown on the prompt and recorded on every terminal gate event so an
+	// approval is reconstructible later. It commits to the CANONICAL form of
+	// the arguments (§5), not to the raw bytes forwarded, so two bodies that
+	// canonicalize alike share a digest. Empty only if it could not be
+	// computed, which a parsed tools/call cannot produce.
+	SubjectDigest string
 	// TimeoutSeconds is how long the gate waits before applying OnTimeout.
 	TimeoutSeconds int
 	// OnTimeout is the manifest's on_timeout policy ("abort" or "proceed").
@@ -324,9 +351,26 @@ func (g *Gate) Close() error {
 }
 
 // ServeHTTP routes /{token}/servers/{id}[/...] to the matching upstream,
-// inspecting POSTed JSON-RPC for gated tools/call requests. Everything that
-// cannot be positively attributed to a declared server — wrong token,
-// unknown id, uninspectable body — fails closed.
+// inspecting JSON-RPC for gated tools/call requests. Everything that cannot be
+// positively attributed to a declared server and a method of the MCP transport
+// — wrong token, unknown id, undefined method, uninspectable body — fails
+// closed.
+//
+// Inspection is not conditioned on the HTTP method. A JSON-RPC tools/call is
+// the same request whether it is POSTed or attached to a GET, and an upstream
+// that routes on path alone will run it either way, so a method-shaped hole
+// here is a hole in the allowlist, the human gate, the spending meter and the
+// audit trail at once.
+//
+// KNOWN GAPS, in this handler, neither closed by the method allowlist:
+// the sub-path after the server id is forwarded without normalising dot
+// segments, so a client can address paths on the upstream origin other than
+// the declared endpoint; and a request carrying Connection: Upgrade is
+// forwarded on an admitted method like any other, so an upstream that answers
+// 101 leaves the gate splicing a raw tunnel it cannot inspect. Both predate
+// the method allowlist and both are tracked separately — the guarantee this
+// handler makes is over the JSON-RPC a request carries, not yet over every
+// byte it can move.
 func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rest, ok := strings.CutPrefix(r.URL.Path, "/"+g.token+"/servers/")
 	if !ok {
@@ -352,6 +396,41 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Method allowlist. Streamable HTTP — the only MCP transport Constle
+	// supports — defines exactly three methods on the endpoint: POST carries
+	// every JSON-RPC message, GET opens the server→client SSE stream, DELETE
+	// terminates the session. Nothing else is an MCP operation, so nothing
+	// else is forwarded: a method outside the set is refused here rather than
+	// proxied, because the gate cannot enforce a policy on a request whose
+	// protocol it does not model.
+	//
+	// The comparison must stay exact and case-sensitive (RFC 9110 §9.1: "the
+	// method token is case-sensitive"). net/http admits any valid token as a
+	// method, so a lowercase "post" is a different method than POST — folding
+	// case here would hand it the POST path's parse and re-open the bypass
+	// from the other side.
+	//
+	// 405 rather than this repo's usual fail-closed 404 (internal/a2a/gate.go)
+	// because the client is an MCP client and MCP gives both codes meanings:
+	// 405 is what the transport itself prescribes for a method the endpoint
+	// does not serve, and what both reference SDKs answer, while 404 means
+	// "this session was terminated" — on which a conforming client starts a
+	// new session, turning a refusal into a reconnect loop. RFC 9110 §15.5.6
+	// requires the Allow header on a 405.
+	switch r.Method {
+	case http.MethodPost, http.MethodGet, http.MethodDelete:
+	default:
+		g.log(audit.EventMCPRequestBlocked, map[string]any{
+			"server": up.id,
+			"method": clampMethod(r.Method),
+			"reason": "method not defined by the MCP transport",
+		})
+		w.Header().Set("Allow", allowedMethods)
+		http.Error(w, "constle mcp gate: "+allowedMethods+" are the only methods the MCP transport defines",
+			http.StatusMethodNotAllowed)
+		return
+	}
+
 	// Rewrite the path so the upstream sees exactly its own endpoint path,
 	// plus any sub-path the client appended after the server id.
 	r.URL.Path = up.path
@@ -359,29 +438,94 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.URL.Path = strings.TrimSuffix(up.path, "/") + "/" + remainder
 	}
 
-	if r.Method != http.MethodPost {
-		// GET (server→client SSE stream) and DELETE (session termination)
-		// carry no client tool calls; pass through.
-		up.proxy.ServeHTTP(w, r)
-		return
-	}
-
-	g.servePOST(w, r, up)
+	g.serveInspected(w, r, up)
 }
 
-// servePOST inspects one JSON-RPC POST and applies allowlist + gate policy.
-func (g *Gate) servePOST(w http.ResponseWriter, r *http.Request, up *upstream) {
+// serveInspected inspects one request — whatever its method — and applies
+// allowlist + gate policy before any MCP message reaches the upstream.
+//
+// Every method the gate forwards arrives here, because the checks below are
+// what make the gate a gate: skipping them for a method is skipping the tool
+// allowlist, the human gate, spending metering and the tool_call audit
+// bracketing all at once, and the JSON-RPC body that selects a tool is
+// carried just as well by a GET as by a POST.
+//
+// The split between methods is therefore not "which ones are inspected" but
+// "what a legitimate body looks like for this one": POST carries the
+// JSON-RPC message, and GET and DELETE carry no message at all.
+func (g *Gate) serveInspected(w http.ResponseWriter, r *http.Request, up *upstream) {
 	// A body we cannot inspect is a body we do not forward.
 	if enc := r.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
 		http.Error(w, "constle mcp gate: Content-Encoding not supported", http.StatusUnsupportedMediaType)
 		return
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
+	// net/http guarantees a non-nil Body on a server request; the fallback
+	// covers a hand-built Request that reaches ServeHTTP directly.
+	src := r.Body
+	if src == nil {
+		src = http.NoBody
+	}
+
+	// Only a POST can carry an MCP message, so only a POST needs its body
+	// read: on any other method the first byte already settles the question,
+	// and stopping there keeps a body the gate is about to refuse from being
+	// buffered, and keeps every non-POST refusal on the one audited path
+	// below rather than splitting it across the size cap.
+	//
+	// The decision has to come from bytes actually read, never from
+	// ContentLength: a chunked request declares no length (ContentLength -1),
+	// so a length-based test reads "no body" on exactly the framing an
+	// attacker controls.
+	limit := int64(maxBodyBytes) + 1
+	if r.Method != http.MethodPost {
+		limit = 1
+	}
+	body, err := io.ReadAll(io.LimitReader(src, limit))
 	if err != nil {
 		http.Error(w, "constle mcp gate: cannot read request body", http.StatusBadRequest)
 		return
 	}
+
+	if r.Method != http.MethodPost {
+		// GET and DELETE, the two non-POST methods the transport defines,
+		// carry no JSON-RPC message in any revision of it: "Every JSON-RPC
+		// message sent from the client MUST be a new HTTP POST request to the
+		// MCP endpoint." GET opens the server→client stream and DELETE names
+		// its session in a header, so for both of them a legitimate body is
+		// an absent one, and that is all there is to inspect in the JSON-RPC
+		// a request of theirs can carry. (It is not all a request can carry —
+		// see the KNOWN GAPS on ServeHTTP.)
+		//
+		// A body on one of them is refused rather than run through the gate
+		// below. It cannot have come from a conforming client, and gating it
+		// would be worse than refusing it: many servers ignore a GET body
+		// entirely, so the gate would prompt a human, bracket the call in the
+		// signed audit log, and meter the response — all for a tool call the
+		// upstream never ran, letting a sandboxed agent write fiction into
+		// the log and the spending ledger.
+		if len(body) > 0 {
+			g.log(audit.EventMCPRequestBlocked, map[string]any{
+				"server": up.id,
+				"method": clampMethod(r.Method),
+				"reason": "body on a method that carries no MCP message",
+			})
+			http.Error(w, fmt.Sprintf(
+				"constle mcp gate: %s carries no MCP message — a JSON-RPC body must be POSTed so the gate can inspect it",
+				clampMethod(r.Method)), http.StatusBadRequest)
+			return
+		}
+		// The body has been consumed to prove it was empty, so hand the proxy
+		// an explicitly empty one. http.NoBody with ContentLength 0 makes
+		// ReverseProxy send no body framing at all, which is what a bodiless
+		// GET looked like before it was read — a chunked empty body would
+		// otherwise be re-emitted as a lone terminating chunk that strict SSE
+		// endpoints reject.
+		r.Body, r.ContentLength, r.TransferEncoding = http.NoBody, 0, nil
+		up.proxy.ServeHTTP(w, r)
+		return
+	}
+
 	if len(body) > maxBodyBytes {
 		http.Error(w, "constle mcp gate: request body too large to inspect", http.StatusRequestEntityTooLarge)
 		return
@@ -485,22 +629,63 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		timeout = 300
 	}
 
+	// Every terminal event below carries this digest, which is what makes an
+	// approval reconstructible after the fact: gate_approved alone says that
+	// something was approved, not what — and the arguments themselves must
+	// never be copied into the audit log, since they routinely carry secrets
+	// and payloads.
+	//
+	// That privacy property is real but partial, and worth stating rather
+	// than implying: the digest is an UNSALTED SHA-256 over the tool name and
+	// arguments (spec §5 requires exactly that, so it cannot be salted
+	// without breaking the cross-side reproducibility it exists for). Over an
+	// enumerable argument space — a PIN, a boolean confirmation, an address
+	// from a known set — it is recoverable by brute force in milliseconds.
+	// The audit log is designed to travel, so treat this as a forensic
+	// handle, not a confidentiality boundary: assume anyone who can read the
+	// log can learn guessable arguments.
+	//
+	// SubjectDigest returns "" on the errors it can raise, and none of them
+	// is reachable for a body parseJSONRPC already unmarshalled. A missing
+	// digest degrades to "no digest recorded" rather than blocking the call:
+	// this value is evidence about the gate's decision, never an input to it.
+	//
+	// WebhookApprover deliberately recomputes its own copy rather than taking
+	// this one (webhook_approver.go). They agree by construction — one pure
+	// function, one set of inputs, the empty-arguments default living inside
+	// SubjectDigest itself — and the duplication is what keeps that approver
+	// safe to use with a Request built anywhere: consuming a caller-supplied
+	// digest would let an empty one through, and "" == "" verifies.
+	subjectDigest, _ := humangate.SubjectDigest(tool, msg.Params.Arguments)
+
 	req := Request{
 		RunID:          runID,
 		AgentName:      agentName,
 		ServerID:       up.id,
 		Tool:           tool,
 		Arguments:      msg.Params.Arguments,
+		SubjectDigest:  subjectDigest,
 		TimeoutSeconds: timeout,
 		OnTimeout:      g.gates.OnTimeout,
 	}
 
-	g.log(audit.EventGateTriggered, map[string]any{
-		"server":          up.id,
-		"tool":            tool,
+	// gateDetails seeds the details map every terminal event of this gate
+	// shares, so none of them can drift out of naming the same subject.
+	gateDetails := func(extra map[string]any) map[string]any {
+		d := map[string]any{"server": up.id, "tool": tool}
+		if subjectDigest != "" {
+			d["subject_digest"] = subjectDigest
+		}
+		for k, v := range extra {
+			d[k] = v
+		}
+		return d
+	}
+
+	g.log(audit.EventGateTriggered, gateDetails(map[string]any{
 		"timeout_seconds": timeout,
 		"on_timeout":      g.gates.OnTimeout,
-	})
+	}))
 
 	if g.notifier != nil {
 		g.notifier.NotifyTriggered(req)
@@ -537,9 +722,7 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		if eventOverride != "" {
 			event = eventOverride
 		}
-		g.log(event, map[string]any{
-			"server": up.id, "tool": tool, "decided_by": decidedBy, "wait_ms": waitMS,
-		})
+		g.log(event, gateDetails(map[string]any{"decided_by": decidedBy, "wait_ms": waitMS}))
 		forward()
 
 	case DecisionDenied:
@@ -547,16 +730,14 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		if eventOverride != "" {
 			event = eventOverride
 		}
-		g.log(event, map[string]any{
-			"server": up.id, "tool": tool, "decided_by": decidedBy, "wait_ms": waitMS,
-		})
+		g.log(event, gateDetails(map[string]any{"decided_by": decidedBy, "wait_ms": waitMS}))
 		writeJSONRPCError(w, msg.ID, fmt.Sprintf(
 			"constle: human gate DENIED tool call %q on server %q", tool, up.id))
 
 	default: // timeout
-		g.log(audit.EventGateTimeout, map[string]any{
-			"server": up.id, "tool": tool, "on_timeout": g.gates.OnTimeout, "wait_ms": waitMS,
-		})
+		g.log(audit.EventGateTimeout, gateDetails(map[string]any{
+			"on_timeout": g.gates.OnTimeout, "wait_ms": waitMS,
+		}))
 		if g.gates.OnTimeout == "proceed" {
 			forward()
 			return
@@ -649,6 +830,18 @@ func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter 
 // which for a proxied call means the upstream connection failed before any
 // response reached the agent.
 func (s *statusRecorder) status() int { return s.code }
+
+// clampMethod bounds a request method before it is logged or echoed. net/http
+// already rejects anything that is not a valid HTTP token, so the value is
+// safe to render; the cap keeps a long one from bloating an audit line, the
+// same principle as compactRPCID.
+func clampMethod(method string) string {
+	const maxMethodLen = 32
+	if len(method) > maxMethodLen {
+		return method[:maxMethodLen]
+	}
+	return method
+}
 
 // compactRPCID renders a JSON-RPC id for audit details: the raw JSON token
 // (`1`, `"abc"`), capped so a hostile id cannot bloat the log, and empty for

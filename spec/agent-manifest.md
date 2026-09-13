@@ -1,9 +1,9 @@
 # Constle AgentManifest Specification
 
-**Spec version:** 0.1.0
+**Spec version:** 0.2.0
 **apiVersion:** `constle.dev/v1alpha1`
 **Status:** Draft. Field names and semantics may change before v1.0.
-**Last updated:** 2026-08-16
+**Last updated:** 2026-09-13
 **Source of truth:** `pkg/manifest/manifest.go` and `pkg/manifest/parser.go`
 **Annotated reference file:** [`spec/agent-manifest.yaml`](https://github.com/constle/constle/blob/main/spec/agent-manifest.yaml)
 **Canonical URL:** https://docs.constle.dev/reference/agent-manifest/
@@ -108,7 +108,7 @@ kind: AgentManifest                # required
 
 identity: ...      # who the agent is, and its cryptographic identity
 sandbox: ...       # how to run and isolate it
-capabilities: ...  # declared action classes; drives isolation inference
+capabilities: ...  # declared action classes; set the capability floor
 mcp: ...           # MCP servers reachable through the gate proxy
 a2a: ...           # signed agent-to-agent peers
 spending: ...      # cost caps, metered at the MCP gate
@@ -296,13 +296,20 @@ sandbox:
 | Type | string |
 | Required | optional |
 | Valid values | `none`, `process`, `network`, `kernel` |
-| Default | inferred from `capabilities` |
-| Enforcement | ENFORCED (backend selection) |
+| Default | the capability floor (§8) |
+| Enforcement | ENFORCED (validation against the capability floor, then backend selection) |
 
-The isolation level this agent requires. When omitted, the runtime infers the
-minimum sufficient level from `capabilities` (§7) and always picks the
-strongest level any declared capability requires. `constle validate` prints the
-level it resolved and whether it was declared or inferred.
+The isolation level this agent requires. The minimum sufficient level is always
+derived from `capabilities` (§8) — the strongest level any declared capability
+requires. That derived level is called the **capability floor**, and it applies
+whether or not this field is written:
+
+- **Omitted.** The runtime resolves the level to exactly the capability floor.
+- **Declared.** The runtime holds the declared level to that floor. Equal or
+  stronger is accepted; weaker is a validation error.
+
+`constle validate` prints the level it resolved and whether it was declared or
+inferred.
 
 A value outside the four listed above is a **validation error**, not an
 unknown level to be worked around. Matching is exact, so `kernal`, `Kernel`
@@ -311,6 +318,25 @@ meant: an unrecognized level would otherwise rank below every real one and be
 satisfied by the weakest backend on the host — a typo silently converting a
 kernel requirement into no requirement at all.
 
+A declared level **weaker than the capability floor** is a validation error for
+the same reason, reached by writing the weaker level instead of mistyping the
+stronger one. Declaring a level may only strengthen the boundary, never weaken
+it — otherwise writing the line would make the boundary weaker than omitting it
+would have:
+
+```
+$ constle validate agent.yaml     # capabilities: [external_transfer], isolation: network
+error: validation failed: sandbox.isolation: "network" is weaker than the "kernel"
+minimum required by capability "external_transfer" — a declared level may only
+strengthen the boundary, never weaken it; raise it to "kernel" or drop that
+capability
+```
+
+The refusal names every capability sitting at the floor, not just the first, so
+dropping the named set actually lowers the floor — where dropping one of several
+would leave it exactly where it was. The per-capability minimums are in §8; they
+are not restated here.
+
 | Level | What it provides | Use when |
 |-------|-----------------|----------|
 | `none` | No isolation. Development only. | Local testing, never production |
@@ -318,7 +344,15 @@ kernel requirement into no requirement at all.
 | `network` | Network and process isolation | Agent makes outbound calls |
 | `kernel` | Hardware-level isolation via a Firecracker microVM | Agent can move money, delete data, or spawn sub-agents |
 
-A declared level is a **minimum contract, not a preference**. The runtime
+Two separate minimums therefore govern this field, and they are checked at
+different times against different things:
+
+| Minimum | Answers | Checked | Weaker is |
+|---------|---------|---------|-----------|
+| **Capability floor** (§8) | what this agent may do | at validation, before any backend is chosen | a validation error |
+| **Backend contract** (below) | what this host can build | at backend selection | a refused run, waivable with `--accept-isolation` |
+
+The resolved level is a **minimum contract, not a preference**. The runtime
 selects a backend that provides at least that level and **refuses to run**
 when it cannot — a silent downgrade is precisely a protection that looks real
 when it isn't.
@@ -333,9 +367,12 @@ Each backend provides a fixed level, whatever the manifest asks for:
 So `isolation: kernel` selects Firecracker, and when Firecracker is unusable
 on this machine (it requires KVM and root) the run aborts with the reason and
 the setup step, instead of continuing on Docker. `--backend=docker` chooses an
-engine; it does not relax the contract, and is refused the same way.
+engine; it does not relax the contract, and is refused the same way. An
+explicit `isolation:` likewise chooses a level; it does not relax the
+capability floor, and is refused the same way.
 
-The one way to proceed with a weaker boundary is for an operator to name it:
+The one way to proceed with a weaker boundary **than this host can build** is
+for an operator to name it:
 
 ```
 constle run --accept-isolation=network agent.yaml
@@ -348,6 +385,19 @@ backend must still provide at least the accepted level. The run then prints an
 the delivered one in `details.isolation_achieved`, and
 `details.isolation_downgrade_accepted: true`. Requested and achieved isolation
 are never collapsed into a single field.
+
+The flag cannot waive the capability-floor refusal: that check fires at
+validation, before any backend is selected, so the flag never reaches it. An
+operator can accept a weaker boundary than this machine offers; nobody can
+accept an Agentfile that contradicts itself.
+
+What the flag *can* still do is deliver a run whose achieved boundary is below
+the capability floor — `--accept-isolation=network` puts an `external_transfer`
+agent on Docker, whatever the Agentfile says. That is the point of the flag, and
+it is why that path is refused unless named, printed as
+`ISOLATION DOWNGRADE ACCEPTED`, and recorded in the audit log. The floor governs
+what an Agentfile may **declare**; the flag governs what an operator may
+knowingly **accept** for one run. Neither is silent.
 
 The same separation holds in the CLI: the run summary labels the manifest
 level `requested`, and the settled sandbox line carries the isolation actually
@@ -568,11 +618,11 @@ capabilities:
 |-|-|
 | Type | list of strings |
 | Required | optional |
-| Enforcement | ENFORCED for isolation inference; DECLARED otherwise |
+| Enforcement | ENFORCED for the capability floor; DECLARED otherwise |
 
 This is the complete set of recognised values. An unrecognised entry is a
 **validation error**, not a warning — a typo'd capability must not silently
-lower the inferred isolation level.
+lower the isolation level the agent is held to.
 
 | Value | Meaning | Minimum isolation |
 |-------|---------|-------------------|
@@ -587,10 +637,19 @@ lower the inferred isolation level.
 
 The list drives exactly two things, and nothing else:
 
-**1. Isolation inference (ENFORCED).** When `sandbox.isolation` is omitted, the
-runtime selects the strongest level any declared capability requires. An agent
-declaring `[web_search, external_transfer]` gets `kernel`, because
-`external_transfer` demands it.
+**1. The capability floor (ENFORCED).** The runtime derives the strongest level
+any declared capability requires. When `sandbox.isolation` (§6.1) is omitted,
+that derived level is the one it uses; when the field is declared, the derived
+level is a floor the declaration may not go below. An agent declaring
+`[web_search, external_transfer]` floors at `kernel`, because
+`external_transfer` demands it — so omitting `sandbox.isolation` resolves it to
+`kernel`, declaring `isolation: kernel` is accepted, and declaring
+`isolation: network` is refused at validation naming `external_transfer`.
+
+The floor binds the capabilities the Agentfile **declares**, which are
+self-asserted. An agent that simply omits `external_transfer` and declares
+`isolation: none` still validates and still runs at `none`; nothing at runtime
+derives the level from what the agent can actually do. See §8.1.
 
 **2. Advisory gate reporting (DECLARED).** Capabilities naming an irreversible
 action — `send_email`, `spawn_subagent`, `external_transfer`, `delete_records`
@@ -638,6 +697,21 @@ the sandbox, and the sandbox network blocks every direct path to it (§7.2).
 
 The gate is what makes tool allowlists, human gates, and spending metering
 enforceable: the call must physically traverse it.
+
+**Transport surface.** The gate accepts only the three HTTP methods Streamable
+HTTP defines on an MCP endpoint — `POST`, which carries every JSON-RPC message,
+`GET`, which opens the server→client SSE stream, and `DELETE`, which terminates
+the session. Any other method is refused with `405 Method Not Allowed` and an
+`Allow: GET, POST, DELETE` header, and is never forwarded. Because the spec
+puts every JSON-RPC message on a `POST` — "Every JSON-RPC message sent from
+the client MUST be a new HTTP POST request to the MCP endpoint" — a `GET` or
+`DELETE` carrying a request body is refused with `400`. Both refusals are
+recorded as `mcp_request_blocked` audit events.
+
+This matters because the gate's checks are driven by the JSON-RPC it reads: a
+`tools/call` smuggled onto a method the gate did not inspect would reach the
+upstream with the tool allowlist, the human gate, spending metering, and the
+`tool_call_start` / `tool_call_end` records all skipped.
 
 ### 9.1 `mcp.servers[].id`
 
@@ -1235,7 +1309,8 @@ inert or bypassed.
 | Host loopback aliases must not appear in `allowed_hosts` when `mcp` or `a2a` are declared | Would expose the gate transport and other host services |
 | An `mcp.servers[].pricing` block must declare at least one meter | Would read as priced while metering nothing |
 | `human_gates.notify[].channel` must be `webhook`, with a `url_secret_ref` | A declared notification path must never look real when it isn't |
-| An unrecognised capability is rejected | A typo must not silently lower inferred isolation |
+| An unrecognised capability is rejected | A typo must not silently lower the capability floor |
+| A declared `sandbox.isolation` may not be weaker than its capabilities require | Writing the line must not make the boundary weaker than omitting it |
 
 Warnings — surfaced, but not fatal — cover the cases where a declaration is
 well-formed but the runtime cannot act on it: unenforceable gate entries,
@@ -1254,14 +1329,14 @@ private key is not available on this machine.
 | `identity.version` | DECLARED | Displayed and carried through |
 | `identity.owner` | VALIDATED | Enforced as an equality check against the stored identity when both are set |
 | `identity.did` | **ENFORCED** | Signs and chains the audit log; run fails closed without the local key |
-| `sandbox.isolation` | **ENFORCED** | Inferred when absent; drives backend selection |
+| `sandbox.isolation` | **ENFORCED** | Resolved from the capability floor when absent; held to it when declared; drives backend selection |
 | `sandbox.image` | **ENFORCED** | Pulled and run by the backend; a leading `-` is rejected at validate time |
 | `sandbox.command` | **ENFORCED** | Passed as the container command |
 | `sandbox.memory_mb` | **ENFORCED** | Container memory limit / microVM size |
 | `sandbox.disk_mb` | DECLARED | Parsed and defaulted; not applied |
 | `sandbox.network.egress` | DECLARED | Parsed and defaulted; **no code path reads it** |
 | `sandbox.network.allowed_hosts` | **ENFORCED** | Per-run Squid allowlist; the real egress control |
-| `capabilities` | **ENFORCED** (inference) / DECLARED (gate advice) | Unknown values rejected |
+| `capabilities` | **ENFORCED** (capability floor) / DECLARED (gate advice) | Unknown values rejected |
 | `mcp.servers[].id` | VALIDATED | Unique; names `CONSTLE_MCP_<ID>_URL` |
 | `mcp.servers[].url` | **ENFORCED** | Host side only; never enters the sandbox |
 | `mcp.servers[].tools` | **ENFORCED** | Non-listed tools blocked at the gate |
@@ -1408,7 +1483,7 @@ by any declared server, `constle validate` would warn that they gate nothing.
 
 | Number | What it versions | Current |
 |--------|-----------------|---------|
-| **Spec version** | This document — its prose, structure, and accuracy | `0.1.0` |
+| **Spec version** | This document — its prose, structure, and accuracy | `0.2.0` |
 | **`apiVersion`** | The wire format the runtime accepts | `constle.dev/v1alpha1` |
 
 The spec version changes whenever this document changes materially, including
@@ -1443,17 +1518,61 @@ modification:
 - adding a new optional field;
 - adding a new valid enum value;
 - adding an entirely optional section;
-- **moving a field from DECLARED to ENFORCED.**
+- **moving a field from DECLARED to ENFORCED;**
+- **closing a gap between two fields that are already ENFORCED** — enforcing a
+  constraint one of them always implied, but which the runtime failed to check.
 
-The last deserves comment. Promoting a field to ENFORCED can certainly stop an
-agent that a previous version let run — but the manifest declared the
-constraint, and Constle's whole premise is that a declared constraint should be
-real. Under this specification that is a bug fix, not a breach of compatibility.
-Such promotions are always called out in the changelog.
+The last two deserve comment, and share a reason. Promoting a field to ENFORCED
+can certainly stop an agent that a previous version let run — but the manifest
+declared the constraint, and Constle's whole premise is that a declared
+constraint should be real. Closing a gap between two ENFORCED fields is the same
+case seen from a different angle: the constraint was already declared by the
+pair, and the runtime simply was not checking it. `sandbox.isolation` and
+`capabilities` are both ENFORCED, yet a declared level weaker than the
+capability floor used to validate — a manifest whose own two halves contradicted
+each other, resolved silently in favour of the weaker one. Under this
+specification both are bug fixes, not breaches of compatibility. Both are always
+called out in the changelog.
 
 ---
 
 ## 20. Changelog
+
+### 0.2.0 — 2026-09-13
+
+Two changes to `sandbox.isolation`, both of the kind §19.4 classifies as a bug
+fix rather than a breaking change, and both rejecting manifests a previous
+runtime accepted. The first shipped without a changelog entry; it is recorded
+here alongside the second rather than left undocumented.
+
+**Changed — a declared level is now held to the capability floor (§6.1, §8):**
+
+- The minimum derived from `capabilities` used to be consulted only when
+  `sandbox.isolation` was **omitted**. A declared level bypassed it entirely, so
+  `capabilities: [external_transfer]` beside `isolation: network` validated,
+  was satisfied outright by Docker, and recorded no downgrade — writing the line
+  made the boundary weaker than omitting it would have. A declared level may now
+  only be equal to or stronger than the floor; weaker is a validation error
+  naming every capability that forces it.
+- `--accept-isolation` does not and cannot waive this: the refusal fires at
+  validation, before backend selection. The flag still covers the separate
+  backend minimum. The two minimums are now distinguished in §6.1.
+- The floor binds **declared** capabilities only. Omitting a capability still
+  lowers it; nothing derives the level from what the agent can actually do
+  (§8, §8.1).
+- §19.4 gained the compatibility bullet this change required, since
+  `sandbox.isolation` was already ENFORCED and so the existing
+  DECLARED→ENFORCED exemption did not cover it.
+
+**Changed — a declared level is a minimum contract against the backend (§6.1):**
+
+- Previously documented as a preference the runtime resolved to the strongest
+  available backend. The runtime now refuses to run when the selected backend
+  cannot provide the declared level, and `--backend` no longer relaxes it.
+  `--accept-isolation=<level>` is the one explicit waiver, recorded in the run
+  output and in the `run_started` audit entry.
+- A level outside the four defined values became a validation error rather than
+  an unknown string ranking below every real level.
 
 ### 0.1.0 — 2026-08-16
 
