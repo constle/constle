@@ -100,6 +100,11 @@ func (m *AgentManifest) Validate() error {
 	// rests on that exemption — IsolationLevel.Satisfies fails closed on an
 	// invalid operand, so an unresolved level cannot satisfy a backend
 	// comparison either.
+	//
+	// This is the syntax half of the isolation check. Whether a well-formed
+	// level is strong enough for what the agent may actually do is the
+	// capability floor, checked by validateIsolationFloor below — after the
+	// capability loop, so the floor is never computed from a typo.
 	if m.Sandbox.Isolation != "" {
 		if _, err := ParseIsolationLevel(string(m.Sandbox.Isolation)); err != nil {
 			return fmt.Errorf("sandbox.isolation: %w", err)
@@ -114,6 +119,10 @@ func (m *AgentManifest) Validate() error {
 		if !isKnownCapability(cap) {
 			return fmt.Errorf("unknown capability %q — check the Constle docs for supported capabilities", cap)
 		}
+	}
+
+	if err := m.validateIsolationFloor(); err != nil {
+		return err
 	}
 
 	if err := m.validateNetwork(); err != nil {
@@ -137,6 +146,83 @@ func (m *AgentManifest) Validate() error {
 	}
 
 	return nil
+}
+
+// validateIsolationFloor refuses an Agentfile whose declared sandbox.isolation
+// is weaker than its own capabilities require.
+//
+// The capability-derived minimum used to be consulted only when the field was
+// absent, so writing a level by hand was a way to overrule it downward and
+// nothing said so: `capabilities: [external_transfer]` beside
+// `isolation: network` validated cleanly, selected Docker, satisfied the
+// backend contract, recorded no downgrade, and signed an audit entry claiming
+// "network" for an agent that can move money. Writing the line made the
+// boundary weaker than omitting it would have. Declaring a level may only
+// strengthen the boundary, never weaken it.
+//
+// The manifest is refused rather than quietly raised to the floor. Raising it
+// would run the agent behind a boundary nobody wrote, leaving the Agentfile
+// saying one thing and the run doing another — the same silent substitution
+// IsValid refuses for a typo'd level.
+//
+// --accept-isolation cannot waive this refusal. That flag is consumed during
+// backend selection (internal/sandbox/detect.go), long after validation, so it
+// never reaches here. It can still put one run on a boundary below this floor
+// — that is what it is for — but only when an operator names it, and the run
+// prints and records that it happened. This governs what an Agentfile may
+// declare; the flag governs what an operator may knowingly accept for one run.
+// Nobody can accept an Agentfile that contradicts itself.
+//
+// Order matters in both directions, and neither half is cosmetic:
+//
+//   - It runs after the malformed-level check above. Satisfies fails closed on
+//     an invalid operand, so a floor check running first answers
+//     `isolation: kernal` with "weaker than kernel" — telling an author to
+//     raise a level they already wrote, instead of naming the typo.
+//   - It runs after the unknown-capability loop. minIsolationFor maps anything
+//     it does not recognize to "process", so a floor computed first answers
+//     `capabilities: [reed_file]` by quoting back a capability that does not
+//     exist, instead of reporting the typo it is.
+//
+// Both operands are therefore known-valid here, which is what lets the message
+// be specific — and is why the named capabilities can never be empty: the
+// declared level is a real level by now, and every real level satisfies
+// IsolationNone, so a refusal always has at least one capability above it.
+//
+// Empty is exempt for the same reason the malformed-level check exempts it: it
+// is the pre-inference state, not a level. Parse fills it from these same
+// capabilities, so no parsed manifest reaches here empty, and a manifest built
+// directly in Go may be validated for its policy content before a level is
+// resolved.
+func (m *AgentManifest) validateIsolationFloor() error {
+	if m.Sandbox.Isolation == "" {
+		return nil
+	}
+
+	floor, drivers := capabilityFloor(m.Capabilities)
+	if m.Sandbox.Isolation.Satisfies(floor) {
+		return nil
+	}
+
+	// Every capability at the floor is named, not just the first. Naming one
+	// of several would make "drop that capability" a lie: the author drops it,
+	// revalidates, and meets its sibling at the same floor with nothing having
+	// moved.
+	quoted := make([]string, len(drivers))
+	for i, cap := range drivers {
+		quoted[i] = fmt.Sprintf("%q", cap)
+	}
+	noun, remedy := "capability", "that capability"
+	if len(drivers) > 1 {
+		noun, remedy = "capabilities", "those capabilities"
+	}
+
+	return fmt.Errorf(
+		"sandbox.isolation: %q is weaker than the %q minimum required by %s %s — "+
+			"a declared level may only strengthen the boundary, never weaken it; "+
+			"raise it to %q or drop %s",
+		m.Sandbox.Isolation, floor, noun, strings.Join(quoted, ", "), floor, remedy,
+	)
 }
 
 // validateIdentityName rejects agent names that would escape the directories
@@ -553,19 +639,51 @@ func isValidID(id string) bool {
 	return true
 }
 
-// InferIsolation returns the strongest IsolationLevel required by any of the
-// given capabilities.
-func InferIsolation(caps []Capability) IsolationLevel {
-	highest := IsolationNone
+// capabilityFloor returns the weakest isolation level that still covers every
+// declared capability, together with every capability that demands exactly
+// that level.
+//
+// It is the single definition of "the isolation these capabilities require":
+// Parse fills an omitted level from it and Validate holds a declared one to
+// it, so the level Constle would have chosen and the level it will accept can
+// never drift apart. A second walk over the same table is how a capability
+// wired into one of them and not the other reopens this hole for that one
+// capability, with nothing failing.
+//
+// The capabilities are returned because a refusal has to name what forces the
+// floor — "weaker than kernel" leaves an author guessing which entry in their
+// own list to look at. All of them are returned, in declaration order, so the
+// remediation is a complete one: dropping the named set actually lowers the
+// floor, where dropping one of several would only surface the next.
+//
+// The returned slice is empty only when the floor is IsolationNone, which
+// every valid level satisfies: minIsolationFor never returns IsolationNone, so
+// any declared capability raises the floor above it and names itself.
+func capabilityFloor(caps []Capability) (IsolationLevel, []Capability) {
+	floor := IsolationNone
+	var drivers []Capability
 
 	for _, cap := range caps {
-		required := minIsolationFor(cap)
-		if isolationRank(required) > isolationRank(highest) {
-			highest = required
+		switch required := minIsolationFor(cap); {
+		case isolationRank(required) > isolationRank(floor):
+			// A stronger capability supersedes everything named so far;
+			// reusing the backing array keeps this to one allocation.
+			floor, drivers = required, append(drivers[:0], cap)
+		case required == floor:
+			drivers = append(drivers, cap)
 		}
 	}
 
-	return highest
+	return floor, drivers
+}
+
+// InferIsolation returns the strongest IsolationLevel required by any of the
+// given capabilities. It is the level Parse writes when the Agentfile omits
+// one; capabilityFloor holds the definition, so an inferred level is always
+// exactly the floor Validate enforces.
+func InferIsolation(caps []Capability) IsolationLevel {
+	level, _ := capabilityFloor(caps)
+	return level
 }
 
 // RequiresHumanGate reports whether the capability involves an irreversible

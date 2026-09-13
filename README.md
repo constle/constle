@@ -137,7 +137,7 @@ constle v0.4.0
   → parsing examples/basic-agent/agent.yaml
   ✓ Agentfile valid
      agent:     basic-agent v0.1.0
-     isolation: network
+     isolation: network (requested)
      memory:    512MB
      network:   restricted → api.groq.com
      spending:  run≤$0.10 (NOT ENFORCED - no priced MCP servers)
@@ -246,7 +246,7 @@ So `egress: open` and `egress: none` both parse cleanly, change nothing about wh
 <!-- --8<-- [start:enforces] -->
 | Capability | Mechanism | Status |
 |---|---|---|
-| **Sandboxed execution** | Firecracker microVM (hardware isolation) or a two-network Docker sandbox with no default gateway. Auto-detected, or forced with `--backend=docker\|firecracker`. A declared `isolation:` level is a minimum contract: `isolation: kernel` selects Firecracker and the run **fails closed** if Firecracker is unavailable, unless an operator explicitly accepts a weaker boundary with `--accept-isolation=<level>`. | Shipped |
+| **Sandboxed execution** | Firecracker microVM (hardware isolation) or a two-network Docker sandbox with no default gateway. Auto-detected, or forced with `--backend=docker\|firecracker`. A declared `isolation:` level is a minimum contract on two axes. Against `capabilities`: it may be stronger than they require but never weaker, or the Agentfile is rejected at validate time naming the capability that forces the floor. Against the host: `isolation: kernel` selects Firecracker and the run **fails closed** if Firecracker is unavailable, unless an operator explicitly accepts a weaker boundary with `--accept-isolation=<level>` - which covers that axis only and cannot waive the capability-floor rejection, though it can still put one run on a weaker boundary, named by the operator and recorded. | Shipped |
 | **Network egress** | All egress traverses a Squid proxy allowlisting `network.allowed_hosts`. Matching is name-based (`dstdomain`), and a separate rule denies destinations given as raw IPs - including the real IP of an allowed host - so resolving a name yourself and connecting to the address is not a way around the allowlist. Every allow and every block is an audit event. | Shipped |
 | **Max duration** | The agent is killed when `limits.max_duration_seconds` elapses; the kill is recorded as `terminated_by_limit`. | Shipped |
 | **Audit log** | JSONL per agent per UTC day. With `identity.did` set, every entry is Ed25519-signed and hash-chained; `constle audit verify` detects tampering and reports the offending line. | Shipped |
@@ -278,7 +278,7 @@ identity:
 
 sandbox:
   image: invoice-processor:latest
-  isolation: kernel               # or omit - inferred from capabilities
+  isolation: kernel               # or omit - derived from capabilities; never weaker than they require
   memory_mb: 512
   network:
     egress: restricted            # declared only - see limitation 5
