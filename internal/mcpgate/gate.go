@@ -50,6 +50,7 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/humangate"
 	"github.com/constle/constle/internal/spending"
 	"github.com/constle/constle/pkg/manifest"
 )
@@ -81,8 +82,28 @@ type Request struct {
 	AgentName string
 	ServerID  string
 	Tool      string
-	// Arguments is the raw params.arguments JSON (may be long; consumers truncate).
+	// Arguments is the raw params.arguments JSON, as parsed out of the body
+	// that will be forwarded verbatim on approval. An approver that shows a
+	// human less than all of it is collecting consent for a call that is not
+	// the one that runs, so every consumer must present it whole or refuse.
+	//
+	// It is what the gate INSPECTED, which is not quite the same as what the
+	// upstream will act on: parseJSONRPC resolves a body with a duplicated
+	// params or arguments key last-wins, while forward() replays the original
+	// bytes, so an upstream that resolves duplicates differently can see
+	// something else. That divergence predates this field and is tracked
+	// separately; it is noted here so the comment above is not read as a
+	// guarantee it cannot give.
 	Arguments json.RawMessage
+
+	// SubjectDigest is spec/human-gates-webhook.md §5's digest over Tool and
+	// Arguments — the short string that names which call this gate is about,
+	// shown on the prompt and recorded on every terminal gate event so an
+	// approval is reconstructible later. It commits to the CANONICAL form of
+	// the arguments (§5), not to the raw bytes forwarded, so two bodies that
+	// canonicalize alike share a digest. Empty only if it could not be
+	// computed, which a parsed tools/call cannot produce.
+	SubjectDigest string
 	// TimeoutSeconds is how long the gate waits before applying OnTimeout.
 	TimeoutSeconds int
 	// OnTimeout is the manifest's on_timeout policy ("abort" or "proceed").
@@ -608,22 +629,63 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		timeout = 300
 	}
 
+	// Every terminal event below carries this digest, which is what makes an
+	// approval reconstructible after the fact: gate_approved alone says that
+	// something was approved, not what — and the arguments themselves must
+	// never be copied into the audit log, since they routinely carry secrets
+	// and payloads.
+	//
+	// That privacy property is real but partial, and worth stating rather
+	// than implying: the digest is an UNSALTED SHA-256 over the tool name and
+	// arguments (spec §5 requires exactly that, so it cannot be salted
+	// without breaking the cross-side reproducibility it exists for). Over an
+	// enumerable argument space — a PIN, a boolean confirmation, an address
+	// from a known set — it is recoverable by brute force in milliseconds.
+	// The audit log is designed to travel, so treat this as a forensic
+	// handle, not a confidentiality boundary: assume anyone who can read the
+	// log can learn guessable arguments.
+	//
+	// SubjectDigest returns "" on the errors it can raise, and none of them
+	// is reachable for a body parseJSONRPC already unmarshalled. A missing
+	// digest degrades to "no digest recorded" rather than blocking the call:
+	// this value is evidence about the gate's decision, never an input to it.
+	//
+	// WebhookApprover deliberately recomputes its own copy rather than taking
+	// this one (webhook_approver.go). They agree by construction — one pure
+	// function, one set of inputs, the empty-arguments default living inside
+	// SubjectDigest itself — and the duplication is what keeps that approver
+	// safe to use with a Request built anywhere: consuming a caller-supplied
+	// digest would let an empty one through, and "" == "" verifies.
+	subjectDigest, _ := humangate.SubjectDigest(tool, msg.Params.Arguments)
+
 	req := Request{
 		RunID:          runID,
 		AgentName:      agentName,
 		ServerID:       up.id,
 		Tool:           tool,
 		Arguments:      msg.Params.Arguments,
+		SubjectDigest:  subjectDigest,
 		TimeoutSeconds: timeout,
 		OnTimeout:      g.gates.OnTimeout,
 	}
 
-	g.log(audit.EventGateTriggered, map[string]any{
-		"server":          up.id,
-		"tool":            tool,
+	// gateDetails seeds the details map every terminal event of this gate
+	// shares, so none of them can drift out of naming the same subject.
+	gateDetails := func(extra map[string]any) map[string]any {
+		d := map[string]any{"server": up.id, "tool": tool}
+		if subjectDigest != "" {
+			d["subject_digest"] = subjectDigest
+		}
+		for k, v := range extra {
+			d[k] = v
+		}
+		return d
+	}
+
+	g.log(audit.EventGateTriggered, gateDetails(map[string]any{
 		"timeout_seconds": timeout,
 		"on_timeout":      g.gates.OnTimeout,
-	})
+	}))
 
 	if g.notifier != nil {
 		g.notifier.NotifyTriggered(req)
@@ -660,9 +722,7 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		if eventOverride != "" {
 			event = eventOverride
 		}
-		g.log(event, map[string]any{
-			"server": up.id, "tool": tool, "decided_by": decidedBy, "wait_ms": waitMS,
-		})
+		g.log(event, gateDetails(map[string]any{"decided_by": decidedBy, "wait_ms": waitMS}))
 		forward()
 
 	case DecisionDenied:
@@ -670,16 +730,14 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		if eventOverride != "" {
 			event = eventOverride
 		}
-		g.log(event, map[string]any{
-			"server": up.id, "tool": tool, "decided_by": decidedBy, "wait_ms": waitMS,
-		})
+		g.log(event, gateDetails(map[string]any{"decided_by": decidedBy, "wait_ms": waitMS}))
 		writeJSONRPCError(w, msg.ID, fmt.Sprintf(
 			"constle: human gate DENIED tool call %q on server %q", tool, up.id))
 
 	default: // timeout
-		g.log(audit.EventGateTimeout, map[string]any{
-			"server": up.id, "tool": tool, "on_timeout": g.gates.OnTimeout, "wait_ms": waitMS,
-		})
+		g.log(audit.EventGateTimeout, gateDetails(map[string]any{
+			"on_timeout": g.gates.OnTimeout, "wait_ms": waitMS,
+		}))
 		if g.gates.OnTimeout == "proceed" {
 			forward()
 			return

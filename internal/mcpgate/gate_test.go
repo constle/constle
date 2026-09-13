@@ -19,6 +19,7 @@ import (
 
 	"github.com/constle/constle/internal/audit"
 	"github.com/constle/constle/internal/homedir"
+	"github.com/constle/constle/internal/humangate"
 	"github.com/constle/constle/pkg/did"
 	"github.com/constle/constle/pkg/manifest"
 )
@@ -50,9 +51,35 @@ type gateHarness struct {
 	gate     *Gate
 	upstream *httptest.Server
 	calls    *atomic.Int64
+	bodies   *upstreamBodies
 	baseURL  string // http://127.0.0.1:port/<token>/servers/email
 	logPath  string
 	logger   *audit.Logger
+}
+
+// upstreamBodies records the raw request bodies the fake MCP server actually
+// received — what the gate chose to execute, as opposed to what the operator
+// was shown. Keeping the two separately observable is what lets a test assert
+// they agree.
+type upstreamBodies struct {
+	mu  sync.Mutex
+	all []string
+}
+
+func (b *upstreamBodies) record(r *http.Request) {
+	data, _ := io.ReadAll(r.Body)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.all = append(b.all, string(data))
+}
+
+func (b *upstreamBodies) last() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.all) == 0 {
+		return ""
+	}
+	return b.all[len(b.all)-1]
 }
 
 // newHarness builds a gate for one server "email" with tools
@@ -61,8 +88,10 @@ func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness 
 	t.Helper()
 
 	calls := &atomic.Int64{}
+	bodies := &upstreamBodies{}
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
+		bodies.record(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"sent"}]}}`)
 	}))
@@ -105,6 +134,7 @@ func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness 
 		gate:     g,
 		upstream: up,
 		calls:    calls,
+		bodies:   bodies,
 		baseURL:  fmt.Sprintf("http://127.0.0.1:%d/%s/servers/email", port, token),
 		logPath:  logPath,
 		logger:   logger,
@@ -112,7 +142,11 @@ func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness 
 }
 
 func toolCallBody(tool string) string {
-	return fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":%q,"arguments":{"to":"x@example.com"}}}`, tool)
+	return toolCallBodyWithArgs(tool, `{"to":"x@example.com"}`)
+}
+
+func toolCallBodyWithArgs(tool, args string) string {
+	return fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":%q,"arguments":%s}}`, tool, args)
 }
 
 func postJSON(t *testing.T, url, body string) (int, string) {
@@ -411,20 +445,27 @@ func TestNonInteractiveStdinFallsThroughToTimeout(t *testing.T) {
 // only after actually seeing the prompt (type-ahead is deliberately dropped
 // by the approver's stale-input drain).
 type promptWatcher struct {
-	mu      sync.Mutex
-	buf     strings.Builder
+	mu    sync.Mutex
+	buf   strings.Builder
+	match string // the prompt text to signal on
+	// prompts is buffered so Write never blocks holding mu: a send that
+	// parked here would deadlock the approver inside outf, turning a test
+	// failure into a hung package.
 	prompts chan struct{}
 }
 
 func newPromptWatcher() *promptWatcher {
-	return &promptWatcher{prompts: make(chan struct{}, 16)}
+	return &promptWatcher{match: "approve?", prompts: make(chan struct{}, 64)}
 }
 
 func (p *promptWatcher) Write(b []byte) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if strings.Contains(string(b), "approve?") {
-		p.prompts <- struct{}{}
+	if strings.Contains(string(b), p.match) {
+		select {
+		case p.prompts <- struct{}{}:
+		default:
+		}
 	}
 	return p.buf.Write(b)
 }
@@ -1171,5 +1212,328 @@ func TestNonPOSTBodyRefusalIsPinned(t *testing.T) {
 	}
 	if _, leaked := e.Details["body"]; leaked {
 		t.Error("the refused body must not be copied into the audit log")
+	}
+}
+
+// TestApprovedCallIsTheCallTheOperatorSaw is the end-to-end form of the
+// display fix, asserting the invariant the whole human gate rests on:
+//
+//	if the gate forwarded a tool call, the operator's transcript contained
+//	every byte of what it forwarded.
+//
+// The old prompt printed a 500-byte prefix while forward() replayed the
+// original body, so an agent could put a second, larger "amount_cents" past
+// the window and have it be the one a last-key-wins parser used. Here the
+// whole call goes through the real gate, the real TerminalApprover, and a
+// real upstream that records exactly what it was asked to run.
+func TestApprovedCallIsTheCallTheOperatorSaw(t *testing.T) {
+	args := `{"destination_account":"ACH-SAFE-4417","amount_cents":4250,"memo":"` +
+		strings.Repeat("routine monthly invoice. ", 30) +
+		`","destination_account":"ACH-ATTACKER-9902","amount_cents":992450000}`
+
+	inR, inW := io.Pipe()
+	t.Cleanup(func() { _ = inW.Close(); _ = inR.Close() })
+	out := newPromptWatcher()
+	approver := &TerminalApprover{In: inR, Out: out, Interactive: true}
+
+	h := newHarness(t, approver, "abort")
+	h.gate.timeoutOverride = 5 * time.Second
+
+	// Answer only once the prompt has actually been printed: the approver
+	// drops input typed before a prompt exists (TestStaleKeystrokeDoes...),
+	// so pre-loading the answer would be a flake, not a test.
+	go func() {
+		<-out.prompts
+		_, _ = fmt.Fprintln(inW, "a")
+	}()
+
+	if status, body := postJSON(t, h.baseURL, toolCallBodyWithArgs("send_email", args)); status != 200 || !strings.Contains(body, "sent") {
+		t.Fatalf("approved call: status=%d body=%s", status, body)
+	}
+
+	forwarded := h.bodies.last()
+	if !strings.Contains(forwarded, "ACH-ATTACKER-9902") {
+		t.Fatalf("harness bug: the upstream did not receive the hidden suffix, so this proves nothing:\n%s", forwarded)
+	}
+
+	out.mu.Lock()
+	shown := out.buf.String()
+	out.mu.Unlock()
+
+	// Every token the upstream was asked to act on must appear in what the
+	// operator read BEFORE they typed "a" — containment alone would also be
+	// satisfied by printing the arguments after the answer was taken.
+	promptAt := strings.Index(shown, "approve?")
+	if promptAt < 0 {
+		t.Fatalf("no approve prompt in the transcript:\n%s", shown)
+	}
+	for _, tok := range []string{"ACH-SAFE-4417", "ACH-ATTACKER-9902", "4250", "992450000"} {
+		at := strings.Index(shown, tok)
+		switch {
+		case at < 0:
+			t.Errorf("the gate forwarded %q but never showed it to the operator.\nprompt was:\n%s", tok, shown)
+		case at > promptAt:
+			t.Errorf("%q was printed only after the operator had already answered", tok)
+		}
+	}
+	if strings.Contains(shown, "…") {
+		t.Errorf("the approved call was elided in the prompt:\n%s", shown)
+	}
+
+	// The digest the audit log records for this approval must be the one the
+	// operator was shown, or the prompt and the record name different calls.
+	digest, err := humangate.SubjectDigest("send_email", json.RawMessage(args))
+	if err != nil {
+		t.Fatalf("SubjectDigest: %v", err)
+	}
+	if at := strings.Index(shown, digest); at < 0 || at > promptAt {
+		t.Errorf("the subject digest %s was not shown to the operator before they answered:\n%s", digest, shown)
+	}
+}
+
+// TestOversizedArgumentsAreNeverApproved: when the arguments cannot be shown
+// in full, no keystroke may approve them. "Show everything" is only a real
+// guarantee if the case it cannot serve fails closed rather than quietly
+// falling back to a prefix.
+//
+// The answers are pre-loaded on purpose — the opposite of the test above.
+// Nothing must approve this call, so an input already primed with every
+// accepted approval word is the stronger setup, not a racy one.
+func TestOversizedArgumentsAreNeverApproved(t *testing.T) {
+	args := `{"pad":"` + strings.Repeat("x", maxDisplayedArgumentBytes+1000) + `","rm_rf":true}`
+
+	var out strings.Builder
+	approver := &TerminalApprover{
+		In:          strings.NewReader("a\napprove\ny\nyes\n"), // would approve IF accepted
+		Out:         &out,
+		Interactive: true,
+	}
+
+	aborted := &atomic.Bool{}
+	h := newHarness(t, approver, "abort")
+	h.gate.SetAbortRun(func() { aborted.Store(true) })
+
+	start := time.Now()
+	status, body := postJSON(t, h.baseURL, toolCallBodyWithArgs("send_email", args))
+	elapsed := time.Since(start)
+
+	if status != 200 || !strings.Contains(body, "timed out") {
+		t.Fatalf("oversized gate: status=%d body=%s", status, body)
+	}
+	if h.calls.Load() != 0 {
+		t.Errorf("a call too large to display reached the upstream: %d calls", h.calls.Load())
+	}
+	if !aborted.Load() {
+		t.Error("an undisplayable call must resolve by on_timeout=abort, not silently pass")
+	}
+
+	// The gate must cost the agent the full approval window. An early return
+	// here would let an agent pad its arguments to skip straight to
+	// on_timeout, which under proceed is the whole call. Mirrors the same
+	// assertion in TestNonInteractiveStdinFallsThroughToTimeout.
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("undisplayable gate resolved in %v — padding must not shortcut the timeout", elapsed)
+	}
+
+	shown := out.String()
+	if !strings.Contains(shown, "over the 4096-byte limit") {
+		t.Errorf("the operator was not told why the call could not be shown:\n%s", shown)
+	}
+	if strings.Contains(shown, "[a]pprove") {
+		t.Errorf("an approve option was offered for arguments that were never shown:\n%s", shown)
+	}
+	if !strings.Contains(shown, "cannot approve arguments that were never shown") {
+		t.Errorf("typing approve must be refused with a reason:\n%s", shown)
+	}
+
+	// Exactly one terminal event, and it is the honest one: the terminal did
+	// not decide, so nothing may be recorded as a human decision.
+	entries := auditEvents(t, h)
+	if n := len(eventsOfType(entries, audit.EventGateTimeout)); n != 1 {
+		t.Errorf("want 1 gate_timeout, got %d in %+v", n, entries)
+	}
+	for _, et := range []audit.EventType{audit.EventGateApproved, audit.EventGateDenied} {
+		if n := len(eventsOfType(entries, et)); n != 0 {
+			t.Errorf("got %d %s events for a gate no human answered", n, et)
+		}
+	}
+}
+
+// TestUndisplayableCallCanStillBeDenied is the other half of the rule, and
+// the one that stops the refusal from becoming a weapon. Withdrawing the
+// approve option must not withdraw the operator's veto: an agent that could
+// silence the prompt by padding its arguments would gain the power to make a
+// call undeniable, which under on_timeout=proceed is the whole call.
+//
+// Both policies are covered because they fail differently: under abort a lost
+// veto merely delays the inevitable, under proceed it hands the agent the
+// call outright.
+func TestUndisplayableCallCanStillBeDenied(t *testing.T) {
+	args := `{"pad":"` + strings.Repeat("x", maxDisplayedArgumentBytes+1000) +
+		`","destination_account":"ACH-ATTACKER-9902"}`
+
+	for _, onTimeout := range []string{"abort", "proceed"} {
+		t.Run("on_timeout="+onTimeout, func(t *testing.T) {
+			inR, inW := io.Pipe()
+			t.Cleanup(func() { _ = inW.Close(); _ = inR.Close() })
+			out := newDenyPromptWatcher()
+			approver := &TerminalApprover{In: inR, Out: out, Interactive: true}
+
+			aborted := &atomic.Bool{}
+			h := newHarness(t, approver, onTimeout)
+			h.gate.timeoutOverride = 5 * time.Second
+			h.gate.SetAbortRun(func() { aborted.Store(true) })
+
+			go func() {
+				<-out.prompts
+				_, _ = fmt.Fprintln(inW, "d")
+			}()
+
+			status, body := postJSON(t, h.baseURL, toolCallBodyWithArgs("send_email", args))
+			if status != 200 || !strings.Contains(body, "DENIED") {
+				t.Fatalf("deny of an undisplayable call: status=%d body=%s", status, body)
+			}
+			if h.calls.Load() != 0 {
+				t.Errorf("a denied call reached the upstream: %d calls", h.calls.Load())
+			}
+			if aborted.Load() {
+				t.Error("an explicit deny must not abort the run — only a timeout does")
+			}
+			if n := len(eventsOfType(auditEvents(t, h), audit.EventGateDenied)); n != 1 {
+				t.Errorf("want 1 gate_denied, got %d", n)
+			}
+		})
+	}
+}
+
+// denyPromptWatcher signals on the deny-only prompt, the way promptWatcher
+// does for the ordinary one.
+func newDenyPromptWatcher() *promptWatcher {
+	p := newPromptWatcher()
+	p.match = "[d]eny?"
+	return p
+}
+
+// TestRenderBudgetsBoundWhatReachesTheTerminal: the raw-byte cap alone does
+// not bound the display. json.Indent emits 3+2*depth spaces per line, so
+// rendered size grows with the square of nesting depth — 4 KiB of brackets
+// renders to megabytes across thousands of lines, scrolling the header, the
+// subject digest and the first key out of any terminal's scrollback while
+// every line is, technically, printed. Each budget is pinned by the payload
+// that defeats the others.
+func TestRenderBudgetsBoundWhatReachesTheTerminal(t *testing.T) {
+	cases := []struct {
+		name, args, wantReason string
+	}{
+		{
+			// 191 raw bytes, 191 lines — under both the raw and the line
+			// budget — rendering to 19 KB of indentation. Only the rendered
+			// byte budget catches this one.
+			"deep nesting inflates rendered bytes",
+			strings.Repeat("[", 95) + "1" + strings.Repeat("]", 95),
+			"bytes of text",
+		},
+		{
+			"very deep nesting is many lines as well",
+			strings.Repeat("[", 1200) + "1" + strings.Repeat("]", 1200),
+			"lines",
+		},
+		{
+			"a flat array is one line per element",
+			"[" + strings.TrimSuffix(strings.Repeat("1,", 1500), ",") + "]",
+			"lines",
+		},
+		{
+			"raw size alone",
+			`{"pad":"` + strings.Repeat("x", maxDisplayedArgumentBytes+10) + `"}`,
+			"bytes, over the",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out strings.Builder
+			approver := &TerminalApprover{In: strings.NewReader(""), Out: &out, Interactive: false}
+			h := newHarness(t, approver, "abort")
+			h.gate.SetAbortRun(func() {})
+
+			postJSON(t, h.baseURL, toolCallBodyWithArgs("send_email", tc.args))
+
+			if h.calls.Load() != 0 {
+				t.Errorf("an undisplayable call reached the upstream: %d calls", h.calls.Load())
+			}
+			if !strings.Contains(out.String(), tc.wantReason) {
+				t.Errorf("refusal reason missing %q; got:\n%s", tc.wantReason, out.String())
+			}
+			if n := len(out.String()); n > 4096 {
+				t.Errorf("the refusal itself printed %d bytes — a refusal must be small", n)
+			}
+		})
+	}
+}
+
+// TestGateEventsCarrySubjectDigest: gate_approved on its own records that
+// something was approved, not what — and tool arguments themselves must never
+// be copied into the audit log. The subject_digest is the one short value that
+// closes that gap, and it is the same digest spec/human-gates-webhook.md §5
+// has an approver sign, so a terminal approval and a webhook approval of the
+// same call name the same subject.
+func TestGateEventsCarrySubjectDigest(t *testing.T) {
+	const args = `{"to":"x@example.com"}`
+
+	want, err := humangate.SubjectDigest("send_email", json.RawMessage(args))
+	if err != nil {
+		t.Fatalf("SubjectDigest: %v", err)
+	}
+
+	h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+	if status, _ := postJSON(t, h.baseURL, toolCallBodyWithArgs("send_email", args)); status != 200 {
+		t.Fatalf("approved call: status=%d", status)
+	}
+
+	for _, et := range []audit.EventType{audit.EventGateTriggered, audit.EventGateApproved} {
+		found := eventsOfType(auditEvents(t, h), et)
+		if len(found) != 1 {
+			t.Fatalf("want 1 %s, got %d", et, len(found))
+		}
+		if got := found[0].Details["subject_digest"]; got != want {
+			t.Errorf("%s subject_digest = %v, want %v", et, got, want)
+		}
+	}
+}
+
+// TestDeniedAndTimedOutGatesCarrySubjectDigest: the digest has to identify
+// the call on every terminal event, not only the approvals — a disputed
+// denial needs the same forensic handle an approval does.
+func TestDeniedAndTimedOutGatesCarrySubjectDigest(t *testing.T) {
+	const args = `{"to":"x@example.com"}`
+	want, err := humangate.SubjectDigest("send_email", json.RawMessage(args))
+	if err != nil {
+		t.Fatalf("SubjectDigest: %v", err)
+	}
+
+	cases := []struct {
+		name     string
+		approver Approver
+		event    audit.EventType
+	}{
+		{"denied", &fixedApprover{decision: DecisionDenied}, audit.EventGateDenied},
+		{"timeout", &fixedApprover{decision: DecisionApproved, delay: time.Hour}, audit.EventGateTimeout},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, tc.approver, "abort")
+			h.gate.SetAbortRun(func() {})
+			postJSON(t, h.baseURL, toolCallBodyWithArgs("send_email", args))
+
+			found := eventsOfType(auditEvents(t, h), tc.event)
+			if len(found) != 1 {
+				t.Fatalf("want 1 %s, got %d", tc.event, len(found))
+			}
+			if got := found[0].Details["subject_digest"]; got != want {
+				t.Errorf("%s subject_digest = %v, want %v", tc.event, got, want)
+			}
+		})
 	}
 }
