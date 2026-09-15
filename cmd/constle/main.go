@@ -17,7 +17,7 @@ import (
 	"github.com/constle/constle/pkg/manifest"
 )
 
-var constleVersion = "0.4.0"
+var constleVersion = "0.5.0"
 
 // stdoutMu serialises all writes to stdout.
 //

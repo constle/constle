@@ -28,7 +28,7 @@
 </p>
 
 > [!IMPORTANT]
-> Constle is early and solo-maintained (v0.4.0, pre-1.0) — interfaces may still change before a 1.0 release. Read [Known limitations](#known-limitations) before you rely on any of this.
+> Constle is early and solo-maintained (v0.5.0, pre-1.0) — interfaces may still change before a 1.0 release. Read [Known limitations](#known-limitations) before you rely on any of this.
 
 <!-- --8<-- [start:demo] -->
 You declare the policy in one YAML file. Constle runs the agent inside a sandbox with no default route, routes every packet through an allowlisting proxy, meters cost at the tool-call boundary, pauses sensitive calls for a human, and writes a signed, hash-chained audit log. None of that lives in the agent's process, so there is nothing in it for a prompt injection to disable.
@@ -167,7 +167,7 @@ If a document the agent reads contains a hidden instruction to exfiltrate data t
 ## 60-second quickstart
 
 <!-- --8<-- [start:quickstart] -->
-Verified end to end on Linux + Docker against `constle v0.4.0`. Copy-paste as-is.
+Verified end to end on Linux + Docker against `constle v0.5.0`. Copy-paste as-is.
 
 **1. Build the CLI** (Go 1.26+):
 
@@ -219,7 +219,7 @@ export AGENT_TASK="What is 2+2?"
 ```
 
 ```
-constle v0.4.0
+constle v0.5.0
 
   → parsing examples/basic-agent/agent.yaml
   ✓ Agentfile valid
