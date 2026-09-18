@@ -713,6 +713,20 @@ This matters because the gate's checks are driven by the JSON-RPC it reads: a
 upstream with the tool allowlist, the human gate, spending metering, and the
 `tool_call_start` / `tool_call_end` records all skipped.
 
+**Unambiguous bodies only.** The same reasoning applies one level down. The
+gate inspects a copy of the request and forwards the original bytes, so a body
+whose members two conforming parsers resolve differently is one the gate cannot
+make a promise about: a repeated `params` resolves last-wins for some parsers
+and first-wins for others, and a member that differs from another only in case
+binds for a case-folding parser and not for a case-sensitive one. Either lets
+the gate inspect one call while the upstream runs another. The gate therefore
+refuses — with `400` and an `mcp_request_blocked` event — any body holding two
+members of one object that are equal, or that differ only in case, at any
+depth, `params.arguments` included, rather than guessing which was meant. The
+two strings the gate routes on, `method` and `params.name`, are refused on the
+same principle when they differ from the spelling the gate matches only by
+case, by surrounding whitespace, or by a control character.
+
 ### 9.1 `mcp.servers[].id`
 
 | | |
