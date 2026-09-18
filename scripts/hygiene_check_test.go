@@ -390,3 +390,71 @@ func TestTreeScopedPatternInBinaryMetadataIsNotCaught(t *testing.T) {
 		t.Fatalf("this test documents a known gap; a non-zero exit means the gap was closed — update the comment on scan_stream and this test\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
 	}
 }
+
+// TestPrivateFileWithNoScopedEntriesLoads is the regression test for a bug
+// that had nothing to do with any one platform, and that every earlier test
+// missed because every earlier fixture happened to carry a text: entry.
+//
+// With no text: entry the scoped pattern file is empty, and the count guard
+// counted it with `grep -c ” FILE || echo 0`. On an empty file grep prints 0
+// AND exits 1, so the fallback fired too and the count came back as the
+// two-line string "0\n0" — not a number, taking the arithmetic down with it.
+// macOS surfaced it first only because a separate failure there emptied a
+// different file; the same fixture reproduces it on Linux.
+func TestPrivateFileWithNoScopedEntriesLoads(t *testing.T) {
+	repo := newFixtureRepo(t)
+	marker := "zq" + "unscoped" + "marker"
+	patterns := writePrivatePatterns(t, marker)
+	writeAndCommit(t, repo, "notes.txt", []byte("a line with "+marker+"\n"), "add notes")
+
+	stdout, stderr, code := runHygieneCheckWith(t, repo, patterns, "--tree", "--require-private")
+	combined := stdout + stderr
+
+	if strings.Contains(combined, "error") || strings.Contains(combined, "Illegal number") {
+		t.Fatalf("the loader errored on a private file with no scoped entries\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if code != 1 {
+		t.Fatalf("expected the unscoped pattern to be loaded and to catch notes.txt (exit 1), got exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	if !strings.Contains(combined, "notes.txt") {
+		t.Fatalf("expected the report to name notes.txt\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+}
+
+// TestPatternLoadFailureIsLoud pins the property that matters more than any
+// individual check in this file: when the script cannot assemble the pattern
+// set it was asked to scan with, it must say so and exit non-zero. It must
+// never print a clean tree.
+//
+// A scan that reports success having checked nothing is worse than no scan,
+// because it is trusted. Every hygiene bug this repo has hit has had that
+// shape — the stderr blind spot, the dropped byte-range entry — so the
+// behaviour is pinned directly rather than inferred from the checks above.
+//
+// An unreadable private file is the trigger here because it is deterministic;
+// the guard is not specific to that cause and fires on any short load.
+func TestPatternLoadFailureIsLoud(t *testing.T) {
+	repo := newFixtureRepo(t)
+	patterns := writePrivatePatterns(t, "zq"+"marker", "text:"+sampleScopedPattern())
+	if err := os.Chmod(patterns, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(patterns, 0o600) })
+	if f, err := os.Open(patterns); err == nil {
+		f.Close()
+		t.Skip("running as a user that ignores file modes (root); cannot make a file unreadable")
+	}
+
+	stdout, stderr, code := runHygieneCheckWith(t, repo, patterns, "--tree", "--require-private")
+	combined := stdout + stderr
+
+	if code == 0 {
+		t.Fatalf("an unloadable pattern file exited 0 — a failed load must never pass quietly\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if strings.Contains(combined, "working tree clean") {
+		t.Fatalf("an unloadable pattern file reported a clean tree\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if !strings.Contains(combined, "refusing to scan") {
+		t.Fatalf("expected the refusal to say why\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+}

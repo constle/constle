@@ -62,6 +62,20 @@
 
 set -u
 
+# Every byte this script handles is a byte, never a character. The private
+# pattern file holds raw byte ranges, which are not valid text in any UTF-8
+# locale, and a tool that is allowed to notice that will refuse the input:
+# BSD sed answers "RE error: illegal byte sequence" and stops, GNU tools
+# quietly switch to their binary path. Both outcomes drop patterns.
+#
+# It is EXPORTED rather than prefixed per command because a prefix covers one
+# command and no more — not the other side of a pipe, not a subshell, not a
+# function called from there. That distinction cost a macOS CI failure: every
+# grep in the loading path carried the prefix and the sed between them did
+# not. One export covers the whole script, including anything added later by
+# someone who does not know this paragraph exists.
+export LC_ALL=C
+
 # --------------------------------------------------------------------------
 # Generic, publishable patterns — see PATTERN SOURCES above for what is
 # allowed to live here. Case-insensitive extended regexes, one per entry.
@@ -86,6 +100,29 @@ STATUS=0
 
 warn() { printf '%s\n' "hygiene-check: $*" >&2; }
 
+# count_lines prints the number of lines in a file, and prints 0 for anything
+# it cannot count. It exists because the obvious spellings are both wrong:
+#
+#   grep -c '' FILE || echo 0    on an EMPTY file grep prints 0 AND exits 1,
+#                                so the fallback fires too and the result is
+#                                the two-line string "0\n0", which is not a
+#                                number and takes the arithmetic below down
+#                                with it. Empty is the normal case for a
+#                                private file with no text: entries.
+#   wc -l < FILE                 BSD wc pads its output with leading spaces,
+#                                so the result is " 3" on macOS and "3" on
+#                                Linux.
+#
+# So: count with wc, which always exits 0, strip whitespace, and refuse
+# anything that is not a plain number rather than feeding it to $(( )).
+count_lines() {
+    n=$(wc -l < "$1" 2>/dev/null | tr -d '[:space:]')
+    case "$n" in
+        '' | *[!0-9]*) n=0 ;;
+    esac
+    printf '%s' "$n"
+}
+
 # combined_pattern_file writes the active patterns to two temp files for
 # grep -f, one per line:
 #
@@ -100,31 +137,54 @@ combined_pattern_file() {
     printf '%s\n' "$GENERIC_PATTERNS" > "$tmp"
     : > "$text_tmp"
     if [ -f "$PRIVATE_FILE" ]; then
-        # LC_ALL=C and -a are both load-bearing, and their absence FAILS
-        # SILENTLY. A byte-range entry puts improperly-encoded bytes in the
-        # private file, which makes grep classify the file ITSELF as binary
-        # and stop reproducing its lines. The byte-range entry is then dropped
-        # on the way in — always — and whether its neighbours survive varies
-        # with buffering and grep version, so the loaded set is both short and
-        # unpredictable. A dropped entry is a check that stops running without
-        # saying so, which is the failure this script exists to prevent. -a
-        # forces the text path; LC_ALL=C stops the locale reaching the same
-        # conclusion on its own. The count guard below is the backstop.
-        LC_ALL=C grep -a -vE '^[[:space:]]*(#|$)' "$PRIVATE_FILE" > "$TMPDIR_HC/private" || true
-        sed -n 's/^text://p' "$TMPDIR_HC/private" | LC_ALL=C grep -a -v '^$' >> "$text_tmp" || true
-        LC_ALL=C grep -a -v '^text:' "$TMPDIR_HC/private" | LC_ALL=C grep -a -v '^$' >> "$tmp" || true
+        # -a is load-bearing here, and its absence FAILS SILENTLY. A
+        # byte-range entry puts improperly-encoded bytes in the private file,
+        # which can make a tool classify the file ITSELF as binary and stop
+        # reproducing its lines: the entry is dropped on the way in, along
+        # with an unpredictable number of its neighbours, and nothing says so.
+        # A dropped entry is a check that stops running — the failure this
+        # script exists to prevent. -a forces the text path; the exported
+        # LC_ALL=C at the top of the file stops the locale reaching the same
+        # conclusion on its own grounds. The count guard below is the backstop
+        # for both, and for whatever the next tool decides to do.
+        # `|| true` would swallow the difference between "no lines matched"
+        # (grep exit 1, normal) and "could not read the file" (grep exit 2 —
+        # unreadable, a directory, a broken symlink). Swallowing the second is
+        # how an existing-but-unreadable private file degrades into a
+        # generic-only scan that prints a clean tree: --require-private is
+        # satisfied by the file EXISTING, and nothing downstream notices that
+        # it contributed nothing.
+        grep -a -vE '^[[:space:]]*(#|$)' "$PRIVATE_FILE" > "$TMPDIR_HC/private"
+        rc=$?
+        if [ "$rc" -gt 1 ]; then
+            warn "private pattern file $PRIVATE_FILE could not be read (grep exit $rc) — refusing to scan without it"
+            exit 2
+        fi
+        sed -n 's/^text://p' "$TMPDIR_HC/private" | grep -a -v '^$' >> "$text_tmp" || true
+        grep -a -v '^text:' "$TMPDIR_HC/private" | grep -a -v '^$' >> "$tmp" || true
 
         # Every private pattern line must land in exactly one of the two
         # files. A count that does not add up means a pattern was dropped on
         # the way in, and a dropped pattern is a check that silently stops
         # running — the failure this whole script exists to prevent. Fail
         # loudly rather than scan with a short list.
-        want=$(LC_ALL=C grep -a -c '' "$TMPDIR_HC/private" 2>/dev/null || echo 0)
-        got_all=$(LC_ALL=C grep -a -c '' "$tmp" 2>/dev/null || echo 0)
-        got_text=$(LC_ALL=C grep -a -c '' "$text_tmp" 2>/dev/null || echo 0)
-        generic=$(printf '%s\n' "$GENERIC_PATTERNS" | LC_ALL=C grep -a -c '')
+        want=$(count_lines "$TMPDIR_HC/private")
+        got_all=$(count_lines "$tmp")
+        got_text=$(count_lines "$text_tmp")
+        printf '%s\n' "$GENERIC_PATTERNS" > "$TMPDIR_HC/generic"
+        generic=$(count_lines "$TMPDIR_HC/generic")
         if [ "$((got_all - generic + got_text))" -ne "$want" ]; then
             warn "private pattern file $PRIVATE_FILE: $want pattern line(s) present but $((got_all - generic + got_text)) loaded — refusing to scan with an incomplete pattern set"
+            exit 2
+        fi
+
+        # A private file that yields no patterns at all leaves the private
+        # half of the scan not running. That is a legitimate state for a file
+        # of nothing but comments, and not one to discover afterwards from a
+        # clean report, so under --require-private it is a refusal like any
+        # other missing signal.
+        if [ "$want" -eq 0 ] && [ "$REQUIRE_PRIVATE" = 1 ]; then
+            warn "private pattern file $PRIVATE_FILE contains no patterns — refusing to scan with the private half switched off"
             exit 2
         fi
     elif [ "$REQUIRE_PRIVATE" = 1 ]; then
@@ -142,7 +202,7 @@ combined_pattern_file() {
 is_binary() {
     head -c 8000 "$1" > "$TMPDIR_HC/head" 2>/dev/null || return 1
     raw=$(wc -c < "$TMPDIR_HC/head")
-    stripped=$(LC_ALL=C tr -d '\000' < "$TMPDIR_HC/head" | wc -c)
+    stripped=$(tr -d '\000' < "$TMPDIR_HC/head" | wc -c)
     [ "$raw" -ne "$stripped" ]
 }
 
@@ -168,7 +228,7 @@ scan_stream() {
     # 2>&1: GNU grep reports a binary-file match ("binary file X matches")
     # on stderr with nothing on stdout, so a binary file with a hit would
     # read as clean unless stderr is captured too.
-    hits=$(LC_ALL=C grep -inE -f "$PATTERN_FILE" "$content" 2>&1 | head -20) || true
+    hits=$(grep -inE -f "$PATTERN_FILE" "$content" 2>&1 | head -20) || true
     if [ -n "$hits" ]; then
         printf '✗ %s: identity/attribution pattern hits:\n%s\n' "$label" "$hits"
         clean=1
@@ -181,7 +241,7 @@ scan_stream() {
         return $clean
     fi
 
-    text_hits=$(LC_ALL=C grep -inE -f "$TEXT_PATTERN_FILE" "$content" 2>&1 | head -5) || true
+    text_hits=$(grep -inE -f "$TEXT_PATTERN_FILE" "$content" 2>&1 | head -5) || true
     if [ -n "$text_hits" ]; then
         printf '✗ %s: text-scoped pattern hits:\n%s\n' "$label" "$text_hits"
         clean=1
