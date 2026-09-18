@@ -48,6 +48,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/constle/constle/internal/audit"
 	"github.com/constle/constle/internal/humangate"
@@ -64,6 +66,11 @@ const maxBodyBytes = 10 << 20 // 10 MB
 // the MCP endpoint. Spelled in the header's canonical order, matching what the
 // reference MCP server implementations advertise.
 const allowedMethods = "GET, POST, DELETE"
+
+// methodToolsCall is the one JSON-RPC method the gate inspects. The
+// comparison against it is exact and case-sensitive, and parseJSONRPC refuses
+// the near-misses rather than letting one route past inspection.
+const methodToolsCall = "tools/call"
 
 // Decision is the outcome of a human approval request.
 type Decision int
@@ -87,13 +94,13 @@ type Request struct {
 	// human less than all of it is collecting consent for a call that is not
 	// the one that runs, so every consumer must present it whole or refuse.
 	//
-	// It is what the gate INSPECTED, which is not quite the same as what the
-	// upstream will act on: parseJSONRPC resolves a body with a duplicated
-	// params or arguments key last-wins, while forward() replays the original
-	// bytes, so an upstream that resolves duplicates differently can see
-	// something else. That divergence predates this field and is tracked
-	// separately; it is noted here so the comment above is not read as a
-	// guarantee it cannot give.
+	// It is what the gate INSPECTED, and that is now the same call the
+	// upstream acts on: parseJSONRPC refuses a body whose member names any
+	// two conforming parsers could resolve differently — a repeated key, or
+	// one that differs from another only in case — at every depth, arguments
+	// included, so these bytes cannot be read one way here and another way
+	// upstream. What the gate cannot promise is how the TOOL then reads a
+	// value it was handed unambiguously.
 	Arguments json.RawMessage
 
 	// SubjectDigest is spec/human-gates-webhook.md §5's digest over Tool and
@@ -533,6 +540,20 @@ func (g *Gate) serveInspected(w http.ResponseWriter, r *http.Request, up *upstre
 
 	msg, jsonErr := parseJSONRPC(body)
 	if jsonErr != nil {
+		// An ambiguous body is audited where a merely malformed one is not:
+		// the second is a broken client, the first is an attempt to have the
+		// gate inspect a different call than the upstream runs, and that is
+		// worth a line in the signed log. The reason is a fixed string — the
+		// offending name is attacker-controlled, and it reaches the agent in
+		// the HTTP response instead, which is read only by the sender that
+		// already has it.
+		if errors.Is(jsonErr, errAmbiguousBody) {
+			g.log(audit.EventMCPRequestBlocked, map[string]any{
+				"server": up.id,
+				"method": clampMethod(r.Method),
+				"reason": "ambiguous JSON-RPC body",
+			})
+		}
 		http.Error(w, "constle mcp gate: "+jsonErr.Error(), http.StatusBadRequest)
 		return
 	}
@@ -543,7 +564,7 @@ func (g *Gate) serveInspected(w http.ResponseWriter, r *http.Request, up *upstre
 		up.proxy.ServeHTTP(w, r)
 	}
 
-	if msg.Method != "tools/call" {
+	if msg.Method != methodToolsCall {
 		forward()
 		return
 	}
@@ -610,6 +631,29 @@ func (g *Gate) serveInspected(w http.ResponseWriter, r *http.Request, up *upstre
 	}
 
 	if !g.gated[tool] {
+		// A name that folds to a gated tool's without matching it is refused
+		// rather than forwarded ungated. The package's mapping contract is an
+		// exact, case-sensitive match, which is what makes gating auditable —
+		// but exactness binds the upstream only if the upstream agrees, and a
+		// server that dispatches tool names case-insensitively would run
+		// send_email for a call the gate read as SEND_EMAIL and never gated.
+		// A declared tools allowlist already blocks the near-miss above as
+		// undeclared; this closes the same hole on a server that declares no
+		// allowlist, which the manifest permits.
+		for gatedTool := range g.gated {
+			if !strings.EqualFold(tool, gatedTool) {
+				continue
+			}
+			g.log(audit.EventMCPToolBlocked, map[string]any{
+				"server": up.id,
+				"tool":   clampJSONValue(tool),
+				"reason": "case variant of a gated tool name",
+			})
+			writeJSONRPCError(w, msg.ID, fmt.Sprintf(
+				"constle: tool %q differs from gated tool %q only in case — the gate matches tool names exactly",
+				clampJSONValue(tool), gatedTool))
+			return
+		}
 		forward()
 		return
 	}
@@ -866,22 +910,334 @@ type jsonRPCMessage struct {
 	} `json:"params"`
 }
 
-// parseJSONRPC parses a single JSON-RPC message, failing closed on batches:
-// a batch could smuggle a gated tools/call past a naive object parse.
+// errAmbiguousBody marks the refusals below — a body more than one conforming
+// parser could read differently — as distinct from a body no parser can read
+// at all. serveInspected audits this one and not its siblings: a truncated or
+// malformed body is almost always a broken client, while a body carrying two
+// spellings of the same member had to be built on purpose.
+var errAmbiguousBody = errors.New("ambiguous JSON-RPC body")
+
+// parseJSONRPC parses a single JSON-RPC message, failing closed on every body
+// it cannot read exactly one way.
+//
+// The gate inspects one copy of the request and forwards another: forward()
+// replays the ORIGINAL bytes, so the upstream runs whatever ITS parser makes
+// of them. A body two conforming parsers can read differently is therefore a
+// body the gate can promise nothing about, and the promise is the whole point
+// — what the gate inspects has to be the call the upstream executes. Three
+// families of body break that, all of them shapes encoding/json accepts in
+// silence:
+//
+//   - A repeated member: {"params":{…rm_rf…},"params":{…echo…}}. encoding/json
+//     keeps the last occurrence; a first-wins parser (gjson, buger/jsonparser,
+//     simdjson's on-demand lookups, most hand-rolled scanners) keeps the
+//     first. The gate then allowlists, gates, digests and audits one tool
+//     while the upstream runs the other. Inside params it is worse than
+//     last-wins suggests: Params is a struct, so a second params MERGES field
+//     by field without zeroing, and the gate can inspect a name and an
+//     arguments pair that no parser anywhere reads together.
+//   - A case-variant member: {"method":"tools/call","METHOD":"tools/list"}.
+//     encoding/json matches struct fields case-INSENSITIVELY, so it binds
+//     METHOD to Method and the gate reads tools/list — skipping the
+//     allowlist, the human gate, the meter and the tool_call bracketing
+//     outright — while every case-sensitive parser (Node, Python, Jackson,
+//     serde, jq, and encoding/json on the upstream's own struct) ignores
+//     METHOD and runs tools/call. This family needs no exotic upstream at
+//     all, and a duplicate-key check alone does not catch it: by RFC 8259
+//     those are two distinct names and the document has no duplicates. The
+//     fold is Unicode, not ASCII — "paramſ" (U+017F) binds to Params too —
+//     so the check folds the way encoding/json folds, not the way
+//     strings.ToLower does.
+//   - A repeat nested inside arguments. Arguments is a json.RawMessage, so
+//     both spellings survive into the approval prompt, the subject digest and
+//     the upstream, where three parsers resolve them three ways: the operator
+//     reads one value, signs a digest over another, and the tool acts on a
+//     third. The walk therefore recurses instead of stopping at the envelope.
+//
+// Which spelling was "intended" is not knowable, so the gate never guesses: an
+// ambiguous body is refused whole, exactly as an unparseable one is.
+//
+// The scan runs before the decode, and once it passes, the decode cannot
+// disagree with it: every member name in the body is then unique under the
+// same fold encoding/json binds with, so last-wins, first-wins and
+// case-sensitive parsers all resolve the same members to the same values.
 func parseJSONRPC(body []byte) (*jsonRPCMessage, error) {
 	trimmed := bytes.TrimLeft(body, " \t\r\n")
 	if len(trimmed) == 0 {
 		return nil, errors.New("empty JSON-RPC body")
 	}
+	// Checked ahead of the scan purely for the message: the scan refuses a
+	// batch anyway, as a top-level value that is not a message object, but
+	// "batches are not supported" tells a client what to change and "not an
+	// object" does not.
 	if trimmed[0] == '[' {
 		return nil, errors.New("JSON-RPC batch requests are not supported through the gate proxy")
+	}
+	if err := scanUnambiguous(body); err != nil {
+		return nil, err
 	}
 
 	var msg jsonRPCMessage
 	if err := json.Unmarshal(body, &msg); err != nil {
 		return nil, fmt.Errorf("invalid JSON-RPC body: %v", err)
 	}
+	if err := checkUnambiguousNames(&msg); err != nil {
+		return nil, err
+	}
 	return &msg, nil
+}
+
+// checkUnambiguousNames refuses the two STRINGS the gate routes on when they
+// are a near-miss for the spelling it compares them against.
+//
+// scanUnambiguous settles which bytes each member holds; this settles whether
+// the gate and the upstream will read those bytes as the same name. The gate
+// dispatches on exact equality ("tools/call", and the manifest's tool names),
+// which is the only auditable mapping — but a value that merely differs in
+// case, in surrounding whitespace, or by a trailing control byte is one an
+// upstream may well fold back: method dispatch that lowercases, a name that
+// crosses a C string boundary where NUL ends it. The gate would read
+// "TOOLS/CALL" as some other method and forward it UNINSPECTED — no
+// allowlist, no gate, no tool_call bracketing — for the upstream to run as
+// tools/call. Refusing the near-miss costs nothing real: no MCP method or
+// tool name contains a control character or leans on leading or trailing
+// space, and an agent that means tools/call can spell it.
+func checkUnambiguousNames(msg *jsonRPCMessage) error {
+	if err := checkRoutingName("method", msg.Method); err != nil {
+		return err
+	}
+	if msg.Method != methodToolsCall {
+		if strings.EqualFold(msg.Method, methodToolsCall) {
+			return fmt.Errorf("%w: method %q differs from %q only in case",
+				errAmbiguousBody, clampJSONValue(msg.Method), methodToolsCall)
+		}
+		return nil
+	}
+	return checkRoutingName("params.name", msg.Params.Name)
+}
+
+// checkRoutingName rejects a routed name that a normalizing reader would see
+// differently from the gate's byte-exact comparison.
+func checkRoutingName(field, name string) error {
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("%w: %s %q has leading or trailing whitespace",
+			errAmbiguousBody, field, clampJSONValue(name))
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%w: %s %q contains a control character",
+				errAmbiguousBody, field, clampJSONValue(name))
+		}
+	}
+	return nil
+}
+
+// maxScanDepth bounds how deep scanUnambiguous nests. It matches
+// encoding/json's own limit, so the gate inspects exactly the documents a
+// conforming decoder accepts — but it has to be enforced here rather than
+// inherited, because json.Decoder's token stream, unlike Unmarshal, applies
+// no depth limit of its own.
+const maxScanDepth = 10000
+
+// maxScanKeys bounds how many member names scanUnambiguous holds at once.
+// Remembering an object's names is what makes a repeat detectable, so the
+// memory the walk holds is proportional to the members of the objects
+// currently OPEN: a sibling's names are released when it closes, and an array
+// of a million alike rows costs the names of one row rather than of all of
+// them. Nothing short of a single object with a six-figure member count
+// reaches the cap. What it buys is a bounded worst case — at roughly 60 bytes
+// of map and string per name the set tops out near 8 MB, the same order as
+// the body already being held, where an uncapped walk over 10 MB of nothing
+// but short distinct names would retain some ten times that.
+const maxScanKeys = 1 << 17
+
+// scanFrame is one open object or array: the member names already seen at that
+// level, and whether the next token there is a name or a value.
+type scanFrame struct {
+	object  bool
+	wantKey bool
+	keys    map[string]string // folded name -> the spelling first seen
+}
+
+// scanUnambiguous walks the whole body once and refuses any object holding two
+// member names that a parser could resolve to the same member.
+//
+// json.Decoder.Token is the right primitive for one reason above the others:
+// it returns names already unescaped, so "name" and "name" arrive as the
+// same Go string and an escape-obfuscated repeat is caught with no unescaping
+// logic of the gate's own — on exactly the decoded form encoding/json itself
+// matches struct fields against.
+//
+// The rule is the same at every depth, envelope or arguments, which is both
+// simpler to state and stronger than scoping it: within one object, no two
+// member names may be equal, and none may differ from another only under
+// Unicode simple folding. Two names that collide that way are left for the
+// reader to resolve, and the readers disagree.
+func scanUnambiguous(body []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	// Numbers are carried as text rather than parsed into float64: an id or an
+	// argument may legitimately be 1e999, which the gate never reads as a
+	// number and Unmarshal never rejects, and the scan must not be the one
+	// that refuses it.
+	dec.UseNumber()
+
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("invalid JSON-RPC body: %v", err)
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		// Unmarshal accepts a top-level null into a zero-value message, whose
+		// empty method is not tools/call and so skips inspection entirely.
+		return errors.New("invalid JSON-RPC body: top-level value is not a JSON-RPC message object")
+	}
+
+	stack := []scanFrame{{object: true, wantKey: true}}
+	tracked := 0
+
+	for len(stack) > 0 {
+		tok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("invalid JSON-RPC body: %v", err)
+		}
+		top := &stack[len(stack)-1]
+
+		if top.object && top.wantKey {
+			if d, ok := tok.(json.Delim); ok {
+				if d != '}' {
+					// Unreachable: in name position the lexer yields a string
+					// or the closing brace, nothing else.
+					return fmt.Errorf("invalid JSON-RPC body: unexpected %q where a member name belongs", d)
+				}
+				tracked -= len(top.keys)
+				stack = stack[:len(stack)-1]
+				continue
+			}
+			key, ok := tok.(string)
+			if !ok {
+				return errors.New("invalid JSON-RPC body: member name is not a string")
+			}
+			folded := foldKey(key)
+			if seen, dup := top.keys[folded]; dup {
+				if seen == key {
+					return fmt.Errorf("%w: member %q appears more than once at depth %d",
+						errAmbiguousBody, clampJSONValue(key), len(stack)-1)
+				}
+				return fmt.Errorf("%w: members %q and %q at depth %d differ only in case",
+					errAmbiguousBody, clampJSONValue(seen), clampJSONValue(key), len(stack)-1)
+			}
+			if top.keys == nil {
+				top.keys = make(map[string]string, 4)
+			}
+			top.keys[folded] = key
+			tracked++
+			if tracked > maxScanKeys {
+				return errors.New("invalid JSON-RPC body: too many member names to inspect")
+			}
+			top.wantKey = false
+			continue
+		}
+
+		// A value position: an array element, or the value of the name just
+		// read. Putting the parent back into name position BEFORE descending
+		// is what keeps the walk iterative — there is then nothing to remember
+		// across the pop, and a 10000-deep body costs heap the cap bounds
+		// rather than goroutine stack it does not.
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				if top.object {
+					top.wantKey = true
+				}
+				if len(stack) >= maxScanDepth {
+					return errors.New("invalid JSON-RPC body: nested too deeply to inspect")
+				}
+				stack = append(stack, scanFrame{object: d == '{', wantKey: d == '{'})
+			case ']':
+				stack = stack[:len(stack)-1]
+			default:
+				// Unreachable: '}' cannot open a value.
+				return fmt.Errorf("invalid JSON-RPC body: unexpected %q where a value belongs", d)
+			}
+			continue
+		}
+		if top.object {
+			top.wantKey = true
+		}
+	}
+
+	// Token is a stream decoder and reports nothing after a complete value, so
+	// a second message appended to the first has to be asked about. Unmarshal
+	// rejects trailing data too, but the scan runs first and so is the one
+	// that gets there.
+	if dec.More() {
+		return errors.New("invalid JSON-RPC body: trailing data after the JSON-RPC message")
+	}
+	return nil
+}
+
+// foldKey returns the spelling shared by every member name encoding/json would
+// bind to the same struct field: each rune replaced by the smallest rune it
+// folds to, lowercased when that is an ASCII letter so the common all-ASCII
+// name is returned unchanged and costs no allocation.
+//
+// It has to be simple folding rather than lowercasing, because that is what
+// encoding/json does: U+017F LATIN SMALL LETTER LONG S folds to "s" and
+// U+212A KELVIN SIGN to "k", so {"params":…,"paramſ":…} binds twice while
+// strings.ToLower reads two unrelated names. Folding maps each equivalence
+// class to one representative, so comparing folded spellings answers exactly
+// the question strings.EqualFold answers pairwise, at map-lookup cost.
+func foldKey(key string) string {
+	simple := true
+	for i := 0; i < len(key); i++ {
+		if c := key[i]; c >= utf8.RuneSelf || ('A' <= c && c <= 'Z') {
+			simple = false
+			break
+		}
+	}
+	if simple {
+		return key
+	}
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range key {
+		b.WriteRune(foldRune(r))
+	}
+	return b.String()
+}
+
+// foldRune is the representative of one simple-folding equivalence class: the
+// smallest rune in it, shifted to lower case when that smallest rune is an
+// ASCII letter (every ASCII letter's class holds its own upper case, so no
+// other class can claim the shifted value).
+func foldRune(r rune) rune {
+	if r < utf8.RuneSelf {
+		if 'A' <= r && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}
+	lo := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < lo {
+			lo = f
+		}
+	}
+	if 'A' <= lo && lo <= 'Z' {
+		lo += 'a' - 'A'
+	}
+	return lo
+}
+
+// clampJSONValue bounds a member name or a routed name before it is echoed
+// back to the agent, on the same principle as clampMethod and compactRPCID:
+// the body cap allows a very long one, and a truncated multi-byte rune is
+// dropped rather than emitted as a broken one.
+func clampJSONValue(s string) string {
+	const maxLen = 64
+	if len(s) > maxLen {
+		s = strings.ToValidUTF8(s[:maxLen], "")
+	}
+	return s
 }
 
 // writeJSONRPCError responds with a JSON-RPC error object (code -32001,
