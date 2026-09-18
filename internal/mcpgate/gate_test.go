@@ -1226,10 +1226,16 @@ func TestNonPOSTBodyRefusalIsPinned(t *testing.T) {
 // the window and have it be the one a last-key-wins parser used. Here the
 // whole call goes through the real gate, the real TerminalApprover, and a
 // real upstream that records exactly what it was asked to run.
+//
+// The hidden suffix is spelled with SIBLING keys rather than the duplicates
+// this test was written with, because parseJSONRPC now refuses a duplicate
+// outright (TestAmbiguousBodyIsRefusedNotResolved). That refusal must not be
+// what carries the display invariant: an argument object can hide a second
+// account in plain, unambiguous JSON, and the operator still has to see it.
 func TestApprovedCallIsTheCallTheOperatorSaw(t *testing.T) {
 	args := `{"destination_account":"ACH-SAFE-4417","amount_cents":4250,"memo":"` +
 		strings.Repeat("routine monthly invoice. ", 30) +
-		`","destination_account":"ACH-ATTACKER-9902","amount_cents":992450000}`
+		`","fallback_destination_account":"ACH-ATTACKER-9902","fallback_amount_cents":992450000}`
 
 	inR, inW := io.Pipe()
 	t.Cleanup(func() { _ = inW.Close(); _ = inR.Close() })
@@ -1536,4 +1542,449 @@ func TestDeniedAndTimedOutGatesCarrySubjectDigest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// firstWinsToolName resolves params.name the way a FIRST-key-wins parser does
+// - gjson, buger/jsonparser, simdjson's on-demand lookups, and most
+// hand-rolled scanners, all of which stop at the first member with a matching
+// name. It is deliberately built from json.Decoder's token stream rather than
+// from object decoding, so it shares no resolution logic with the gate's
+// encoding/json parse and can disagree with it.
+func firstWinsToolName(t *testing.T, body string) string {
+	t.Helper()
+
+	firstMember := func(doc, want string) string {
+		dec := json.NewDecoder(strings.NewReader(doc))
+		if _, err := dec.Token(); err != nil { // the opening brace
+			t.Fatalf("first-wins walk of %q: %v", doc, err)
+		}
+		for dec.More() {
+			key, err := dec.Token()
+			if err != nil {
+				t.Fatalf("first-wins walk of %q: %v", doc, err)
+			}
+			var raw json.RawMessage
+			if err := dec.Decode(&raw); err != nil {
+				t.Fatalf("first-wins walk of %q: %v", doc, err)
+			}
+			if key == want {
+				return string(raw)
+			}
+		}
+		return ""
+	}
+
+	params := firstMember(body, "params")
+	if params == "" {
+		return ""
+	}
+	name := firstMember(params, "name")
+	if name == "" {
+		return ""
+	}
+	var unquoted string
+	if err := json.Unmarshal([]byte(name), &unquoted); err != nil {
+		t.Fatalf("first-wins name %q: %v", name, err)
+	}
+	return unquoted
+}
+
+// TestParserDifferentialIsProvenNotAssumed is the regression test for the
+// bypass itself, and it proves the bypass before it asserts the fix.
+//
+// parseJSONRPC read the body with encoding/json, which resolves a repeated
+// member LAST-wins, while forward() replays the original bytes for the
+// upstream to resolve with its own parser. The body below is the sharp form
+// of that: Go reads params.name as list_inbox -- declared, ungated, forwarded
+// with no prompt -- and a first-wins upstream reads send_email, the tool the
+// Agentfile gates. Nothing in the old path could tell them apart, because
+// nothing in the old path read the bytes twice.
+//
+// The two readings are computed here rather than asserted from memory: if they
+// ever stop diverging, this test is measuring nothing and says so.
+func TestParserDifferentialIsProvenNotAssumed(t *testing.T) {
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call",` +
+		`"params":{"name":"send_email","arguments":{"to":"attacker@evil.example"}},` +
+		`"params":{"name":"list_inbox","arguments":{}}}`
+
+	var gateView jsonRPCMessage
+	if err := json.Unmarshal([]byte(body), &gateView); err != nil {
+		t.Fatalf("encoding/json rejected the exploit body, so it proves nothing: %v", err)
+	}
+	upstreamView := firstWinsToolName(t, body)
+
+	if gateView.Params.Name == upstreamView {
+		t.Fatalf("both parsers read %q -- this body is no longer a differential", upstreamView)
+	}
+	if gateView.Params.Name != "list_inbox" || upstreamView != "send_email" {
+		t.Fatalf("gate reads %q, first-wins reads %q -- want the ungated tool and the gated one",
+			gateView.Params.Name, upstreamView)
+	}
+
+	// Approver would APPROVE, so reaching the upstream can only mean no gate
+	// ran -- the same trick the method-bypass regression uses.
+	h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+	status, resp := postJSON(t, h.baseURL, body)
+	if status != http.StatusBadRequest {
+		t.Errorf("ambiguous tools/call: status=%d body=%s, want 400", status, resp)
+	}
+	if !strings.Contains(resp, "ambiguous JSON-RPC body") {
+		t.Errorf("the refusal does not name its reason: %s", resp)
+	}
+	if h.calls.Load() != 0 {
+		t.Errorf("the ambiguous body reached the upstream %d time(s)", h.calls.Load())
+	}
+	if forwarded := h.bodies.last(); forwarded != "" {
+		t.Errorf("the upstream was sent bytes the gate never resolved:\n%s", forwarded)
+	}
+
+	entries := auditEvents(t, h)
+	if n := len(eventsOfType(entries, audit.EventToolCallStart)); n != 0 {
+		t.Errorf("%d tool_call_start events for a call that never ran", n)
+	}
+	if n := len(eventsOfType(entries, audit.EventGateTriggered)); n != 0 {
+		t.Errorf("%d gate_triggered events -- a refused body must not consume a decision", n)
+	}
+	if n := len(eventsOfType(entries, audit.EventMCPRequestBlocked)); n != 1 {
+		t.Errorf("want 1 mcp_request_blocked, got %+v", entries)
+	}
+}
+
+// TestAmbiguousBodyIsRefusedNotResolved sweeps the families of body whose
+// meaning depends on which parser reads it. Every one is accepted by
+// encoding/json today, and every one reaches a different call under some
+// conforming parser, so the gate must refuse rather than pick: there is no
+// "intended" spelling to recover.
+//
+// The approver is set to APPROVE throughout, so a body that reaches the
+// upstream can only have got there ungated.
+func TestAmbiguousBodyIsRefusedNotResolved(t *testing.T) {
+	const envelope = `"jsonrpc":"2.0","id":1,`
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"duplicate params", `{` + envelope + `"method":"tools/call",` +
+			`"params":{"name":"send_email","arguments":{}},"params":{"name":"list_inbox","arguments":{}}}`},
+		{"duplicate name", `{` + envelope + `"method":"tools/call",` +
+			`"params":{"name":"send_email","name":"list_inbox","arguments":{}}}`},
+		{"duplicate method", `{` + envelope + `"method":"tools/call","method":"tools/list",` +
+			`"params":{"name":"send_email","arguments":{}}}`},
+		{"duplicate id", `{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/call",` +
+			`"params":{"name":"list_inbox","arguments":{}}}`},
+		// No duplicate members at all by RFC 8259, and still a bypass:
+		// encoding/json folds case, so it binds the second spelling while a
+		// case-sensitive upstream -- every mainstream parser -- binds the first.
+		{"case-variant params", `{` + envelope + `"method":"tools/call",` +
+			`"params":{"name":"send_email","arguments":{}},"PARAMS":{"name":"list_inbox","arguments":{}}}`},
+		{"case-variant method", `{` + envelope + `"Method":"tools/call","method":"tools/list",` +
+			`"params":{"name":"send_email","arguments":{}}}`},
+		{"case-variant name", `{` + envelope + `"method":"tools/call",` +
+			`"params":{"name":"send_email","NAME":"list_inbox","arguments":{}}}`},
+		// U+017F LATIN SMALL LETTER LONG S folds to "s", so encoding/json binds
+		// this spelling to Params too. strings.ToLower does not see it.
+		{"unicode fold params", `{` + envelope + `"method":"tools/call",` +
+			`"params":{"name":"send_email","arguments":{}},"paramſ":{"name":"list_inbox","arguments":{}}}`},
+		// Token() unescapes before comparing, so the escape hides nothing.
+		{"escaped duplicate name", `{` + envelope + `"method":"tools/call",` +
+			`"params":{"\u006eame":"send_email","name":"list_inbox","arguments":{}}}`},
+		// Inside arguments the gate makes no decision, but the operator reads
+		// one value, the digest commits to another and the tool acts on a
+		// third -- the same divergence one level down.
+		{"duplicate key in arguments", `{` + envelope + `"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"to_account":"ACH-SAFE-4417","to_account":"ACH-ATTACKER-9902"}}}`},
+		{"case-variant key in arguments", `{` + envelope + `"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"to":"safe@example.com","TO":"attacker@evil.example"}}}`},
+		{"duplicate key nested in arguments", `{` + envelope + `"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"transfer":{"rows":[{"ok":true},{"to":"safe","to":"attacker"}]}}}}`},
+		// Not a tools/call by Go's reading, so the old path forwarded it with
+		// no inspection at all -- while a first-wins upstream runs the gated
+		// call the params still carry.
+		{"ambiguity on an uninspected method", `{` + envelope + `"method":"tools/list","method":"tools/list",` +
+			`"params":{"name":"send_email","arguments":{}}}`},
+		{"trailing second message", `{` + envelope + `"method":"tools/call","params":{"name":"list_inbox","arguments":{}}}` +
+			`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_email","arguments":{}}}`},
+		// Unmarshal accepts a top-level null into a zero-value message, whose
+		// empty method skips inspection entirely.
+		{"top-level null", `null`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+			status, resp := postJSON(t, h.baseURL, tc.body)
+			if status != http.StatusBadRequest {
+				t.Errorf("status=%d body=%s, want 400", status, resp)
+			}
+			if h.calls.Load() != 0 {
+				t.Errorf("reached the upstream %d time(s)", h.calls.Load())
+			}
+			if forwarded := h.bodies.last(); forwarded != "" {
+				t.Errorf("the upstream was sent bytes the gate never resolved:\n%s", forwarded)
+			}
+
+			entries := auditEvents(t, h)
+			if n := len(eventsOfType(entries, audit.EventToolCallStart)); n != 0 {
+				t.Errorf("%d tool_call_start events for a call that never ran", n)
+			}
+			if n := len(eventsOfType(entries, audit.EventGateApproved)); n != 0 {
+				t.Errorf("%d gate_approved events -- a refused body must not consume a decision", n)
+			}
+		})
+	}
+}
+
+// TestRoutingNameNearMissesAreRefused covers the other half of "the gate reads
+// what the upstream runs": the two STRINGS it routes on. The gate compares them
+// byte-exactly, which is the only auditable mapping -- but a value that differs
+// only in case, in surrounding space, or by a trailing NUL is one a normalizing
+// upstream folds right back, and the gate would have forwarded "TOOLS/CALL"
+// with no inspection at all, on the grounds that it is not tools/call.
+func TestRoutingNameNearMissesAreRefused(t *testing.T) {
+	cases := []struct{ name, method, tool string }{
+		{"uppercase method", "TOOLS/CALL", "send_email"},
+		{"mixed-case method", "tools/Call", "send_email"},
+		{"padded method", "tools/call ", "send_email"},
+		{"nul-terminated method", "tools/call\x00", "send_email"},
+		{"padded tool name", "tools/call", " send_email"},
+		{"nul-terminated tool name", "tools/call", "send_email\x00"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+			// json.Marshal, not %q: a NUL has to reach the gate as the JSON
+			// escape a real client would send, not as Go's own \x00 spelling,
+			// which is not JSON at all.
+			method, err := json.Marshal(tc.method)
+			if err != nil {
+				t.Fatalf("marshal method: %v", err)
+			}
+			tool, err := json.Marshal(tc.tool)
+			if err != nil {
+				t.Fatalf("marshal tool: %v", err)
+			}
+			body := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":%s,"params":{"name":%s,"arguments":{}}}`,
+				method, tool)
+
+			status, resp := postJSON(t, h.baseURL, body)
+			if status != http.StatusBadRequest {
+				t.Errorf("status=%d body=%s, want 400", status, resp)
+			}
+			if h.calls.Load() != 0 {
+				t.Errorf("reached the upstream %d time(s)", h.calls.Load())
+			}
+			if n := len(eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)); n != 1 {
+				t.Errorf("want 1 mcp_request_blocked, got %d", n)
+			}
+		})
+	}
+}
+
+// TestGatedToolNameCaseVariantIsRefused pins the same rule for the manifest's
+// tool names, on the one configuration where nothing else catches it: a server
+// that declares no tools allowlist, which pkg/manifest permits. There the
+// exact-match gate set is the only check, so SEND_EMAIL would be forwarded
+// ungated for a case-insensitive upstream to run as send_email.
+func TestGatedToolNameCaseVariantIsRefused(t *testing.T) {
+	calls := &atomic.Int64{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	}))
+	t.Cleanup(up.Close)
+
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New(logLoc)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "test-agent"},
+		MCP: manifest.MCP{Servers: []manifest.MCPServer{
+			{ID: "email", URL: up.URL}, // no Tools: whatever the server offers
+		}},
+		HumanGates: manifest.HumanGates{
+			Enabled:                true,
+			RequireApprovalFor:     []string{"send_email"},
+			ApprovalTimeoutSeconds: 300,
+			OnTimeout:              "abort",
+		},
+	}
+	g, err := New(m, &fixedApprover{decision: DecisionApproved}, nil, logger, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	port, token, err := g.Bind("testrun01", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d/%s/servers/email", port, token)
+
+	// Not the undeclared-tool path: list_inbox is reachable on this server
+	// precisely because it declares no allowlist.
+	if status, body := postJSON(t, baseURL, toolCallBody("list_inbox")); status != 200 {
+		t.Fatalf("harness bug: an ungated tool must still pass: status=%d body=%s", status, body)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("harness bug: the ungated call did not reach the upstream")
+	}
+
+	status, body := postJSON(t, baseURL, toolCallBody("SEND_EMAIL"))
+	if status != 200 || !strings.Contains(body, "only in case") {
+		t.Errorf("case-variant gated tool: status=%d body=%s", status, body)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("the case-variant call reached the upstream")
+	}
+
+	entries := auditEvents(t, &gateHarness{logPath: logLoc.String()})
+	if n := len(eventsOfType(entries, audit.EventMCPToolBlocked)); n != 1 {
+		t.Errorf("want 1 mcp_tool_blocked, got %+v", entries)
+	}
+	if n := len(eventsOfType(entries, audit.EventGateTriggered)); n != 0 {
+		t.Errorf("%d gate_triggered events for a call that was refused", n)
+	}
+}
+
+// TestUnambiguousBodiesStillPass is the other side of the refusal: the check
+// costs nothing to a body with one reading, however awkward it looks. The same
+// member name at two depths, in sibling array elements, or as a prefix of a
+// field name is not ambiguity -- it is ordinary JSON, and refusing it would
+// break real MCP traffic to defend against nothing.
+func TestUnambiguousBodiesStillPass(t *testing.T) {
+	deep := strings.Repeat("[", 1200) + "1" + strings.Repeat("]", 1200)
+
+	cases := []struct{ name, body, wantMethod, wantTool string }{
+		{"initialize", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18",` +
+			`"capabilities":{"roots":{"listChanged":true}},"clientInfo":{"name":"probe","version":"1.0"}}}`,
+			"initialize", ""}, // clientInfo.name is a different object's member
+		{"notification", `{"jsonrpc":"2.0","method":"notifications/initialized"}`, "notifications/initialized", ""},
+		{"same name at two depths", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"name":"a nested object is a different object"}}}`, "tools/call", "send_email"},
+		{"repeats across sibling elements", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"rows":[{"to":"a"},{"to":"b"},{"to":"c"}]}}}`, "tools/call", "send_email"},
+		{"near-miss field names", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"userName":1,"methodName":2,"argumentList":3,"ids":4}}}`, "tools/call", "send_email"},
+		{"meta and extra members", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{},"_meta":{"progressToken":"abc"}}}`, "tools/call", "send_email"},
+		{"oversized numbers", `{"jsonrpc":"2.0","id":1e999,"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"amount":1e999}}}`, "tools/call", "send_email"},
+		{"null id", `{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"send_email","arguments":{}}}`,
+			"tools/call", "send_email"},
+		{"escaped and non-ascii content", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"subject":"café","body":"über"}}}`, "tools/call", "send_email"},
+		{"deeply nested arguments", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_email",` +
+			`"arguments":{"deep":` + deep + `}}}`, "tools/call", "send_email"},
+		{"whitespace around the message", "  \n\t" + `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":` +
+			`{"name":"send_email","arguments":{}}}` + "\n", "tools/call", "send_email"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, err := parseJSONRPC([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("refused a body with exactly one reading: %v", err)
+			}
+			if msg.Method != tc.wantMethod {
+				t.Errorf("method = %q, want %q", msg.Method, tc.wantMethod)
+			}
+			if msg.Params.Name != tc.wantTool {
+				t.Errorf("params.name = %q, want %q", msg.Params.Name, tc.wantTool)
+			}
+		})
+	}
+}
+
+// TestFoldKeyAgreesWithEncodingJSON is the proof that the fold the scan uses is
+// the fold the decoder uses. Two spellings collide for the scan exactly when
+// strings.EqualFold says they do and -- the half that matters -- exactly when
+// encoding/json really does bind the odd spelling to the envelope field. A
+// ToLower-based check passes the first half and fails the second on the long s.
+func TestFoldKeyAgreesWithEncodingJSON(t *testing.T) {
+	keys := []string{
+		"params", "PARAMS", "Params", "pArAmS", "paramſ", "PARAMſ",
+		"name", "NAME", "Name", "method", "METHOD", "id", "ID", "Id",
+		"jsonrpc", "JsonRpc", "arguments", "ARGUMENTS", "argumentſ",
+		"kelvin", "KELVIN", "kelvinK", "İd", "ıd",
+		"to", "TO", "tO", "to_account", "TO_ACCOUNT", "", "_", "1", "日本語",
+	}
+	for _, a := range keys {
+		for _, b := range keys {
+			if got, want := foldKey(a) == foldKey(b), strings.EqualFold(a, b); got != want {
+				t.Errorf("foldKey(%q)==foldKey(%q) is %v, EqualFold says %v", a, b, got, want)
+			}
+		}
+	}
+
+	// The decoder's own behaviour, not a restatement of the rule: every
+	// spelling that folds to "params" has to actually reach Params, or the
+	// scan is refusing collisions the decoder would never have made -- and,
+	// worse, might be missing ones it would.
+	for _, spelling := range []string{"params", "PARAMS", "Params", "paramſ", "parans"} {
+		body := fmt.Sprintf(`{"method":"tools/call",%q:{"name":"bound"}}`, spelling)
+		var msg jsonRPCMessage
+		if err := json.Unmarshal([]byte(body), &msg); err != nil {
+			t.Fatalf("unmarshal %s: %v", body, err)
+		}
+		bound := msg.Params.Name == "bound"
+		if folds := foldKey(spelling) == foldKey("params"); folds != bound {
+			t.Errorf("%q: foldKey says folds=%v, encoding/json binds=%v", spelling, folds, bound)
+		}
+	}
+}
+
+// TestScanRefusesWhatItCannotInspect pins the two bounds the walk puts on
+// itself. Both are refusals rather than best-effort passes, for the reason the
+// body cap already exists: a body the gate cannot inspect is a body it does not
+// forward.
+func TestScanRefusesWhatItCannotInspect(t *testing.T) {
+	t.Run("past the depth cap", func(t *testing.T) {
+		body := `{"method":"tools/call","params":{"name":"send_email","arguments":` +
+			strings.Repeat("[", maxScanDepth) + "1" + strings.Repeat("]", maxScanDepth) + `}}`
+		if _, err := parseJSONRPC([]byte(body)); err == nil {
+			t.Error("a body nested past the cap was accepted")
+		}
+	})
+
+	t.Run("past the member cap", func(t *testing.T) {
+		var b strings.Builder
+		b.WriteString(`{"method":"tools/call","params":{"name":"send_email","arguments":{`)
+		for i := 0; i <= maxScanKeys; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `"k%d":0`, i)
+		}
+		b.WriteString(`}}}`)
+		if _, err := parseJSONRPC([]byte(b.String())); err == nil {
+			t.Error("a body with more members than the cap was accepted")
+		}
+	})
+
+	// Inside both caps a body still has to pass: they exist to bound a hostile
+	// body, not to shrink a legitimate one. Thousands of rows of the same shape
+	// is the case a per-document counter would have failed.
+	t.Run("inside both caps", func(t *testing.T) {
+		var b strings.Builder
+		b.WriteString(`{"method":"tools/call","params":{"name":"send_email","arguments":{"rows":[`)
+		for i := 0; i < 2000; i++ {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			fmt.Fprintf(&b, `{"id":%d,"to":"user%d@example.com"}`, i, i)
+		}
+		b.WriteString(`]}}}`)
+		if _, err := parseJSONRPC([]byte(b.String())); err != nil {
+			t.Errorf("a large but unambiguous body was refused: %v", err)
+		}
+	})
 }
