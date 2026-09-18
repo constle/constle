@@ -19,6 +19,12 @@
 #   1. Generic patterns (below, checked in): AI-attribution phrases and the
 #      Hebrew unicode range. Safe to publish; they name nobody.
 #
+#      The two are not applied alike to binary content. Attribution and
+#      private patterns run on binaries as well as text — a tool name in a
+#      file's embedded credentials is a leak. The Hebrew check does not: it
+#      matches raw byte ranges, which compressed bytes hit by chance, so on a
+#      binary it produces only noise. See scan_stream.
+#
 #   2. Private patterns (NOT checked in): the maintainer's personal
 #      identifiers — name variants, hostname strings, anything that would
 #      itself be a leak if this script shipped it. One case-insensitive
@@ -90,6 +96,17 @@ combined_pattern_file() {
     fi
 }
 
+# is_binary reports whether a file holds a NUL byte in its first 8000 bytes —
+# git's own heuristic, reused so this script agrees with what git calls binary.
+# Written with tr and wc rather than grep -I so it does not depend on a GNU
+# extension the rest of the script can otherwise live without.
+is_binary() {
+    head -c 8000 "$1" > "$TMPDIR_HC/head" 2>/dev/null || return 1
+    raw=$(wc -c < "$TMPDIR_HC/head")
+    stripped=$(LC_ALL=C tr -d '\000' < "$TMPDIR_HC/head" | wc -c)
+    [ "$raw" -ne "$stripped" ]
+}
+
 # scan_stream NAME reads content on stdin and reports hits under label NAME.
 # Returns 0 when clean.
 scan_stream() {
@@ -104,6 +121,21 @@ scan_stream() {
     if [ -n "$hits" ]; then
         printf '✗ %s: identity/attribution pattern hits:\n%s\n' "$label" "$hits"
         clean=1
+    fi
+
+    # The Hebrew check is a BYTE-RANGE match, and on compressed binary content
+    # those two-byte sequences occur by chance: the repo's brand GIFs carry
+    # ~1900 hits each across 1.4 MB of LZW data, which is the ~0.13% two random
+    # bytes land in the range anyway. Every one of them is a false positive,
+    # and a scan that is permanently red is a scan nobody reads — which is how a
+    # real hit gets missed. So the range check is skipped on binary content,
+    # and ONLY that check: the attribution and private patterns above still run
+    # on binaries, because a phrase naming the authoring tool embedded in an
+    # image (C2PA credentials, EXIF) is a real leak in a way a stray D7 byte is
+    # not. Leaked Hebrew is a prose problem and prose lives in text files.
+    if is_binary "$content"; then
+        printf '• %s: binary — attribution patterns checked, Hebrew byte-range skipped\n' "$label"
+        return $clean
     fi
 
     heb=$(LC_ALL=C grep -nE "$HEBREW_RE" "$content" 2>&1 | head -5) || true

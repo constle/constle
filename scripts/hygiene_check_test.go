@@ -57,6 +57,14 @@ func bannedMarker() string {
 	return strings.Join([]string{"generated", "by", "Cla" + "ude"}, " ")
 }
 
+// hebrewWord builds a Hebrew fixture from code points at runtime, for the same
+// reason bannedMarker assembles its phrase: this source file must not itself
+// contain what hygiene-check.sh scans for, or the scanner trips over its own
+// test suite.
+func hebrewWord() string {
+	return string([]rune{0x05E2, 0x05D1, 0x05E8, 0x05D9, 0x05EA})
+}
+
 // newFixtureRepo creates a fresh git repo with one clean, unrelated commit
 // already in it.
 func newFixtureRepo(t *testing.T) string {
@@ -151,5 +159,69 @@ func TestTreeCatchesAttributionPatternInTextFile(t *testing.T) {
 	}
 	if !strings.Contains(combined, "notes.txt") {
 		t.Fatalf("expected the report to name notes.txt as the offending file\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+}
+
+// TestTreeBinaryFileWithHebrewBytesPasses pins the narrowing the Hebrew check
+// needed after the stderr-capture fix (PR #42) made binary matches visible at
+// all. The check is a raw byte-range match, and compressed content hits that
+// range by chance: the repo's own brand GIFs carry ~1900 matches each, every
+// one a false positive. A scan that is permanently red is a scan nobody reads,
+// which is the failure mode that lets a real hit through — so Hebrew is not
+// looked for in binary content.
+func TestTreeBinaryFileWithHebrewBytesPasses(t *testing.T) {
+	repo := newFixtureRepo(t)
+
+	// A NUL byte to force binary classification, then bytes inside the UTF-8
+	// Hebrew ranges (D6 90–BF, D7 80–BF) exactly as LZW output lands in them.
+	payload := []byte{0x00, 0x01, 0xD6, 0x90, 0xFF, 0xD7, 0xA9, 0x02, 0xD7, 0x9C, 0x00}
+	writeAndCommit(t, repo, "brand.gif", payload, "add binary asset with incidental Hebrew bytes")
+
+	stdout, stderr, code := runHygieneCheck(t, repo, "--tree")
+	if code != 0 {
+		t.Fatalf("expected a binary file with incidental Hebrew bytes to pass, got exit %d\nstdout:\n%s\nstderr:\n%s", code, stdout, stderr)
+	}
+	// Skipped, not silent: a blind spot nobody is told about is how the
+	// stderr bug survived as long as it did.
+	if combined := stdout + stderr; !strings.Contains(combined, "brand.gif") {
+		t.Fatalf("expected the report to say brand.gif was scanned as binary\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+}
+
+// TestTreeCatchesHebrewInTextFile is the other half: narrowing the check to
+// text must not weaken it there, where leaked prose actually lives.
+func TestTreeCatchesHebrewInTextFile(t *testing.T) {
+	repo := newFixtureRepo(t)
+	writeAndCommit(t, repo, "notes.md", []byte("a line of "+hebrewWord()+" prose\n"), "add notes")
+
+	stdout, stderr, code := runHygieneCheck(t, repo, "--tree")
+	combined := stdout + stderr
+
+	if code == 0 {
+		t.Fatalf("expected hygiene-check.sh --tree to fail on a text file containing Hebrew, got exit 0\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if !strings.Contains(combined, "notes.md") {
+		t.Fatalf("expected the report to name notes.md as the offending file\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+}
+
+// TestTreeCatchesAttributionInBinaryWithHebrewBytes is the trap the narrowing
+// could have walked into: skipping the Hebrew check on a binary must not skip
+// the attribution check with it.
+func TestTreeCatchesAttributionInBinaryWithHebrewBytes(t *testing.T) {
+	repo := newFixtureRepo(t)
+
+	payload := append([]byte{0x00, 0xD6, 0x90, 0xD7, 0xA9}, []byte("noise "+bannedMarker()+" noise")...)
+	payload = append(payload, 0x00, 0xD7, 0x9C)
+	writeAndCommit(t, repo, "credits.gif", payload, "add binary asset with an attribution phrase")
+
+	stdout, stderr, code := runHygieneCheck(t, repo, "--tree")
+	combined := stdout + stderr
+
+	if code == 0 {
+		t.Fatalf("expected a binary file carrying a banned pattern to fail even though Hebrew is skipped, got exit 0\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
+	}
+	if !strings.Contains(combined, "credits.gif") {
+		t.Fatalf("expected the report to name credits.gif as the offending file\nstdout:\n%s\nstderr:\n%s", stdout, stderr)
 	}
 }
