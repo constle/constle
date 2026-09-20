@@ -231,6 +231,43 @@ func (l Location) MkdirAllOwned(perm os.FileMode) error {
 	return mkdirAll(l.Base, comps, perm)
 }
 
+// MkdirAllOwnedTightened is MkdirAllOwned followed by narrowing the mode of
+// the final directory to at most perm.
+//
+// MkdirAllOwned's perm reaches only the levels that call creates. A directory
+// an earlier release created at a wider mode — ~/.constle/logs at 0755, say —
+// keeps that mode for the life of the installation, so raising a caller's perm
+// protects new installs and leaves existing ones exactly as exposed as before.
+// This closes that gap for the one directory the caller names. Levels above it
+// are left alone: they are shared with other callers, which have their own
+// reasons for the mode they ask for.
+//
+// It only ever removes bits. A directory already no wider than perm, or wider
+// because the user chose that, is narrowed to the intersection rather than set
+// to perm outright.
+//
+// When l is the base itself — an empty relative path — nothing is narrowed and
+// no error is returned, exactly as MkdirAllOwned creates nothing in that case.
+// The base is shared ground: the invoking user's home, or whatever a caller
+// substituted for it. Narrowing $HOME to 0700 because a log happens to sit
+// directly in it is not this package's decision to make, and callers do
+// legitimately place a file at the base (several tests, and any caller that
+// passes a flat log path). Confidentiality of the contents does not rest on
+// this either way — it rests on the mode of the file, which its own open sets.
+func (l Location) MkdirAllOwnedTightened(perm os.FileMode) error {
+	comps, err := l.components()
+	if err != nil {
+		return err
+	}
+	if err := l.MkdirAllOwned(perm); err != nil {
+		return err
+	}
+	if len(comps) == 0 {
+		return nil
+	}
+	return tightenDir(l.Base, comps, perm)
+}
+
 // ReadDir lists the directory at l, refusing to reach it through a symbolic
 // link. The entries are sorted by filename, like os.ReadDir.
 func (l Location) ReadDir() ([]fs.DirEntry, error) {

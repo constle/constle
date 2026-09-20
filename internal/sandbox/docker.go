@@ -613,9 +613,25 @@ func agentRunArgs(name, intNet, image string, memoryMB int, command []string, la
 		"-e", "https_proxy=http://squid:3128",
 	}
 
-	// Caller-supplied env vars (e.g. ANTHROPIC_API_KEY forwarded from the host).
+	// Caller-supplied env vars — the host API keys forwarded by
+	// forwardedHostEnv and the MCP/A2A gate tokens minted for this run — are
+	// passed by NAME ONLY. `docker run -e NAME`, with no "=", makes the
+	// client read the value out of its own environment and hand it to the
+	// daemon over the socket.
+	//
+	// The spelling is the security property. "-e", k+"="+envVars[k] put every
+	// one of those secrets into the argv of the docker client, and
+	// /proc/<pid>/cmdline is world-readable: any local user who ran `ps` or
+	// polled /proc while a container was starting walked away with the
+	// operator's API keys and the gate tokens that authenticate to the MCP and
+	// A2A gates. By name, the argv says only which variables exist.
+	//
+	// startAgentContainer supplies the values through agentEnvForCommand;
+	// /proc/<pid>/environ is readable only by the process owner and root.
+	// The four proxy variables above keep their values inline on purpose —
+	// they are the fixed in-network Squid address, not a secret.
 	for _, k := range sortedKeys(envVars) {
-		args = append(args, "-e", k+"="+envVars[k])
+		args = append(args, "-e", k)
 	}
 
 	for _, k := range sortedKeys(labels) {
@@ -626,8 +642,61 @@ func agentRunArgs(name, intNet, image string, memoryMB int, command []string, la
 	return append(args, command...)
 }
 
+// agentEnvForCommand builds the environment of the `docker` client process
+// that agentRunArgs' "-e NAME" entries are resolved against: the parent
+// environment, so docker still finds DOCKER_HOST, PATH and HOME (for
+// ~/.docker/config.json), with every forwarded variable carrying the value
+// this run intends.
+//
+// Each forwarded name is dropped from the inherited entries before its own is
+// appended, so the result holds every key exactly once and no precedence rule
+// is involved. Appending alone would also work through this particular call
+// path — os/exec deduplicates cmd.Env in favour of later values before it
+// execs (exec.dedupEnv) — but that is a property of os/exec, not of
+// environments generally: a duplicate reaching a Go process by any other
+// route resolves to the FIRST entry, because syscall.copyenv keeps the first
+// mention of a key and blanks the rest.
+//
+// Emitting no duplicate means that difference can never matter here, and an
+// inherited CONSTLE_A2A_URL or CONSTLE_MCP_<ID>_URL cannot sit in the
+// environment alongside the gate URL minted for this run.
+func agentEnvForCommand(envVars map[string]string) []string {
+	env := make([]string, 0, len(envVars))
+	for _, entry := range os.Environ() {
+		// Entries not of the "key=value" form are preserved as they are,
+		// matching what os/exec does with them.
+		if k, _, ok := strings.Cut(entry, "="); ok {
+			if _, forwarded := envVars[k]; forwarded {
+				continue
+			}
+		}
+		env = append(env, entry)
+	}
+	for _, k := range sortedKeys(envVars) {
+		env = append(env, k+"="+envVars[k])
+	}
+	return env
+}
+
+// agentRunCommand assembles the `docker run` command: the argv from
+// agentRunArgs, which names the forwarded variables, and the environment from
+// agentEnvForCommand, which carries their values.
+//
+// The two halves only work together. `-e NAME` with no "=" tells the docker
+// client to look NAME up in its own environment, so an argv built without the
+// matching Env silently starts a container missing those variables — and
+// `docker run -e MISSING` is not an error, it just sets nothing. Building the
+// command in one place, rather than setting Env at the call site, is what lets
+// a test assert that the argv and the environment agree.
+func agentRunCommand(name, intNet, image string, memoryMB int, command []string, labels map[string]string, envVars map[string]string) *exec.Cmd {
+	cmd := exec.Command("docker", agentRunArgs(name, intNet, image, memoryMB, command, labels, envVars)...)
+	cmd.Env = agentEnvForCommand(envVars)
+	return cmd
+}
+
 func startAgentContainer(name, intNet, image string, memoryMB int, command []string, labels map[string]string, envVars map[string]string) (string, error) {
-	out, err := exec.Command("docker", agentRunArgs(name, intNet, image, memoryMB, command, labels, envVars)...).Output()
+	cmd := agentRunCommand(name, intNet, image, memoryMB, command, labels, envVars)
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("docker run agent: %w", err)
 	}

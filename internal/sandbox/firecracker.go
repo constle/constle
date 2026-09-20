@@ -112,6 +112,10 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		return nil, fmt.Errorf("guest kernel not found at %s — run scripts/setup-firecracker: %w", fcKernelPath, err)
 	}
 
+	// 0755 on purpose: `constle ps` reads the state file here without root
+	// (fcRunState.write, firecracker_state.go). The directory mode is not a
+	// confidentiality boundary for anything inside it — every file written
+	// into this tree carries its own mode.
 	runDir := filepath.Join(fcRunsDir, runID)
 	if err := os.MkdirAll(runDir, 0755); err != nil {
 		return nil, fmt.Errorf("cannot create run directory: %w", err)
@@ -442,8 +446,19 @@ func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, gu
 	}
 
 	workspacePath := filepath.Join(runDir, "workspace.ext4")
-	f, err := os.Create(workspacePath)
+	// 0600 from the moment the inode exists, not after the fact. The image
+	// carries the env blob with the run's API keys and gate tokens, and it
+	// is built here in the 0755 run directory before prepareChroot renames
+	// it into the 0700 jail — os.Create's 0666&umask left it world-readable
+	// for exactly that window, which is long enough to copy it out of. The
+	// mode is restated below because a lax umask cannot widen it, only a
+	// strict one narrow it, and the guest must still be able to write.
+	f, err := os.OpenFile(workspacePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
+		return "", err
+	}
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
 		return "", err
 	}
 	// 256 MB: room for the agent log alongside env+cmd.
