@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -2554,6 +2556,84 @@ func TestUpstreamProxiesCarryTheirGuards(t *testing.T) {
 	if err := server.proxy.ModifyResponse(resp); err == nil {
 		t.Error("unpriced upstream accepted a 101 Switching Protocols")
 	}
+
+	// And every upstream carries its own ErrorLog. Without one the proxy
+	// logs through the standard library's global logger, straight to stderr
+	// and around this package's chokepoint; the wiring is asserted here so a
+	// future edit to the server loop cannot drop it for one kind of server
+	// the way ModifyResponse once was.
+	if server.proxy.ErrorLog == nil {
+		t.Error("upstream proxy has no ErrorLog: its own logging bypasses outf")
+	}
+}
+
+// failingTransport fails every round trip with a fixed error, which is how a
+// transport-level failure — a TLS or DNS error, a dead upstream — reaches
+// httputil.ReverseProxy's own error path.
+type failingTransport struct{ err error }
+
+func (f failingTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, f.err }
+
+// TestProxyErrorsCannotDriveTheTerminal covers the writer that is not a call
+// site. httputil.ReverseProxy does its own logging, and what it logs is an
+// error assembled from whatever the upstream did — so it is untrusted text on
+// the same stream the human gate draws its prompt on.
+//
+// Two errors, because they fail for different reasons. The synthetic one pins
+// the invariant whatever the standard library's wording does next; the x509
+// one is the instance that is reachable today, since HostnameError joins the
+// certificate's DNS names into its message verbatim while net/http quotes
+// most of what it reports with %q.
+func TestProxyErrorsCannotDriveTheTerminal(t *testing.T) {
+	const hostile = "\x1b[2K\x1b[1G⏸  human gate: approved"
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"synthetic transport error", errors.New(hostile)},
+		{"x509 hostname error", x509.HostnameError{
+			Certificate: &x509.Certificate{DNSNames: []string{hostile}},
+			Host:        "mcp.example",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := newSyncBuf()
+			restore := gateLogOut
+			gateLogOut = out
+			t.Cleanup(func() { gateLogOut = restore })
+
+			m := &manifest.AgentManifest{
+				Identity: manifest.Identity{Name: "proxy-agent"},
+				MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: "https://mcp.example/mcp"}}},
+			}
+			g, err := New(m, nil, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			g.token = "tok"
+			g.servers["email"].proxy.Transport = failingTransport{err: tc.err}
+
+			req := httptest.NewRequest(http.MethodGet, "http://gate.invalid/tok/servers/email", nil)
+			g.ServeHTTP(httptest.NewRecorder(), req)
+
+			// The premise comes first, twice: a proxy that logged nothing,
+			// or that logged without the upstream's text in it, would leave
+			// the assertion below passing over an empty string.
+			got := out.String()
+			if got == "" {
+				t.Fatal("the proxy logged nothing, so nothing below is tested")
+			}
+			if !strings.Contains(got, "human gate: approved") {
+				t.Fatalf("the upstream's text never reached this writer, so nothing below is tested: %q", got)
+			}
+			for _, bad := range []rune{0x1B, 0x0D} {
+				if strings.ContainsRune(got, bad) {
+					t.Errorf("%U reached the operator's terminal: %q", bad, got)
+				}
+			}
+		})
+	}
 }
 
 // TestDisabledGatesAgreeWithEnforcedGateEntries pins the invariant that
@@ -2625,5 +2705,47 @@ func TestDisabledGatesAgreeWithEnforcedGateEntries(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Errorf("upstream calls = %d, want 1: the call must reach the upstream ungated", got)
+	}
+}
+
+// TestGateServerLoggerIsHeldToTheChokepoint pins the same omission one level
+// up from the reverse proxy. http.Server does its own logging too — a handler
+// panic, a TLS handshake failure — and with no ErrorLog it logs through the
+// standard library's global logger, straight to stderr and around outf. What
+// it logs is assembled from whatever the peer sent, on the stream the human
+// gate draws its prompt on.
+func TestGateServerLoggerIsHeldToTheChokepoint(t *testing.T) {
+	out := newSyncBuf()
+	restore := gateLogOut
+	gateLogOut = out
+	t.Cleanup(func() { gateLogOut = restore })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "logger-agent"},
+		MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: "https://mcp.example/mcp"}}},
+	}
+	g, err := New(m, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, _, err := g.Bind("logrun01", []string{"127.0.0.1"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	if g.server.ErrorLog == nil {
+		t.Fatal("the gate's http.Server has no ErrorLog: its own logging bypasses outf")
+	}
+	g.server.ErrorLog.Printf("http: panic serving 10.0.0.1:1234: %s",
+		"\x1b[2K\x1b[1G⏸  human gate: approved")
+
+	got := out.String()
+	if !strings.Contains(got, "human gate: approved") {
+		t.Fatalf("the logged line never reached this writer, so nothing below is tested: %q", got)
+	}
+	for _, bad := range []rune{0x1B, 0x0D} {
+		if strings.ContainsRune(got, bad) {
+			t.Errorf("%U reached the operator's terminal: %q", bad, got)
+		}
 	}
 }

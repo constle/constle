@@ -41,6 +41,9 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-isatty"
+	"github.com/mattn/go-runewidth"
+
+	"github.com/constle/constle/internal/termsafe"
 )
 
 // Palette. Brand anchors (Lavender/Green/Orange/Navy/SoftGray) with two
@@ -261,20 +264,28 @@ func renderSummaryRows(rows []kv) {
 	initStyles()
 	w := 0
 	for _, r := range rows {
-		if len(r.label) > w {
-			w = len(r.label)
+		if n := runewidth.StringWidth(r.label); n > w {
+			w = n
 		}
 	}
 	for _, r := range rows {
-		label := stMuted.Render(r.label + strings.Repeat(" ", w-len(r.label)))
+		label := stMuted.Render(padr(r.label, w))
 		printf("%s%s   %s\n", indent, label, r.value)
 	}
 }
 
 // subject prints the focal identity line (agent name + version).
+//
+// Both values come straight out of an Agentfile, which the operator may have
+// been handed rather than written: identity.name is checked only for path
+// separators and identity.version is not checked at all, so neither is
+// trustworthy text. They are escaped here rather than at each caller because
+// every caller passes raw manifest fields — there is no version of this line
+// that wants anything else.
 func subjectLine(name, version string) {
 	initStyles()
-	printf("%s%s %s\n", indent, stWord.Render(name), stVer.Render("v"+version))
+	printf("%s%s %s\n", indent,
+		stWord.Render(termsafe.Line(name)), stVer.Render("v"+termsafe.Line(version)))
 }
 
 // ------------------------------------------------------------
@@ -293,7 +304,10 @@ func renderAgentOutput(caption string, lines []string) {
 		return
 	}
 	for _, ln := range lines {
-		printf("%s%s %s\n", indent, bar, stInk.Render(ln))
+		// Defence in depth: cmdRun already builds these with termsafe.Lines.
+		// Escaping again costs nothing (termsafe.Line is idempotent) and
+		// means this renderer is safe for any caller, not only that one.
+		printf("%s%s %s\n", indent, bar, stInk.Render(termsafe.Line(ln)))
 	}
 }
 
@@ -329,6 +343,18 @@ func pill(label string, kind statusKind) string {
 // ------------------------------------------------------------
 
 func warnBlock(w io.Writer, lines []string) {
+	// Every warning block in this package interpolates an Agentfile field it
+	// cannot vouch for — the require_approval_for entries that are NOT
+	// enforced, the agent name behind an unusable identity.did. Escaping
+	// happens here, once, on plain text that no caller has styled yet, which
+	// is also what stops a value from ending its line and writing one that
+	// reads as constle's own. The warning whose text an injected line would
+	// overwrite is literally "will run WITHOUT approval".
+	lines = append([]string(nil), lines...)
+	for i, ln := range lines {
+		lines[i] = termsafe.Line(ln)
+	}
+
 	if !styled || !isStdout(w) {
 		for _, ln := range lines {
 			fprintln(w, ln)
@@ -470,10 +496,16 @@ func prettyPath(p string) string {
 	return p
 }
 
-// padr right-pads s to width w (measured in plain runes; callers apply colour
-// after padding so ANSI never skews alignment).
+// padr right-pads s to width w, measured in terminal columns. Callers apply
+// colour after padding, so ANSI never skews alignment.
+//
+// Columns and not runes: a rune count is right only for text that is entirely
+// single-width, and the values padded here (agent names, statuses) are not
+// guaranteed to be. A CJK name is half as many runes as the columns it
+// occupies, so a rune count over-pads it and the column to its right lands
+// in the wrong place. runewidth is already a direct dependency.
 func padr(s string, w int) string {
-	if n := w - len([]rune(s)); n > 0 {
+	if n := w - runewidth.StringWidth(s); n > 0 {
 		return s + strings.Repeat(" ", n)
 	}
 	return s
@@ -509,7 +541,7 @@ type spinner struct {
 }
 
 func startSpinner(format string, args ...any) *spinner {
-	msg := fmt.Sprintf(format, args...)
+	msg := termsafe.Line(fmt.Sprintf(format, args...))
 	if !styled {
 		printf("  → %s\n", msg)
 		return &spinner{msg: msg}
@@ -525,7 +557,7 @@ func startSpinner(format string, args ...any) *spinner {
 // leaving a permanent row. On the non-styled path there is no live line, so it
 // falls back to a fresh plain step line (identical to a new startSpinner).
 func (s *spinner) set(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := termsafe.Line(fmt.Sprintf(format, args...))
 	if !s.active {
 		printf("  → %s\n", msg)
 		return
@@ -564,7 +596,7 @@ func (s *spinner) draw(frame string) {
 // stopClear (e.g. a deferred cleanup) is a safe no-op rather than a double
 // channel close.
 func (s *spinner) ok(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := termsafe.Line(fmt.Sprintf(format, args...))
 	if !s.active {
 		printf("  ✓ %s\n", msg)
 		return

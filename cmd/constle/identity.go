@@ -8,6 +8,7 @@ import (
 
 	"github.com/constle/constle/internal/audit"
 	"github.com/constle/constle/internal/identity"
+	"github.com/constle/constle/internal/termsafe"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -70,13 +71,13 @@ func cmdIdentityCreate(name, owner string) error {
 	printf("\n✓ identity created for agent %q\n\n", name)
 	printf("  did:       %s\n", id.DID())
 	if owner != "" {
-		printf("  owner:     %s\n", owner)
+		printf("  owner:     %s\n", termsafe.Line(owner))
 	}
-	printf("  key file:  %s (mode 0600 — never leaves this machine)\n", identity.Dir(name))
+	printf("  key file:  %s (mode 0600 — never leaves this machine)\n", termsafe.Line(identity.Dir(name)))
 	printf("\n")
 	printf("  add the DID (and only the DID) to your Agentfile:\n\n")
 	printf("    identity:\n")
-	printf("      name: %s\n", name)
+	printf("      name: %s\n", termsafe.Line(name))
 	printf("      did: %s\n", id.DID())
 	printf("\n")
 	return nil
@@ -88,15 +89,15 @@ func cmdIdentityShow(name string) error {
 		return err
 	}
 
-	printf("\n  agent:     %s\n", name)
+	printf("\n  agent:     %s\n", termsafe.Line(name))
 	printf("  did:       %s\n", id.DID())
 	if id.Owner != "" {
-		printf("  owner:     %s\n", id.Owner)
+		printf("  owner:     %s\n", termsafe.Line(id.Owner))
 	}
 	if !id.CreatedAt.IsZero() {
 		printf("  created:   %s\n", id.CreatedAt.Format("2006-01-02 15:04:05 UTC"))
 	}
-	printf("  key file:  %s\n\n", identity.Dir(name))
+	printf("  key file:  %s\n\n", termsafe.Line(identity.Dir(name)))
 	return nil
 }
 
@@ -111,7 +112,7 @@ func loadRunIdentity(m *manifest.AgentManifest) (*identity.Identity, error) {
 		if _, ok := err.(*identity.NotFoundError); ok {
 			return nil, fmt.Errorf(
 				"the Agentfile declares identity.did but no local identity exists for agent %q — "+
-					"refusing to run unsigned; create one with: constle identity create %s",
+					"refusing to run unsigned; create one with: constle identity create %q",
 				m.Identity.Name, m.Identity.Name,
 			)
 		}
@@ -169,14 +170,19 @@ func cmdAuditVerify(path, expectedDID string) error {
 	report, err := audit.VerifyFile(path, expectedDID)
 	if err != nil {
 		if te, ok := err.(*audit.TamperError); ok {
-			return fmt.Errorf("TAMPERING DETECTED in %s\n  %v", path, te)
+			// te's detail is already bounded and quoted by internal/audit;
+			// path is whatever the operator typed on the command line.
+			return fmt.Errorf("TAMPERING DETECTED in %s\n  %v", termsafe.Line(path), te)
 		}
 		return err
 	}
 
-	printf("\n✓ audit log verified: %s\n\n", path)
+	printf("\n✓ audit log verified: %s\n\n", termsafe.Line(path))
 	printf("  entries:   %d (all signatures valid, hash chain intact)\n", report.Entries)
-	printf("  signed by: %s\n", report.DID)
+	// report.DID reached here through did.PublicKey, so it is already a
+	// did:key charset. Escaped anyway: a reader should not have to trace that
+	// to see the line is safe, and the guarantee is the verifier's to change.
+	printf("  signed by: %s\n", termsafe.Line(report.DID))
 	if expectedDID != "" {
 		printf("  pinned:    DID matches the expected identity\n")
 	}
