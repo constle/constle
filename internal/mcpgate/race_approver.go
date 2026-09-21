@@ -39,10 +39,21 @@ func (r RaceApprover) DecideWithReason(ctx context.Context, req Request) Outcome
 		}(a)
 	}
 
+	// A source that produced no decision can still have produced evidence:
+	// a webhook approver that opened a gate nobody answered records the
+	// request it sent, which is what lets the resulting gate_timeout be
+	// correlated with the receiver's own log by request_id. Carrying the
+	// first such record out keeps that from being lost to the drain below,
+	// where every source has by now returned DecisionNone.
+	var undecided Outcome
 	for range r.Approvers {
-		if out := <-results; out.Decision != DecisionNone {
+		out := <-results
+		if out.Decision != DecisionNone {
 			return out
 		}
+		if undecided.Evidence == nil {
+			undecided.Evidence = out.Evidence
+		}
 	}
-	return Outcome{Decision: DecisionNone}
+	return undecided
 }

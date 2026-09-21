@@ -56,6 +56,15 @@ func (e *TamperError) Error() string {
 type VerifyReport struct {
 	Entries int
 	DID     string
+
+	// Parsed are the log's entries in file order, available once the
+	// signature and chain checks above have all passed. A caller that wants
+	// to inspect what the log SAYS — as `constle audit verify` does, to
+	// re-verify the gate decisions recorded under spec
+	// human-gates-webhook.md §9 — reads them from here rather than parsing
+	// the file a second time, so it can only ever examine entries this
+	// function has already proved authentic.
+	Parsed []Entry
 }
 
 // quoteDID renders a DID for a tamper report.
@@ -131,6 +140,7 @@ func VerifyFile(path, expectedDID string) (*VerifyReport, error) {
 	}
 
 	prevHash := GenesisHash
+	parsed := make([]Entry, 0, len(lines))
 	for i, line := range lines {
 		lineNo := i + 1
 
@@ -185,7 +195,8 @@ func VerifyFile(path, expectedDID string) (*VerifyReport, error) {
 				fmt.Sprintf("prev_hash matches no line in this file — the entry between lines %d and %d was deleted or altered", i, lineNo)}
 		}
 		prevHash = lineHash[i]
+		parsed = append(parsed, entry)
 	}
 
-	return &VerifyReport{Entries: len(lines), DID: logDID}, nil
+	return &VerifyReport{Entries: len(lines), DID: logDID, Parsed: parsed}, nil
 }

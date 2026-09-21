@@ -1,11 +1,12 @@
 # Human Gates Webhook — External Decision Channel
 
 **Status:** Draft
-**Spec version:** 0.3.1 (scopes §8's fail-closed claim to what the runtime actually guarantees)
+**Spec version:** 0.4.0 (§9 now describes a decision record the runtime actually writes and can re-verify)
 **Last updated:** 2026-09-21
 
 ## Changelog
 
+- **0.4.0** (2026-09-21): §9 rewritten. Every version up to 0.3.0 promised that the signed decision was persisted and re-verifiable offline, and the runtime persisted none of it — `gate_approved` recorded that something had been approved and nothing that showed the approver had approved it. The decision is now written as its signed fields rather than as the raw response body (equivalent for a §6 signature, which covers a derived string, and bounded where the body is not); the recorded request deliberately omits `tool_call.arguments`; the `approver_pubkey` actually verified against is recorded alongside; and `constle audit verify --approver-pubkey=<did:key:…>` re-verifies the result.
 - **0.3.1** (2026-09-21): Documentation accuracy only — no change to the wire format, the verification steps, or any runtime behaviour. §8 previously read as an unconditional "fail closed, always". It is now split into what holds unconditionally (§8.1: a decision that arrives is verified and can only deny), what is operator policy rather than a guarantee (§8.2: a gate that receives *no* decision is resolved by `human_gates.on_timeout`, which may legally be `proceed`), and what this channel does not cover at all (§8.3: a racing terminal prompt approves without signing). §4's timeout bullet and §4.1's poll table are corrected to match: a `200` whose body does not parse as a decision object continues polling rather than denying.
 - **0.3.0** (2026-09-04): Resolved the two questions 0.2.0 left open. §4.1 (new) specifies the delivery mechanism previously deferred as "out of scope for this revision": POST-once-then-poll against the same URL `human_gates.notify` already uses, with a derivable per-request decision endpoint. §5 canonicalization is now implemented (`internal/humangate.SubjectDigest`) rather than merely specified, with its two documented, deliberate deviations from strict RFC 8785 noted inline.
 - **0.2.0** (2026-09-04): Replaced HMAC-SHA256 symmetric signing with Ed25519 asymmetric signatures. Introduced a dedicated webhook signing keypair, decoupled from `internal/identity`'s per-agent DIDs. Public key now declared in the Agentfile as a `did:key` string. Fail-closed behavior for a missing or malformed key made explicit.
@@ -160,7 +161,19 @@ A terminal prompt racing this endpoint (§4.1) can approve a gated call on its o
 
 ## 9. Audit log
 
-The full response object — `signature` included — is written to the audit log verbatim, alongside the original request. Anyone holding the Agentfile's `approver_pubkey` can re-verify, offline, that a given decision was genuinely signed by the approver's key over that exact tool call.
+Every terminal event of a gate decided through this channel — `gate_approved`, `gate_denied`, and the three fail-closed events of §8.1 — carries the decision that produced it, alongside the identifying fields of the request it answers. A gate that timed out unanswered records the request alone, so it can still be correlated with the receiver's own records by `request_id`. Anyone holding the Agentfile's `approver_pubkey` can re-verify, offline, that a given decision was genuinely signed by the approver's key over that exact tool call; `constle audit verify --approver-pubkey=<did:key:…> <logfile>` does exactly that.
+
+**"The full response object" means its fields, not its bytes.** The four signed fields and the one unsigned one are recorded as fields, not as the raw HTTP body they arrived in. The two are equivalent here, and only here: §6's signature covers the derived string `request_id + "." + decision + "." + subject_digest`, which a verifier reconstructs from the parsed fields and never from the body, so a record of the fields reproduces the signed payload exactly. The codebase's other two signed payloads sign their own wire bytes and genuinely do require them (see the note in §5); this one does not. Keeping the body instead would add nothing verifiable while copying an unbounded, endpoint-controlled blob into a signed, hash-chained log that is designed to travel.
+
+Each recorded field is bounded at 256 bytes — far above any real value, since a `request_id`, a `subject_digest` and an Ed25519 signature all have fixed short lengths. The bound exists because the records that matter most are the *rejected* decisions, whose contents an untrusted endpoint chose. A record that hit the bound is marked as truncated, and the verifier reports it as unverifiable rather than as a bad signature: those bytes were dropped by the runtime, not forged by the endpoint.
+
+`decided_at` is recorded but not attested. It falls outside the signed payload, so it is the endpoint's own claim about when it decided, and nothing verifies it.
+
+**The recorded request omits `tool_call.arguments`.** It carries `request_id`, `agent_name`, the tool name, `subject_digest` and the timestamp. Arguments routinely carry secrets and payloads, and the signature attests to the digest rather than to them, so excluding them costs the verifier nothing. §5's caveat applies unchanged: `subject_digest` is an unsalted SHA-256 and is recoverable by brute force over an enumerable argument space, so it is a forensic handle, not a confidentiality boundary.
+
+**The approver key in use is recorded too.** The paragraph above assumes a verifier who brings `approver_pubkey` from the Agentfile; recording it as well pins which key the runtime actually verified against, so a runtime that ran with a swapped approver key leaves a log that visibly disagrees with the Agentfile rather than one that verifies cleanly against the swap. Pinning the key at verification time is what acts on that difference — an unpinned check accepts whatever key the log names, which establishes the log's internal consistency and nothing about its trust anchor.
+
+**What this closes.** Verification compares the cryptography against the event the log claims, in both directions: a `gate_approved` that does not re-verify as approved is an approval the declared approver never gave, and a `gate_signature_invalid` that now verifies cleanly is a denial the log misattributes to the approver. An approval that was never signed can therefore no longer be recorded as though it had been. What it does not close is §10's third limitation: a host that lies about what it is asking approval for lies before any of this is written.
 
 ## 10. Known limitations
 
