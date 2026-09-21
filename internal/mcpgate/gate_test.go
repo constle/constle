@@ -1988,3 +1988,570 @@ func TestScanRefusesWhatItCannotInspect(t *testing.T) {
 		}
 	})
 }
+
+// pathProbe records the request target of every request an upstream actually
+// received, exactly as it arrived on the wire. r.RequestURI is the request
+// line verbatim — r.URL.Path would show the target after net/http decoded it,
+// which is the very difference these tests are about.
+type pathProbe struct {
+	mu      sync.Mutex
+	targets []string
+}
+
+func (p *pathProbe) record(r *http.Request) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.targets = append(p.targets, r.RequestURI)
+}
+
+func (p *pathProbe) all() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.targets...)
+}
+
+// newPathHarness builds a gate for one server "email" whose declared endpoint
+// is endpoint, and a probe over what the upstream received. newHarness cannot
+// be used for path tests: its server URL carries no path at all, so it can
+// never show a sub-path landing under the declared endpoint.
+func newPathHarness(t *testing.T, endpoint string) (*gateHarness, *pathProbe) {
+	t.Helper()
+
+	calls := &atomic.Int64{}
+	probe := &pathProbe{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		probe.record(r)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	}))
+	t.Cleanup(up.Close)
+
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New(logLoc)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "path-agent"},
+		MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: up.URL + endpoint}}},
+	}
+	g, err := New(m, nil, nil, logger, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	port, token, err := g.Bind("pathrun01", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	return &gateHarness{
+		gate:     g,
+		upstream: up,
+		calls:    calls,
+		baseURL:  fmt.Sprintf("http://127.0.0.1:%d/%s/servers/email", port, token),
+		logPath:  logLoc.String(),
+		logger:   logger,
+	}, probe
+}
+
+// TestDotSegmentsNeverReachTheUpstream pins C-34. The sub-path after the
+// server id was concatenated onto the declared endpoint as a string, and
+// net/http does not clean the path of a handler mounted directly on a Server
+// — only ServeMux does — so "../" travelled to the origin intact and the
+// origin resolved it. That reaches any path the origin serves, including a
+// second MCP server mounted beside this one, whose tool allowlist, human gate
+// and metering were never consulted for the call.
+//
+// The approver would APPROVE, and the upstream answers whatever arrives, so a
+// request that reaches it at all is the bypass.
+func TestDotSegmentsNeverReachTheUpstream(t *testing.T) {
+	for _, tc := range []struct{ suffix, wantReason string }{
+		// Dot segments, plain and in every encoding that decodes to one.
+		{"/../admin", reasonDotSegment},
+		{"/a/../../b", reasonDotSegment},
+		{"/./x", reasonDotSegment},
+		{"//x", reasonDotSegment},
+		{"/%2e%2e/admin", reasonDotSegment},
+		{"/%2E%2E/admin", reasonDotSegment},
+		{"/%2e%2e%2fadmin", reasonDotSegment},
+		{"/..%2fadmin", reasonDotSegment},
+		{"/sub/..", reasonDotSegment},
+		{"/sub/.", reasonDotSegment},
+		// A second round of decoding would turn these into the above. The
+		// percent sign survives the first decode, which is the tell.
+		{"/%252e%252e%252fadmin", reasonPercentEncoding},
+		{"/%252e%252e/admin", reasonPercentEncoding},
+		// Path parameters: servers that strip ";..." before normalising read
+		// the segment before it as a dot segment.
+		{"/..;/admin", reasonPathParameter},
+		{"/..%3b/admin", reasonPathParameter},
+		{"/..;x/admin", reasonPathParameter},
+		// Backslash, for an origin on a platform that separates paths with it.
+		{"/%5c..%5cadmin", reasonBackslash},
+		{`/..\..\admin`, reasonBackslash},
+	} {
+		suffix := tc.suffix
+		t.Run(suffix, func(t *testing.T) {
+			h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+			status, body, _ := doRequest(t, http.MethodGet, h.baseURL+suffix, "")
+			if status != http.StatusBadRequest {
+				t.Errorf("GET %s: status=%d body=%q, want 400", suffix, status, body)
+			}
+			if got := h.calls.Load(); got != 0 {
+				t.Errorf("GET %s reached the upstream %d times, want 0", suffix, got)
+			}
+
+			blocked := eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)
+			if len(blocked) != 1 {
+				t.Fatalf("GET %s: %d mcp_request_blocked events, want 1", suffix, len(blocked))
+			}
+			reason, _ := blocked[0].Details["reason"].(string)
+			if reason != tc.wantReason {
+				t.Errorf("GET %s: reason=%q, want %q", suffix, reason, tc.wantReason)
+			}
+			if strings.Contains(reason, "admin") {
+				t.Errorf("GET %s: reason %q repeats attacker-controlled path text", suffix, reason)
+			}
+		})
+	}
+}
+
+// TestDotSegmentsAreRefusedOnEveryAdmittedMethod: the refusal belongs to the
+// target, not to the method that carries it. A rule that held only for POST
+// would be the method-shaped hole again, one layer up.
+func TestDotSegmentsAreRefusedOnEveryAdmittedMethod(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+			body := ""
+			if method == http.MethodPost {
+				body = toolCallBody("send_email")
+			}
+			status, _, _ := doRequest(t, method, h.baseURL+"/../admin", body)
+			if status != http.StatusBadRequest {
+				t.Errorf("%s: status=%d, want 400", method, status)
+			}
+			if got := h.calls.Load(); got != 0 {
+				t.Errorf("%s reached the upstream %d times, want 0", method, got)
+			}
+		})
+	}
+}
+
+// TestLegitimateSubPathStillReachesTheUpstream: the refusals above must not
+// cost the feature they guard. A server that mounts more than its one endpoint
+// path — a session sub-path, say — is still addressable, and what lands on the
+// wire is the declared endpoint with the sub-path under it.
+func TestLegitimateSubPathStillReachesTheUpstream(t *testing.T) {
+	for _, tc := range []struct{ endpoint, suffix, want string }{
+		{"/v1/mcp", "/messages", "/v1/mcp/messages"},
+		{"/v1/mcp", "/messages/42", "/v1/mcp/messages/42"},
+		{"/v1/mcp", "", "/v1/mcp"},
+		{"/v1/mcp", "/", "/v1/mcp"},
+		{"/v1/mcp", "/session/", "/v1/mcp/session/"},
+		{"", "/messages", "/messages"},
+		// Ordinary percent-encoding decodes to a name with no structure in
+		// it, and is forwarded. Only a percent sign that survives the decode
+		// — the mark of an upstream asked to decode twice — is refused.
+		{"/v1/mcp", "/report%2Ejson", "/v1/mcp/report.json"},
+		{"/v1/mcp", "/a%20b", "/v1/mcp/a%20b"},
+	} {
+		t.Run(tc.endpoint+"|"+tc.suffix, func(t *testing.T) {
+			h, probe := newPathHarness(t, tc.endpoint)
+
+			status, body, _ := doRequest(t, http.MethodGet, h.baseURL+tc.suffix, "")
+			if status != http.StatusOK {
+				t.Fatalf("GET %s: status=%d body=%q, want 200", tc.suffix, status, body)
+			}
+			targets := probe.all()
+			if len(targets) != 1 {
+				t.Fatalf("upstream saw %d requests, want 1", len(targets))
+			}
+			if targets[0] != tc.want {
+				t.Errorf("upstream saw target %q, want %q", targets[0], tc.want)
+			}
+		})
+	}
+}
+
+// TestQueryStringSurvivesThePathRules: clearing RawPath rewrites the path, and
+// must leave the query alone — a session id in the query is how several MCP
+// servers address a stream.
+func TestQueryStringSurvivesThePathRules(t *testing.T) {
+	h, probe := newPathHarness(t, "/v1/mcp")
+
+	status, _, _ := doRequest(t, http.MethodGet, h.baseURL+"?sessionId=abc123", "")
+	if status != http.StatusOK {
+		t.Fatalf("status=%d, want 200", status)
+	}
+	if got := probe.all(); len(got) != 1 || got[0] != "/v1/mcp?sessionId=abc123" {
+		t.Errorf("upstream saw %q, want /v1/mcp?sessionId=abc123", got)
+	}
+}
+
+// TestWithinEndpoint is the post-condition the rewrite is held to. It compares
+// whole segments: a sibling endpoint sharing a prefix is not underneath.
+func TestWithinEndpoint(t *testing.T) {
+	for _, tc := range []struct {
+		endpoint, forwarded string
+		want                bool
+	}{
+		{"/mcp", "/mcp", true},
+		{"/mcp", "/mcp/messages", true},
+		{"/mcp/", "/mcp", true},
+		{"/mcp", "/mcp-admin", false},
+		{"/mcp", "/admin", false},
+		{"/mcp", "/", false},
+		{"", "/anything", true},
+		{"", "", true},
+	} {
+		if got := withinEndpoint(tc.endpoint, tc.forwarded); got != tc.want {
+			t.Errorf("withinEndpoint(%q, %q) = %v, want %v", tc.endpoint, tc.forwarded, got, tc.want)
+		}
+	}
+}
+
+// TestUpgradeRequestIsRefused pins C-35 on the request side. A GET carrying
+// Connection: Upgrade was forwarded like any other admitted method, and an
+// upstream answering 101 left httputil.ReverseProxy hijacking the connection
+// and copying bytes both ways — a tunnel through the gate, to a host the
+// sandbox is forbidden to reach directly, past every check in the package.
+//
+// Both spellings of the request are refused, in any case, alone or beside
+// other connection tokens.
+func TestUpgradeRequestIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+		method  string
+	}{
+		{"websocket", map[string]string{"Connection": "Upgrade", "Upgrade": "websocket"}, http.MethodGet},
+		{"lowercase", map[string]string{"connection": "upgrade", "upgrade": "websocket"}, http.MethodGet},
+		{"among other tokens", map[string]string{"Connection": "keep-alive, Upgrade", "Upgrade": "websocket"}, http.MethodGet},
+		{"upgrade header alone", map[string]string{"Upgrade": "h2c"}, http.MethodGet},
+		{"connection token alone", map[string]string{"Connection": "Upgrade"}, http.MethodGet},
+		{"on a post", map[string]string{"Connection": "Upgrade", "Upgrade": "websocket"}, http.MethodPost},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
+
+			var rdr io.Reader
+			if tc.method == http.MethodPost {
+				rdr = strings.NewReader(toolCallBody("list_inbox"))
+			}
+			req, err := http.NewRequest(tc.method, h.baseURL, rdr)
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("%s: %v", tc.method, err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("status=%d, want 400", resp.StatusCode)
+			}
+			if got := h.calls.Load(); got != 0 {
+				t.Errorf("reached the upstream %d times, want 0", got)
+			}
+			blocked := eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)
+			if len(blocked) != 1 {
+				t.Fatalf("%d mcp_request_blocked events, want 1", len(blocked))
+			}
+			if reason, _ := blocked[0].Details["reason"].(string); reason != reasonProtocolUpgrade {
+				t.Errorf("reason=%q, want %q", reason, reasonProtocolUpgrade)
+			}
+		})
+	}
+}
+
+// TestUnsolicitedSwitchingProtocolsIsNotSpliced pins the outcome for a 101 no
+// one asked for: the response fails and the tunnel bytes behind it never reach
+// the client. Two layers produce that now — httputil.ReverseProxy refuses a
+// 101 whose Upgrade token does not match the request's, and the gate's own
+// ModifyResponse refuses any sub-200 status before the proxy can splice at all
+// (TestRefuseProtocolSwitchRefusesInformationalResponses covers that one
+// directly, because the request half makes it unreachable from out here). This
+// test is about the guarantee, not about which layer keeps it.
+func TestUnsolicitedSwitchingProtocolsIsNotSpliced(t *testing.T) {
+	const secret = "TUNNELLED-BYTES"
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, buf, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("upstream hijack: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n" + secret)
+		_ = buf.Flush()
+	}))
+	t.Cleanup(up.Close)
+
+	logLoc := homedir.Under(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New(logLoc)
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "upgrade-agent"},
+		MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: up.URL}}},
+	}
+	g, err := New(m, nil, nil, logger, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	port, token, err := g.Bind("upgraderun01", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	status, body, _ := doRequest(t, http.MethodGet,
+		fmt.Sprintf("http://127.0.0.1:%d/%s/servers/email", port, token), "")
+
+	if status != http.StatusBadGateway {
+		t.Errorf("status=%d, want 502 — a 101 must fail the response, not open a tunnel", status)
+	}
+	if strings.Contains(body, secret) {
+		t.Errorf("tunnel bytes reached the client: %q", body)
+	}
+}
+
+// TestHopByHopHeadersAreNotForwarded pins what the upstream sees: no
+// connection-scoped header, including one the sender named in Connection, and
+// every ordinary header intact. httputil.ReverseProxy strips these itself, so
+// this passes with or without the Director's scrub — the scrub exists because
+// the proxy makes one exception, restoring Connection and Upgrade for an
+// upgrade request, and it is that exception the gate has to take away
+// (TestScrubHopByHopRemovesTheUpgradeHandshake covers it directly). Keeping
+// the assertion here guards the outcome against either layer changing.
+//
+// Te is deliberately not asserted: the reverse proxy re-advertises
+// Te: trailers from the inbound request after the Director has run, which is
+// its choice about trailer support and not a connection header leaking through.
+func TestHopByHopHeadersAreNotForwarded(t *testing.T) {
+	h, probe := newPathHarness(t, "/v1/mcp")
+	_ = probe
+
+	seen := make(chan http.Header, 1)
+	h.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{}}`)
+	})
+
+	req, err := http.NewRequest(http.MethodGet, h.baseURL, nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Connection", "X-Constle-Probe")
+	req.Header.Set("X-Constle-Probe", "leaked")
+	req.Header.Set("Keep-Alive", "timeout=5")
+	req.Header.Set("Proxy-Connection", "keep-alive")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+
+	got := <-seen
+	for _, name := range []string{"Connection", "Upgrade", "Keep-Alive", "Proxy-Connection", "X-Constle-Probe"} {
+		if v := got.Get(name); v != "" {
+			t.Errorf("upstream saw %s: %q, want it scrubbed", name, v)
+		}
+	}
+	if got.Get("Accept") != "application/json" {
+		t.Errorf("an ordinary header was scrubbed too: Accept=%q", got.Get("Accept"))
+	}
+}
+
+// TestScrubHopByHopRemovesTheUpgradeHandshake covers the Director's scrub
+// directly. Its effect cannot be observed end to end — ServeHTTP refuses an
+// upgrade request before any of it is reached — but it is the half that makes
+// the splice structurally impossible rather than merely refused: the reverse
+// proxy restores Connection and Upgrade on the outbound request whenever the
+// inbound one carried them, and computes that after the Director has run.
+func TestScrubHopByHopRemovesTheUpgradeHandshake(t *testing.T) {
+	h := http.Header{}
+	h.Set("Connection", "Upgrade, X-Constle-Probe")
+	h.Set("Upgrade", "websocket")
+	h.Set("X-Constle-Probe", "leaked")
+	h.Set("Keep-Alive", "timeout=5")
+	h.Set("Proxy-Connection", "keep-alive")
+	h.Set("Proxy-Authorization", "Basic zzz")
+	h.Set("Accept", "application/json")
+
+	scrubHopByHop(h)
+
+	for _, name := range []string{
+		"Connection", "Upgrade", "X-Constle-Probe", "Keep-Alive",
+		"Proxy-Connection", "Proxy-Authorization",
+	} {
+		if v := h.Get(name); v != "" {
+			t.Errorf("scrubHopByHop left %s: %q", name, v)
+		}
+	}
+	if h.Get("Accept") != "application/json" {
+		t.Errorf("scrubHopByHop removed an ordinary header: Accept=%q", h.Get("Accept"))
+	}
+
+	// The proxy reads exactly this to decide whether to splice a 101.
+	if requestsUpgrade(h) {
+		t.Error("a scrubbed header set still reads as an upgrade request")
+	}
+}
+
+// TestRefuseProtocolSwitchRefusesInformationalResponses covers the response
+// hook directly, for the same reason: with the request refused up front there
+// is no way to drive a 101 through the gate from outside, so the layer that
+// would catch one anyway is tested where it lives.
+//
+// httputil.ReverseProxy calls ModifyResponse before it hijacks, and treats an
+// error as a failed response — so an error here is exactly the difference
+// between a 502 and an open tunnel.
+func TestRefuseProtocolSwitchRefusesInformationalResponses(t *testing.T) {
+	for _, status := range []int{
+		http.StatusSwitchingProtocols,
+		http.StatusContinue,
+		http.StatusProcessing,
+	} {
+		resp := &http.Response{StatusCode: status, Header: http.Header{}}
+		if err := refuseProtocolSwitch(false)(resp); err == nil {
+			t.Errorf("status %d: ModifyResponse returned nil, want a refusal", status)
+		}
+	}
+
+	// An ordinary response passes, on a priced upstream as on a free one: with
+	// no metering job in the request context meterResponse is a no-op, which is
+	// what makes one hook safe to install everywhere.
+	for _, metered := range []bool{false, true} {
+		req, err := http.NewRequest(http.MethodPost, "http://upstream.invalid/mcp", nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{},
+			Body:       io.NopCloser(strings.NewReader("{}")),
+			Request:    req,
+		}
+		if err := refuseProtocolSwitch(metered)(resp); err != nil {
+			t.Errorf("metered=%v: 200 refused: %v", metered, err)
+		}
+	}
+}
+
+// TestDeclaredEndpointCannotBeAmbiguous: the endpoint path is the base every
+// forwarded request is measured against, so an endpoint that is itself
+// ambiguous makes the measurement meaningless. `https://origin/safe/..`
+// accepts a sub-path of `admin`, produces `/safe/../admin`, passes
+// withinEndpoint because the string starts with the base, and is served as
+// `/admin` by any origin that normalises. The run must not start at all.
+func TestDeclaredEndpointCannotBeAmbiguous(t *testing.T) {
+	for _, endpoint := range []string{
+		"https://origin.example/safe/..",
+		"https://origin.example/safe/../admin",
+		"https://origin.example/./mcp",
+		"https://origin.example/a//b",
+		"https://origin.example/mcp%2F..",
+	} {
+		m := &manifest.AgentManifest{
+			Identity: manifest.Identity{Name: "endpoint-agent"},
+			MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: endpoint}}},
+		}
+		if _, err := New(m, nil, nil, nil, nil); err == nil {
+			t.Errorf("New accepted an ambiguous endpoint %q", endpoint)
+		}
+	}
+
+	// The ordinary shapes must still build.
+	for _, endpoint := range []string{
+		"https://origin.example",
+		"https://origin.example/",
+		"https://origin.example/mcp",
+		"https://origin.example/v1/mcp",
+		"https://origin.example/v1/mcp/",
+	} {
+		m := &manifest.AgentManifest{
+			Identity: manifest.Identity{Name: "endpoint-agent"},
+			MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: endpoint}}},
+		}
+		if _, err := New(m, nil, nil, nil, nil); err != nil {
+			t.Errorf("New rejected a usable endpoint %q: %v", endpoint, err)
+		}
+	}
+}
+
+// TestUpstreamProxiesCarryTheirGuards checks the wiring, not the helpers.
+// Both backstops are unreachable through ServeHTTP — it refuses an upgrade
+// request before either can act — so a test that exercises only the functions
+// stays green if the Director scrub or ModifyResponse is ever dropped from
+// New. This one drives the built proxy directly, which is the one way to
+// observe what the wiring does.
+func TestUpstreamProxiesCarryTheirGuards(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		_, _ = fmt.Fprintln(w, `{}`)
+	}))
+	t.Cleanup(up.Close)
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "wiring-agent"},
+		MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "free", URL: up.URL + "/mcp"}}},
+	}
+	g, err := New(m, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	server, ok := g.servers["free"]
+	if !ok {
+		t.Fatal("server not built")
+	}
+
+	// Handed an upgrade request, httputil.ReverseProxy puts the handshake back
+	// on the outbound request after the Director has run. Without the scrub
+	// the upstream sees it, and a 101 would then be spliced.
+	req, err := http.NewRequest(http.MethodGet, "http://gate.invalid/mcp", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	server.proxy.ServeHTTP(httptest.NewRecorder(), req)
+
+	got := <-seen
+	for _, name := range []string{"Connection", "Upgrade"} {
+		if v := got.Get(name); v != "" {
+			t.Errorf("upstream saw %s: %q — the Director scrub is not wired in", name, v)
+		}
+	}
+
+	// And an unpriced upstream must still refuse a 101: before this wiring,
+	// ModifyResponse was installed only on priced servers.
+	if server.proxy.ModifyResponse == nil {
+		t.Fatal("unpriced upstream proxy has no ModifyResponse")
+	}
+	resp := &http.Response{StatusCode: http.StatusSwitchingProtocols, Header: http.Header{}}
+	if err := server.proxy.ModifyResponse(resp); err == nil {
+		t.Error("unpriced upstream accepted a 101 Switching Protocols")
+	}
+}
