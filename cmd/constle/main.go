@@ -441,11 +441,16 @@ func cmdRun(opts runOptions) error {
 					Out:            lockedStdout{},
 				},
 			}}
-		case wn == nil && m.HumanGates.ApproverPubkey != "":
+		case wn == nil && m.HumanGates.ApproverPubkey != "" && m.HumanGates.GatesArmed():
 			// Declared but unusable: approver_pubkey names a verifier with
 			// nothing to verify, because no notify webhook URL resolved.
 			// Same principle as warnUnenforcedHumanGates — a declared
 			// protection must never look real when it isn't.
+			//
+			// Gated by GatesArmed for that same reason in the other
+			// direction: with the master switch off nothing is ever decided
+			// at this terminal either, and promising that it would be is the
+			// false assurance rather than a warning about one.
 			printf("⚠️  warning: human_gates.approver_pubkey is set but no notify " +
 				"webhook URL resolved — gated calls will only be decided at this terminal\n")
 		}
@@ -1016,10 +1021,26 @@ func printValidatePlain(agentfilePath string, m *manifest.AgentManifest) {
 
 	gates := manifest.InferRequiredGates(m.Capabilities)
 	if len(gates) > 0 {
-		// Careful wording: capability-derived gates are spec-level advice;
-		// enforcement happens on MCP tool calls whose names exactly match
-		// require_approval_for entries.
-		printf("  human gates: %s (approval required by spec — enforced for matching MCP tools)\n",
+		// Capability-derived gates are spec-level advice and nothing else:
+		// declaring send_email under capabilities gates no call on its own
+		// (spec §8). This row therefore makes no claim about enforcement.
+		//
+		// It used to end "— enforced for matching MCP tools", which was true
+		// only when the same name also appeared in require_approval_for AND
+		// matched a declared tool AND the master switch was on. With an empty
+		// require_approval_for the proxy gates nothing and the row still said
+		// enforced. Every enforcement claim now comes from one place: the
+		// "enforced" row below, via EnforcedGateEntries.
+		//
+		// That is not the identical set the proxy arms. EnforcedGateEntries
+		// additionally drops entries no declared server could ever serve,
+		// which the proxy keeps in g.gated so its case-fold near-miss refusal
+		// still covers them. The two agree on what actually gets gated,
+		// because such a call is rejected by the server's own tools allowlist
+		// first; they differ only in that the CLI must not call an
+		// unreachable entry enforced. What is single-sourced is the master
+		// switch itself, through GatesArmed.
+		printf("  human gates: %s (approval required by spec)\n",
 			strings.Join(gates, ", "))
 	}
 
@@ -1053,7 +1074,9 @@ func renderValidateStyled(agentfilePath string, m *manifest.AgentManifest) {
 		rows = append(rows, kv{"allowed", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", "))})
 	}
 	if gates := manifest.InferRequiredGates(m.Capabilities); len(gates) > 0 {
-		rows = append(rows, kv{"human gates", stInk.Render(strings.Join(gates, ", ")) + stMuted.Render("  ∙  by spec")})
+		// Advice only — see printValidatePlain. "by spec" is the whole claim.
+		rows = append(rows, kv{"human gates",
+			stInk.Render(strings.Join(gates, ", ")) + stMuted.Render("  ∙  by spec")})
 	}
 	if enforced, _ := m.EnforcedGateEntries(); len(enforced) > 0 {
 		rows = append(rows, kv{"enforced", stInk.Render(strings.Join(enforced, ", ")) + stMuted.Render("  ∙  at gate")})
