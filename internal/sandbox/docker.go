@@ -341,25 +341,45 @@ func writeSquidConfig(runID string, allowedHosts []string, gateHost string, gate
 // gateway IP literal on Firecracker — where the guest reaches the gates
 // directly via nftables, but a client that routes everything through
 // http_proxy must still get through.
-// KNOWN GAP (inert today, recorded so it stays visible): the ip_only ACL below
-// is IPv4-only — there is no ::/0 counterpart. Nothing currently rides on that,
-// because an IPv6 literal is still refused by the trailing `http_access deny
-// all`, and no sandbox has an IPv6 route to reach this proxy with (the Docker
-// internal network is created --ipv6=false; the Firecracker guest gets only a
-// link-local address, and the per-run nft table drops the tap in the
-// dual-family `inet` table). It turns into a real hole only if someone later
-// gives a sandbox an IPv6 route without adding the matching ACL here.
+// Three rules stand between the allowlist and what the proxy will actually
+// dial, and the order they are emitted in is part of each one.
 //
-// KNOWN GAP (pre-existing, reproduced against Squid 7.2): `deny ip_only
-// !allowed_hosts` below does not refuse every request that names a raw
-// address. When the destination is an IP literal and no value matches by
-// string, Squid resolves the address in reverse and matches the PTR name
-// against the dstdomain values, so an address whose reverse name is an
-// allowlisted host is admitted — over GET and CONNECT alike — and that PTR
-// record belongs to whoever owns the address. Adding the `-n` flag to the
-// dstdomain ACLs turns the reverse lookup off and denies both; it is left
-// for a change of its own because it alters matching for every entry, not
-// only for the addresses this gap is about.
+// `-n` on every dstdomain ACL turns off reverse lookups. Without it, when the
+// destination is an IP literal and no value matches by string, Squid resolves
+// the address in reverse and matches the PTR name against the dstdomain
+// values — so an address whose reverse name is an allowlisted host was
+// admitted, over GET and CONNECT alike, and that PTR record belongs to whoever
+// owns the address. (Reproduced against Squid 7.2.) With lookups off an
+// address can never match a name, which is what `deny ip_only !allowed_hosts`
+// below has always been documented to mean. Matching by name is unaffected:
+// it was a string comparison to begin with.
+//
+// `deny to_internal` refuses the destinations an allowlisted name must never
+// resolve to. The allowlist is name-based, so a name is all Squid checks;
+// pointing one at 169.254.169.254 reached the cloud instance metadata service
+// from the proxy container, and at an RFC 1918 address the host's own LAN —
+// under Firecracker, where Squid runs on the host itself, 127.0.0.1 reached
+// every service on it. This is evaluated against the resolved address, which
+// is the only place the question can be asked: no manifest-time check on the
+// entry can know what a name will resolve to at run time.
+//
+// The port rules confine what a tunnel can carry. Without them `CONNECT
+// allowed.host:22` was a raw TCP tunnel to any port of any allowlisted host.
+//
+// All three are emitted after the gate clause, and must stay there. The gate
+// sits on a private address (host.docker.internal, or the TAP gateway) and on
+// an ephemeral port, so either deny placed ahead of its allow would cut the
+// MCP and A2A gates off on both backends.
+//
+// `ip_only` is spelled `dst all`, which is both families, and to_internal
+// carries the IPv6 ranges beside the IPv4 ones. The previous `dst 0.0.0.0/0`
+// was IPv4 as written; Squid 7.2 rewrites it to `all` and says so with a
+// SECURITY NOTICE, which is not a thing to depend on. Nothing reaches this
+// proxy over IPv6 today — the Docker internal network is created
+// --ipv6=false, and the Firecracker guest gets only a link-local address with
+// its tap dropped in the dual-family `inet` table — but the external network
+// the proxy itself sits on is not pinned that way, and a rule that covers only
+// one family is a rule that rots.
 func buildSquidConfig(runID string, allowedHosts []string, httpPort, accessLogPath, extra, gateHost string, gatePorts []int) (string, error) {
 	// Fail closed: an entry that is not a plain hostname cannot be rendered
 	// safely at all — a newline inside it is a second directive, and
@@ -375,7 +395,9 @@ func buildSquidConfig(runID string, allowedHosts []string, httpPort, accessLogPa
 
 	gateClause := ""
 	if len(gatePorts) > 0 {
-		aclType := "dstdomain"
+		// -n for the same reason as the allowlist ACLs below: the gate host
+		// is matched as a name, never as whatever a reverse lookup returns.
+		aclType := "dstdomain -n"
 		if net.ParseIP(gateHost) != nil {
 			aclType = "dst"
 		}
@@ -395,14 +417,29 @@ http_access allow constle_gate_dst constle_gate_port
 	if len(allowedHosts) > 0 {
 		aclLines := make([]string, len(allowedHosts))
 		for i, host := range allowedHosts {
-			aclLines[i] = "acl allowed_hosts dstdomain " + host
+			aclLines[i] = "acl allowed_hosts dstdomain -n " + host
 		}
 		config = fmt.Sprintf(`# Constle - run %s
 %s
 %s
-# Block direct IP connections to prevent allowlist bypass.
-acl ip_only dst 0.0.0.0/0
+# Block direct IP connections to prevent allowlist bypass. The dstdomain ACLs
+# above carry -n, so an address can never match one by its reverse name.
+acl ip_only dst all
 http_access deny ip_only !allowed_hosts
+
+# An allowlisted name must not resolve into the sandbox host, the container
+# host's own network, or a cloud metadata service.
+acl to_internal dst 0.0.0.0/8 127.0.0.0/8 169.254.0.0/16 10.0.0.0/8
+acl to_internal dst 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10
+acl to_internal dst 192.0.0.0/24 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4
+acl to_internal dst ::1/128 ::/128 fe80::/10 fec0::/10 fc00::/7
+http_access deny to_internal
+
+# A tunnel to an allowlisted host is still only a tunnel to its HTTPS port.
+acl SSL_ports port 443
+acl Safe_ports port 80 443
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
 
 http_access allow allowed_hosts
 http_access allow CONNECT allowed_hosts

@@ -13,32 +13,60 @@ sandbox:
     - |
       echo "=== testing proxy bypass attempts ==="
 
+      # The proxy-visible attempts come first on purpose. Squid buffers its
+      # access log, so a request made in the last moments of a run can still
+      # be in that buffer when the host reads the file, and the attempt would
+      # then be missing from the audit log the assertions read.
+
       echo ""
-      echo "Test 1: normal blocked host (should fail)"
+      echo "Test 1: non-allowlisted host (should fail)"
       curl -sf --max-time 5 http://example.com > /dev/null 2>&1 \
         && echo "  BLOCKED: NO — example.com accessible (bad!)" \
         || echo "  BLOCKED: YES — example.com blocked (good)"
 
       echo ""
-      echo "Test 2: unset proxy vars then try"
+      echo "Test 2: allowlisted host on a non-HTTPS port"
+      curl -sf --max-time 5 https://httpbin.org:2222/ > /dev/null 2>&1 \
+        && echo "  BYPASS: SUCCEEDED — tunnel opened on a non-443 port!" \
+        || echo "  BYPASS: FAILED — non-443 tunnel refused"
+
+      echo ""
+      echo "Test 3: allowlisted name that resolves to the proxy's own loopback"
+      curl -sf --max-time 5 https://localhost/ > /dev/null 2>&1 \
+        && echo "  BYPASS: SUCCEEDED — an allowed name reached an internal address!" \
+        || echo "  BYPASS: FAILED — internal destination refused"
+
+      echo ""
+      echo "Test 4: raw IP whose reverse name is allowlisted"
+      curl -sf --max-time 5 https://1.1.1.1/ > /dev/null 2>&1 \
+        && echo "  BYPASS: SUCCEEDED — an address matched the allowlist by its PTR!" \
+        || echo "  BYPASS: FAILED — address not matched by reverse name"
+
+      echo ""
+      echo "Test 5: unset proxy vars then try"
       unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy
       curl -sf --max-time 5 http://example.com > /dev/null 2>&1 \
         && echo "  BYPASS: SUCCEEDED — proxy is not enforced at network level!" \
         || echo "  BYPASS: FAILED — network-level enforcement works"
 
       echo ""
-      echo "Test 3: direct IP (bypasses hostname filtering)"
-      IP=$(nslookup example.com 2>/dev/null | grep -A1 'Name:' | grep Address | head -1 | awk '{print $2}')
-      echo "  example.com IP: $IP"
-      curl -sf --max-time 5 "http://$IP" > /dev/null 2>&1 \
+      echo "Test 6: direct IP with no proxy"
+      curl -sf --max-time 5 http://1.1.1.1/ > /dev/null 2>&1 \
         && echo "  BYPASS: SUCCEEDED — direct IP works!" \
-        || echo "  BYPASS: FAILED — IP also blocked"
+        || echo "  BYPASS: FAILED — no route to an address either"
 
   memory_mb: 128
   network:
     egress: restricted
     allowed_hosts:
+      # httpbin.org is the allowed host the port rule is tested against.
+      # localhost and one.one.one.one are allowlisted deliberately: the first
+      # resolves to the proxy's own loopback and the second is the reverse
+      # name of 1.1.1.1, so each one asks whether an entry on this list is
+      # enough by itself to reach a destination. Neither is.
       - httpbin.org
+      - localhost
+      - one.one.one.one
 
 capabilities:
   - web_search
