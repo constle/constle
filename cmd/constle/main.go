@@ -276,11 +276,26 @@ func isolationOrigin(m *manifest.AgentManifest) string {
 // explicit operator downgrade, which the entry then names outright. A reader
 // of the log can therefore never mistake a requested boundary for an
 // enforced one.
+//
+// credentials_granted records which host variables this run handed the agent.
+// NAMES ONLY — never values, and never a digest of a value either: a hash of a
+// low-entropy secret is broken offline, and no audit requirement in
+// spec/agent-manifest.md asks for one. The list is the manifest's declaration
+// order, which is deterministic for a given Agentfile; ranging over the
+// resolved map instead would reorder a JSON array that is part of the signed
+// bytes of the entry, so two runs of one Agentfile would produce two different
+// signatures.
+//
+// The key is present even when the list is empty, so "this agent was granted
+// nothing" is a recorded fact rather than the absence of one. An entry with no
+// such key is a run from before this was enforced, and those are exactly the
+// runs where every key the operator had reached every agent.
 func runStartedDetails(m *manifest.AgentManifest, sel *sandbox.Selection) map[string]any {
 	details := map[string]any{
-		"backend":            string(sel.Type),
-		"image":              m.Sandbox.Image,
-		"isolation_achieved": string(sel.Achieved),
+		"backend":             string(sel.Type),
+		"image":               m.Sandbox.Image,
+		"isolation_achieved":  string(sel.Achieved),
+		"credentials_granted": m.CredentialNames(),
 	}
 	if sel.Downgraded {
 		details["isolation_downgrade_accepted"] = true
@@ -931,6 +946,11 @@ func printAgentOutput(logs []byte) {
 // printRunSummaryPlain is the non-TTY run-summary block. It reproduces the
 // exact bytes constle has always emitted — do not restyle this path.
 //
+// The credentials row is a deliberate addition rather than drift: it states what
+// the run will hand the agent, and it prints even when that is nothing, because
+// "nothing" is what changed about this runtime (see credentialsSummary). Its
+// label is wider than the column, like max_duration below it.
+//
 // The one deliberate exception is the "(requested)" qualifier on the isolation
 // row: this block is printed before backend selection, so the level it shows
 // is what the Agentfile asked for, which is not necessarily what the run gets.
@@ -944,6 +964,8 @@ func printRunSummaryPlain(m *manifest.AgentManifest) {
 		printf("     network:   restricted → %s\n",
 			strings.Join(m.Sandbox.Network.AllowedHosts, ", "))
 	}
+	// Always printed, including the empty case — see credentialsSummary.
+	printf("     credentials: %s\n", credentialsSummary(m))
 	if m.Limits.MaxDurationSeconds > 0 {
 		printf("     max_duration: %ds\n", m.Limits.MaxDurationSeconds)
 	}
@@ -992,6 +1014,7 @@ func renderRunSummary(m *manifest.AgentManifest) {
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		rows = append(rows, kv{"network", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", ")) + stMuted.Render("  ∙  restricted")})
 	}
+	rows = append(rows, kv{"credentials", credentialsSummaryStyled(m)})
 	if m.Limits.MaxDurationSeconds > 0 {
 		rows = append(rows, kv{"timeout", stInk.Render(fmt.Sprintf("%ds", m.Limits.MaxDurationSeconds))})
 	}
@@ -1033,6 +1056,7 @@ func cmdValidate(agentfilePath string) error {
 	warnUnenforcedHumanGates(m)
 	warnUnenforcedSpending(m)
 	warnUnverifiableIdentity(m)
+	warnUnresolvableCredentials(m)
 	return nil
 }
 
@@ -1058,6 +1082,7 @@ func printValidatePlain(agentfilePath string, m *manifest.AgentManifest) {
 		printf("  allowed:     %s\n",
 			strings.Join(m.Sandbox.Network.AllowedHosts, ", "))
 	}
+	printf("  credentials: %s\n", credentialsSummary(m))
 
 	gates := manifest.InferRequiredGates(m.Capabilities)
 	if len(gates) > 0 {
@@ -1113,6 +1138,7 @@ func renderValidateStyled(agentfilePath string, m *manifest.AgentManifest) {
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		rows = append(rows, kv{"allowed", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", "))})
 	}
+	rows = append(rows, kv{"credentials", credentialsSummaryStyled(m)})
 	if gates := manifest.InferRequiredGates(m.Capabilities); len(gates) > 0 {
 		// Advice only — see printValidatePlain. "by spec" is the whole claim.
 		rows = append(rows, kv{"human gates",

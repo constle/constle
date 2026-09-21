@@ -17,7 +17,7 @@ var gatesWarnOut io.Writer = os.Stdout
 // warnUnenforcedHumanGates warns about the require_approval_for entries the
 // gate engine cannot enforce for this manifest, and says which of the two
 // reasons applies: the master switch is off (human_gates.enabled: false, which
-// disarms every entry — spec/agent-manifest.md §13.1), or the entry matches no
+// disarms every entry — spec/agent-manifest.md §14.1), or the entry matches no
 // declared MCP tool.
 //
 // Human gates ARE enforced now — for MCP tool calls: an entry that exactly

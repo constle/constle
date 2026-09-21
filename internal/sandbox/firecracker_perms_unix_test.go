@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/constle/constle/internal/agentenv"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -94,9 +95,18 @@ func TestBuildWorkspaceImageIsOwnerOnly(t *testing.T) {
 
 	m := &manifest.AgentManifest{}
 	m.Sandbox.Command = []string{"sh", "-c", "true"}
+	// Declared, because an undeclared credential no longer reaches the image at
+	// all — and an image with no secret in it could not fail this test's mode
+	// assertion for the right reason. Resolved through the production path so
+	// the value arrives the way a real run delivers it.
+	m.Credentials = []manifest.Credential{{Name: "ANTHROPIC_API_KEY"}}
+	credEnv, err := agentenv.Resolve(m)
+	if err != nil {
+		t.Fatalf("credentials.Resolve: %v", err)
+	}
 
 	path, err := buildWorkspaceImage(runDir, m, "172.30.0.1", "172.30.0.2",
-		map[string]string{"CONSTLE_MCP_GATE_TOKEN": gateToken})
+		credEnv, map[string]string{"CONSTLE_MCP_GATE_TOKEN": gateToken})
 	if err != nil {
 		t.Fatalf("buildWorkspaceImage: %v", err)
 	}

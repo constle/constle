@@ -6,7 +6,7 @@ the Docker and Firecracker backends (outbound, inbound listener/inbox, audit
 completeness, adversarial verification).
 **Last updated:** 2026-08-16
 **Source of truth:** `internal/a2a`, `internal/sandbox`
-**Related:** [`agent-manifest.md` §10](agent-manifest.md) (the `a2a` manifest
+**Related:** [`agent-manifest.md` §11](agent-manifest.md) (the `a2a` manifest
 section), [`identity.md`](identity.md) (the identity every envelope is signed
 with)
 

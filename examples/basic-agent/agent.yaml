@@ -16,6 +16,17 @@ sandbox:
 capabilities:
   - external_api
 
+# The host variables this agent receives. Nothing outside this list reaches the
+# sandbox, so an agent that needs one of the operator's keys no longer gets all
+# of them. agent.py reads both of these.
+#
+# AGENT_TASK is not a secret — it is the prompt. It is declared here because
+# this section governs every host variable the sandbox receives, not only the
+# secret ones, and constle handles everything in it as a secret regardless.
+credentials:
+  - name: GROQ_API_KEY
+  - name: AGENT_TASK
+
 spending:
   max_per_run_usd: "0.10"
 
@@ -26,6 +37,6 @@ compliance:
   audit_log_level: minimal
 
 metadata:
-  description: "Minimal example: reads AGENT_TASK, calls Claude Haiku, prints the response."
+  description: "Minimal example: reads AGENT_TASK, calls Groq llama-3.1-8b-instant, prints the response."
 
 
