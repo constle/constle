@@ -240,19 +240,30 @@ func createSquidAccessLog(path, squidUser string) error {
 	// to its own error handling and the run continues without an access log
 	// rather than not at all. A missing log is already visible downstream,
 	// where the flush reports that network events were not fully recorded.
-	_ = applyAccessLogOwner(path, squidUser)
+	_ = applyAccessLogOwnerFn(path, squidUser)
 	return nil
 }
+
+// applyAccessLogOwnerFn is the seam createSquidAccessLog calls through, and
+// exists for one reason: to let an unprivileged test prove the call happens.
+//
+// The chown's error is discarded at the call site by design, and an
+// unprivileged process cannot tell a chown that was attempted and refused
+// from one that was never made — the file keeps the owner it was created with
+// either way. Asserting on the helper directly proves only that the helper
+// works; substituting this variable is what proves createSquidAccessLog
+// reaches it. Deleting the call used to leave the whole suite green.
+var applyAccessLogOwnerFn = applyAccessLogOwner
 
 // applyAccessLogOwner gives the access log the owner accessLogOwner chose.
 //
 // It is a function of its own, returning the chown's error rather than
-// discarding it at the call site, so that the chown can be proved to happen.
-// Only root can complete it, which is why the end-to-end ownership test skips
-// on an unprivileged runner — but an unprivileged caller still gets EPERM back
-// from the attempt, while a version that had lost the chown altogether would
-// return nil. That difference is what an unprivileged test can assert, and
-// without it deleting this call outright goes unnoticed everywhere CI runs.
+// discarding it inline, so that the attempt itself can be asserted on. Only
+// root can complete it, which is why the end-to-end ownership test skips on an
+// unprivileged runner — but an unprivileged caller still gets EPERM back from
+// the attempt, while a version that had lost the chown altogether would return
+// nil. That difference is what TestAccessLogOwnerIsApplied asserts; the call
+// site is covered separately, through applyAccessLogOwnerFn.
 func applyAccessLogOwner(path, squidUser string) error {
 	uid, gid, err := accessLogOwner(squidUser)
 	if err != nil {

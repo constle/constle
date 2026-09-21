@@ -318,14 +318,52 @@ func TestAccessLogOwnerRefusesAnUnknownUser(t *testing.T) {
 	}
 }
 
-// TestAccessLogOwnerIsApplied is the one assertion that catches the chown
-// being deleted outright on an unprivileged runner, which is every runner CI
-// has. TestAccessLogOwnerUsesGroupZero pins the choice of owner and
+// TestCreateSquidAccessLogAppliesTheOwner catches the ownership call being
+// deleted from createSquidAccessLog, on the unprivileged runners that are
+// every runner CI has. Deleting it used to leave the entire suite green.
+//
+// It has to go through the seam rather than inspect the file, because the file
+// cannot show the difference: the chown is best effort and its error is
+// discarded, so an unprivileged run leaves access.log owned by the caller
+// whether the chown was refused or never attempted at all. Asserting on
+// applyAccessLogOwner directly, as TestAccessLogOwnerIsApplied does, proves
+// only that the helper works — not that anything calls it.
+//
+// The cost of the regression is not disclosure: it is access.log staying
+// root-owned, Squid unable to write it, and the run's network history missing
+// from the audit log.
+func TestCreateSquidAccessLogAppliesTheOwner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "access.log")
+
+	type ownerCall struct{ path, user string }
+	var calls []ownerCall
+	restore := applyAccessLogOwnerFn
+	t.Cleanup(func() { applyAccessLogOwnerFn = restore })
+	// EPERM is what the real chown hands an unprivileged caller, so the
+	// substitute also pins that createSquidAccessLog still swallows it.
+	applyAccessLogOwnerFn = func(p, user string) error {
+		calls = append(calls, ownerCall{p, user})
+		return syscall.EPERM
+	}
+
+	if err := createSquidAccessLog(path, "constle-squid-probe"); err != nil {
+		t.Fatalf("createSquidAccessLog returned %v: a refused chown is best effort and must not fail the run", err)
+	}
+
+	if len(calls) != 1 {
+		t.Fatalf("createSquidAccessLog made %d ownership calls, want exactly 1: the chown is not on this path, so access.log would keep the owner it was created with and Squid could not write it", len(calls))
+	}
+	if calls[0].path != path || calls[0].user != "constle-squid-probe" {
+		t.Errorf("ownership call was (%q, %q), want (%q, %q)", calls[0].path, calls[0].user, path, "constle-squid-probe")
+	}
+}
+
+// TestAccessLogOwnerIsApplied pins applyAccessLogOwner itself: that it really
+// attempts the chown rather than reporting success without trying.
+// TestAccessLogOwnerUsesGroupZero pins the choice of owner and
 // TestCreateSquidAccessLogOwnershipAsRoot pins the result, but the latter
-// skips without root — so removing the call entirely used to leave the whole
-// suite green. The cost of that regression is not disclosure: it is access.log
-// staying root-owned, Squid unable to write it, and the run's network history
-// missing from the audit log.
+// skips without root. It deliberately says nothing about the call site, which
+// is TestCreateSquidAccessLogAppliesTheOwner's job.
 //
 // It works unprivileged because chowning a file to root is refused rather than
 // ignored: an attempt returns EPERM, and no attempt returns nil.
