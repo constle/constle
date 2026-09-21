@@ -2,8 +2,10 @@ package humangate
 
 import (
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/termsafe"
 	"github.com/constle/constle/pkg/did"
 )
 
@@ -32,12 +34,59 @@ type DecisionProblem struct {
 	Detail    string
 }
 
+// String renders one problem for an operator to read. Every part of it that
+// came out of the log is escaped and bounded first — see safeProblemField.
 func (p DecisionProblem) String() string {
-	id := p.RequestID
+	id := safeProblemField(p.RequestID)
 	if id == "" {
 		id = "(no request_id)"
 	}
-	return fmt.Sprintf("entry %d: %s %s — %s", p.Entry, p.Event, id, p.Detail)
+	// Detail is composed here or by a stdlib error over an already-bounded
+	// field, so it is escaped without a length bound of its own. Escaped
+	// rather than trusted, because "constle wrote it" is a claim about the
+	// format string, not about what got interpolated into it.
+	return fmt.Sprintf("entry %d: %s %s — %s",
+		p.Entry, safeProblemField(string(p.Event)), id, termsafe.Line(p.Detail))
+}
+
+// safeProblemField renders one field of a problem line that arrived out of
+// the log under examination.
+//
+// Those fields are not trustworthy as text, and passing verification does not
+// make them so: internal/audit's own verifier documents that a wholly
+// attacker-authored log is internally consistent by construction, and this
+// package is reached precisely when a log's claims are in question. The log
+// is also designed to travel, so the machine reading it is not the machine
+// that wrote it.
+//
+// Escaping happens BEFORE the value is formatted into the line, which is the
+// rule internal/termsafe states for this exact case: Block, the backstop
+// underneath, cannot tell a newline the format string wrote from one that
+// arrived inside an interpolated value — so a value that could end its own
+// line has to be escaped first, or it can write a line that reads as constle
+// speaking. Here that line is a verdict about whether an approval was real.
+//
+// The length bound is internal/audit quoteDID's reasoning, with one
+// difference: it applies AFTER escaping. Escaping expands — one control byte
+// becomes six printable ones — so a cap taken first would not be a cap on
+// what is printed. It is enforced here rather than inherited from the
+// EvidenceFieldMax the records are written under, because String is exported
+// and a DecisionProblem can be built out of anything; the constant is reused
+// because it is already this package's answer to how long one of these may
+// legitimately be.
+func safeProblemField(s string) string {
+	s = termsafe.Line(s)
+	if len(s) <= EvidenceFieldMax {
+		return s
+	}
+	// Cut on a rune boundary: the escaped string is printable, but a byte
+	// slice can still split a multi-byte rune and produce the invalid UTF-8
+	// this function exists to keep out.
+	cut := EvidenceFieldMax
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s… (%d bytes in all)", s[:cut], len(s))
 }
 
 // OK reports whether every recorded decision held up.

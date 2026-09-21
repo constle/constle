@@ -207,7 +207,9 @@ func cmdAuditVerify(a auditVerifyArgs) error {
 		printf("  pinned:    DID matches the expected identity\n")
 	}
 	if a.agentfile != "" {
-		printf("  pins from: %s (%s)\n", a.agentfile, describePins(expectedDID, approverPubkey))
+		// Same reason #54 wraps path a few lines up: whatever the operator
+		// typed on the command line.
+		printf("  pins from: %s (%s)\n", termsafe.Line(a.agentfile), describePins(expectedDID, approverPubkey))
 	}
 	printf("\n")
 
