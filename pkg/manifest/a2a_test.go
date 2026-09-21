@@ -174,6 +174,42 @@ func TestValidateA2A(t *testing.T) {
 			},
 			wantErr: "must not be allowlisted when a2a.peers are declared",
 		},
+		// A peer endpoint is a URL, so the same name reaches it in spellings
+		// the allowlist grammar never admits. Each one is a direct path to the
+		// peer that skips the signing gate.
+		{
+			name: "peer host in allowed_hosts, declared in uppercase",
+			mutate: func(t *testing.T, m *AgentManifest) {
+				m.A2A.Peers[0].Endpoint = "https://PEER.EXAMPLE.COM:7420"
+				m.Sandbox.Network.AllowedHosts = []string{"peer.example.com"}
+			},
+			wantErr: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "peer host in allowed_hosts, declared fully qualified",
+			mutate: func(t *testing.T, m *AgentManifest) {
+				m.A2A.Peers[0].Endpoint = "https://peer.example.com.:7420"
+				m.Sandbox.Network.AllowedHosts = []string{"peer.example.com"}
+			},
+			wantErr: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "a different peer host in another case stays allowed",
+			mutate: func(t *testing.T, m *AgentManifest) {
+				m.A2A.Peers[0].Endpoint = "https://PEER.EXAMPLE.COM:7420"
+				m.Sandbox.Network.AllowedHosts = []string{"api.groq.com"}
+			},
+		},
+		{
+			// Dialled as peer.example.com after Go's transport applies IDNA,
+			// and spellable in no allowlist entry, so it cannot be compared.
+			name: "peer host written with an ideographic full stop",
+			mutate: func(t *testing.T, m *AgentManifest) {
+				m.A2A.Peers[0].Endpoint = "https://peer\u3002example.com:7420" // ideographic full stop
+				m.Sandbox.Network.AllowedHosts = []string{"peer.example.com"}
+			},
+			wantErr: "non-ASCII host",
+		},
 	}
 
 	for _, tt := range tests {

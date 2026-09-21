@@ -638,6 +638,24 @@ accepted, because each would open a bypass around a stronger control:
    above.) Allowlisting them wholesale would expose the gate itself
    and every other host service to the agent.
 
+Both comparisons are on names rather than on spellings. An entry here is
+lowercase with no trailing dot, because the grammar above admits nothing else,
+while a host read from `mcp.servers[].url` or `a2a.peers[].endpoint` is part of
+a URL, where `API.EXAMPLE.COM` and `api.example.com.` are legal spellings of
+`api.example.com` — and reach the same server through the proxy, which matches
+names case-insensitively. Declaring a server in one spelling and allowlisting
+it in another is therefore the same overlap, and is refused as one.
+
+For the same reason a declared `url` or `endpoint` must have an ASCII host,
+given as the ASCII form it resolves to — punycode for an internationalised
+name, exactly as an allowlist entry must be. An HTTP client resolves a URL's
+host through IDNA before it connects, so `api。example.com` — written with
+U+3002 rather than a full stop — reaches `api.example.com`, and
+`bücher.example` reaches `xn--bcher-kva.example`. Neither spelling can appear
+in `allowed_hosts`, so neither can be compared against it; a non-ASCII host is
+refused at validate time rather than compared in two alphabets, and the
+refusal names the form that should have been written.
+
 Both are errors, not warnings. A bypass that is merely warned about is a bypass.
 
 ---

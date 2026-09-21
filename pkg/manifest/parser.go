@@ -9,6 +9,9 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"unicode/utf8"
+
+	"golang.org/x/net/idna"
 
 	"gopkg.in/yaml.v3"
 
@@ -561,7 +564,10 @@ func a2aEndpointHost(rawURL string) (string, error) {
 	if u.Hostname() == "" {
 		return "", fmt.Errorf("endpoint %q has no host", rawURL)
 	}
-	return u.Hostname(), nil
+	if !isASCIIHost(u.Hostname()) {
+		return "", nonASCIIHostError("endpoint", rawURL, u.Hostname())
+	}
+	return normalizeHost(u.Hostname()), nil
 }
 
 // validateHumanGates checks gate timing and notification channels.
@@ -668,12 +674,128 @@ func mcpServerHost(rawURL string) (string, error) {
 	if u.Hostname() == "" {
 		return "", fmt.Errorf("url %q has no host", rawURL)
 	}
-	return u.Hostname(), nil
+	if !isASCIIHost(u.Hostname()) {
+		return "", nonASCIIHostError("url", rawURL, u.Hostname())
+	}
+	return normalizeHost(u.Hostname()), nil
+}
+
+// normalizeHost renders a hostname in the one spelling the checks below
+// compare, so that two names DNS and the egress proxy treat as the same host
+// are the same string here too.
+//
+// Two spellings differ from the allowlist grammar without naming a different
+// host. A DNS name is case-insensitive (RFC 4343), and a URL's host is
+// explicitly case-insensitive (RFC 3986 §3.2.2), so "API.EXAMPLE.COM" is
+// "api.example.com". A trailing dot is the fully-qualified form of the same
+// name, so "api.example.com." is "api.example.com" as well.
+//
+// This matters because the two sides of every comparison below reach it by
+// different routes. An allowed_hosts entry has been through
+// ValidateAllowedHost, which admits only lowercase and rejects an empty
+// trailing label; a host taken from mcp.servers[].url or
+// a2a.peers[].endpoint has been through neither, because it is a URL and
+// those spellings are legal in one. Comparing them raw meant an operator
+// could declare an MCP server as "https://API.EXAMPLE.COM/mcp", allowlist
+// "api.example.com", and have the bypass check see two different hosts —
+// while Squid, matching case-insensitively, let the sandbox reach the server
+// directly, with the tool allowlist, the human gates, spending metering and
+// the gate's audit trail all skipped at once.
+//
+// Normalising here rather than at the point each host is read is deliberate:
+// the guarantee belongs to the comparison, so a future caller that finds a
+// host some third way cannot reintroduce the mismatch.
+//
+// A leading dot is left alone. It is the allowlist's subdomain marker, not
+// part of a name.
+//
+// Trailing dots are stripped to exhaustion rather than one at a time, so the
+// result does not depend on how many times this runs — a host reaches the
+// comparators already normalised by mcpServerHost, and is normalised again
+// there.
+func normalizeHost(host string) string {
+	return strings.TrimRight(strings.ToLower(host), ".")
+}
+
+// isASCIIHost reports whether a hostname is entirely ASCII.
+//
+// A non-ASCII host cannot be compared against the allowlist, and the gap is
+// not cosmetic: Go's HTTP transport runs a URL's host through IDNA before it
+// resolves anything, so "api。example.com" — written with U+3002, an
+// ideographic full stop — is dialled as "api.example.com", and "bücher.example"
+// as "xn--bcher-kva.example". The allowlist grammar admits neither spelling,
+// so the bypass check would compare two strings that are different and name
+// the same host, declare no overlap, and leave the sandbox a direct route to
+// the very server the gate exists to sit in front of.
+//
+// Refusing is the fix rather than converting here, for the reason the grammar
+// in network.go gives: one host, one spelling. The allowlist already requires
+// the punycode form of an internationalised name, and requiring the same of a
+// declared URL is what keeps both sides of the comparison in one alphabet.
+//
+// Converting would also make this check depend on tracking net/http's IDNA
+// profile exactly and forever, since a validator that maps a name differently
+// from the client that dials it reopens this very class of bug. Refusing has
+// no such coupling.
+func isASCIIHost(host string) bool {
+	for i := 0; i < len(host); i++ {
+		if host[i] >= utf8.RuneSelf {
+			return false
+		}
+	}
+	return true
+}
+
+// nonASCIIHostError explains why a declared host cannot be compared against
+// the allowlist, naming the ASCII form the operator should have written. That
+// form is punycode for an internationalised name, and a plain ASCII name for
+// a host that only used characters Unicode maps onto ASCII ones — an
+// ideographic or fullwidth full stop, say — so the message does not call it
+// punycode.
+//
+// The form comes from idna.Lookup.ToASCII, which is exactly what net/http
+// calls before it resolves a URL's host (idnaASCII, net/http/request.go), so
+// the name in the message is the name this manifest would really have dialled
+// rather than an approximation of it. That is the whole reason to compute it:
+// telling an operator to use the ASCII form leaves them to find a converter,
+// while naming it also shows them what their host actually resolves to —
+// which for a homoglyph is the point being made. A Cyrillic
+// "аpi.example.com" comes back as "xn--pi-6kc.example.com", which is
+// visibly not the host they thought they had declared.
+//
+// ToASCII is only consulted for the message. Nothing decided here depends on
+// it, so a future change to the profile can make the hint less apt but cannot
+// make the refusal wrong.
+func nonASCIIHostError(field, rawURL, host string) error {
+	// Only a form that is itself a concrete, writable host is worth naming.
+	// Mapping can leave an empty first label behind — a lone zero-width space
+	// becomes ".example", which the allowlist grammar reads as a subdomain
+	// pattern rather than a host — and suggesting something the operator
+	// cannot put in a URL would send them in a circle.
+	// Normalise before converting. idna.Lookup is strict about an empty final
+	// label, so "bücher.example." - a fully qualified name, and a spelling
+	// this package otherwise accepts - would otherwise be reported as having
+	// no usable form when its form is xn--bcher-kva.example.
+	ascii, err := idna.Lookup.ToASCII(normalizeHost(host))
+	if err == nil && (strings.HasPrefix(ascii, ".") || ValidateAllowedHost(ascii) != nil) {
+		err = fmt.Errorf("not a usable host")
+	}
+	if err != nil || ascii == normalizeHost(host) {
+		return fmt.Errorf(
+			"%s %q has a non-ASCII host that is not a usable name — "+
+				"declare a host that can be compared with network.allowed_hosts",
+			field, rawURL)
+	}
+	return fmt.Errorf(
+		"%s %q has a non-ASCII host — use the ASCII form it resolves to, %s, "+
+			"so that it can be compared with network.allowed_hosts",
+		field, rawURL, ascii)
 }
 
 // hostsOverlap reports whether an allowed_hosts entry covers the given host.
 // Squid dstdomain entries starting with "." match all subdomains.
 func hostsOverlap(allowed, host string) bool {
+	allowed, host = normalizeHost(allowed), normalizeHost(host)
 	if strings.HasPrefix(allowed, ".") {
 		return host == strings.TrimPrefix(allowed, ".") || strings.HasSuffix(host, allowed)
 	}
@@ -683,7 +805,7 @@ func hostsOverlap(allowed, host string) bool {
 // isHostLoopbackAlias reports whether an allowlist entry addresses the
 // sandbox host itself — the gate proxy's transport surface.
 func isHostLoopbackAlias(host string) bool {
-	switch host {
+	switch normalizeHost(host) {
 	case "localhost", "127.0.0.1", "::1", "host.docker.internal", ".host.docker.internal":
 		return true
 	}

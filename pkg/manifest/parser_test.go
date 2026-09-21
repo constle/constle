@@ -490,6 +490,10 @@ func TestValidateMCP(t *testing.T) {
 		name    string
 		mutate  func(*AgentManifest)
 		wantErr bool
+		// wantErrContains, when set, requires the refusal to be the one the
+		// case is about. Without it a case that starts failing earlier, for
+		// an unrelated reason, still passes and stops testing anything.
+		wantErrContains string
 	}{
 		{
 			name:    "valid server",
@@ -568,6 +572,156 @@ func TestValidateMCP(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		// The bypass check compares an allowlist entry, which the grammar has
+		// already forced to one spelling, against a host taken from a URL,
+		// where several spellings of the same name are legal. Every one of
+		// these reaches the same server through Squid, which matches names
+		// case-insensitively, so every one of them has to be an overlap here.
+		{
+			name: "MCP host in allowed_hosts, declared in uppercase — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://API.EXAMPLE.COM/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "MCP host in allowed_hosts, declared in mixed case — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://Api.Example.Com/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "MCP host in allowed_hosts, declared fully qualified — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://api.example.com./mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "MCP host in allowed_hosts, both spellings at once — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://ApI.eXaMpLe.CoM./mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "subdomain wildcard covering an uppercase MCP host — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://MCP.EXAMPLE.COM/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{".example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		// Go's HTTP transport runs a URL host through IDNA before resolving
+		// it, so each of these is dialled as "api.example.com" while the
+		// allowlist grammar can spell none of them. The comparison cannot be
+		// made in two alphabets, so a non-ASCII host is refused outright and
+		// the operator is pointed at the punycode form.
+		{
+			name: "MCP host written with an ideographic full stop — uncomparable",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://api\u3002example.com/mcp" // ideographic full stop
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr: true,
+			// The refusal names the host this manifest would really have
+			// dialled, which is the allowlisted one.
+			wantErrContains: "resolves to, api.example.com",
+		},
+		{
+			name: "MCP host written with a fullwidth full stop — uncomparable",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://api\uff0eexample.com/mcp" // fullwidth full stop
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "non-ASCII host",
+		},
+		{
+			name: "MCP host written with fullwidth letters — uncomparable",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://\uff41pi.example.com/mcp" // fullwidth a
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "non-ASCII host",
+		},
+		{
+			name: "MCP host written with a Cyrillic homoglyph — uncomparable",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://\u0430pi.example.com/mcp" // Cyrillic a
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr: true,
+			// And here it names a host that is visibly not the one the
+			// operator meant, which is the whole value of naming it.
+			wantErrContains: "resolves to, xn--pi-6kc.example.com",
+		},
+		{
+			name: "an internationalised MCP host in unicode is refused, with its ASCII form named",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://bücher.example/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "resolves to, xn--bcher-kva.example",
+		},
+		{
+			// The hint is computed on the normalised host, so the two
+			// spellings this commit already folds do not cost the operator
+			// the one piece of information the message exists to give.
+			name: "an internationalised MCP host, fully qualified and uppercase, still names its form",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://B\u00dcCHER.EXAMPLE./mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "resolves to, xn--bcher-kva.example",
+		},
+		{
+			name: "a non-ASCII host that maps to no usable name names none",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://\u200b.example/mcp" // zero-width space
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "is not a usable name",
+		},
+		{
+			name: "an internationalised MCP host in punycode is comparable, and overlaps",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://xn--bcher-kva.example/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"xn--bcher-kva.example"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "an internationalised MCP host in punycode, not allowlisted, is fine",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://xn--bcher-kva.example/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr: false,
+		},
+		{
+			name: "a different host in another case is still a different host",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://API.EXAMPLE.COM/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -580,6 +734,9 @@ func TestValidateMCP(t *testing.T) {
 			}
 			if !tt.wantErr && err != nil {
 				t.Errorf("unexpected validation error: %v", err)
+			}
+			if tt.wantErrContains != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErrContains)) {
+				t.Errorf("error = %v, want one containing %q", err, tt.wantErrContains)
 			}
 		})
 	}
