@@ -98,7 +98,11 @@ type ResponseRecord struct {
 	// NOT covered by the §6 signature, which spans exactly request_id,
 	// decision and subject_digest — so it is recorded as an assertion by
 	// the endpoint, never as an attested fact, and nothing verifies it.
-	DecidedAt time.Time `json:"decided_at,omitempty"`
+	//
+	// A pointer so that absence reads as absence. `omitempty` does nothing
+	// for a time.Time, which is a struct: a response that sent no
+	// decided_at would otherwise be recorded as having claimed the year 1.
+	DecidedAt *time.Time `json:"decided_at,omitempty"`
 
 	// Truncated marks a record whose fields hit EvidenceFieldMax. Such a
 	// record can no longer reproduce the signed payload, so the verifier
@@ -110,7 +114,11 @@ type ResponseRecord struct {
 // NewResponseRecord copies a decision response into its audit form, bounding
 // every endpoint-controlled field at EvidenceFieldMax.
 func NewResponseRecord(resp DecisionResponse) ResponseRecord {
-	rec := ResponseRecord{DecidedAt: resp.DecidedAt}
+	var rec ResponseRecord
+	if !resp.DecidedAt.IsZero() {
+		at := resp.DecidedAt
+		rec.DecidedAt = &at
+	}
 	var cut bool
 	rec.RequestID, cut = clampEvidence(resp.RequestID)
 	rec.Truncated = rec.Truncated || cut
@@ -127,13 +135,16 @@ func NewResponseRecord(resp DecisionResponse) ResponseRecord {
 // record must never reach here — VerifyDecisions rejects those first — since
 // a clipped signature would verify as forged rather than as incomplete.
 func (r ResponseRecord) wire() DecisionResponse {
-	return DecisionResponse{
+	out := DecisionResponse{
 		RequestID:     r.RequestID,
 		Decision:      r.Decision,
 		SubjectDigest: r.SubjectDigest,
 		Signature:     r.Signature,
-		DecidedAt:     r.DecidedAt,
 	}
+	if r.DecidedAt != nil {
+		out.DecidedAt = *r.DecidedAt
+	}
+	return out
 }
 
 // clampEvidence bounds one field, dropping a partial rune rather than

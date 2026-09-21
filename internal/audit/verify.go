@@ -64,6 +64,11 @@ type VerifyReport struct {
 	// human-gates-webhook.md §9 — reads them from here rather than parsing
 	// the file a second time, so it can only ever examine entries this
 	// function has already proved authentic.
+	//
+	// Retaining them raises this call's peak memory by a decoded copy of the
+	// log, on top of the raw file and the line index it already holds. That
+	// is linear in the file either way, but a large log now costs more than
+	// it did.
 	Parsed []Entry
 }
 

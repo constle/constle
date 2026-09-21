@@ -249,24 +249,49 @@ func TestVerifyDecisionsInternalInconsistency(t *testing.T) {
 	}
 }
 
-// TestVerifyDecisionsLegacyLogIsNotAFalseAlarm: a log written before spec
-// 0.4.0 records no decisions anywhere. Every webhook approval in it is
-// genuinely unproven, but reporting them as failures would bury a real
-// finding under an alarm about software age.
-func TestVerifyDecisionsLegacyLogIsNotAFalseAlarm(t *testing.T) {
-	entries := []audit.Entry{
-		logEntry(t, audit.EventGateApproved, map[string]any{
-			"tool": "fs.write", "subject_digest": testDigest, DetailDecidedBy: DecidedByWebhook}),
-		logEntry(t, audit.EventGateDenied, map[string]any{
-			"tool": "fs.write", "subject_digest": testDigest, DetailDecidedBy: DecidedByWebhook}),
+// TestVerifyDecisionsEvidenceFreeApprovalAlwaysFails is the review finding
+// that killed the earlier heuristic. An approval with no recorded decision
+// used to be reported only when some OTHER entry in the same log carried
+// evidence — so a log with the evidence stripped from every approval was
+// byte-for-byte the shape that heuristic read as "written by an older
+// constle", and passed. An absence of proof cannot be excused by the absence
+// being thorough.
+func TestVerifyDecisionsEvidenceFreeApprovalAlwaysFails(t *testing.T) {
+	a := newTestApprover(t)
+	approval := logEntry(t, audit.EventGateApproved, map[string]any{
+		"tool": "send_email", "subject_digest": testDigest, DetailDecidedBy: DecidedByWebhook})
+
+	// Alone in the log, pinned or not.
+	for _, pinned := range []string{a.did, ""} {
+		rep := mustVerify(t, []audit.Entry{approval}, pinned)
+		if rep.OK() {
+			t.Errorf("an evidence-free approval passed (pinned=%q)", pinned)
+		}
 	}
 
-	rep := mustVerify(t, entries, "")
-	if !rep.OK() {
-		t.Errorf("a pre-0.4.0 log was reported as failing: %s", failureText(rep))
+	// And alongside entries that would once have made it look like an old log.
+	rep := mustVerify(t, []audit.Entry{approval, approval}, a.did)
+	if len(rep.Failures) != 2 {
+		t.Errorf("Failures = %d, want 2 — every unproven approval counts", len(rep.Failures))
 	}
-	if len(rep.Unproven) != 1 {
-		t.Errorf("Unproven = %d, want 1 — the approval, not the denial", len(rep.Unproven))
+	if got := failureText(rep); !strings.Contains(got, "before spec 0.4.0") {
+		t.Errorf("failure does not explain the pre-0.4.0 case: %s", got)
+	}
+}
+
+// TestVerifyDecisionsEvidenceFreeDenialIsNotAFailure keeps the asymmetry the
+// rule above depends on: a webhook denial needs no signature to justify
+// having blocked a call, and two such denials are reachable by design when
+// the request cannot even be built.
+func TestVerifyDecisionsEvidenceFreeDenialIsNotAFailure(t *testing.T) {
+	entries := []audit.Entry{
+		logEntry(t, audit.EventGateDenied, map[string]any{
+			"tool": "send_email", "subject_digest": testDigest, DetailDecidedBy: DecidedByWebhook}),
+		logEntry(t, audit.EventGateSignatureInvalid, map[string]any{
+			"tool": "send_email", "subject_digest": testDigest, DetailDecidedBy: DecidedByWebhook}),
+	}
+	if rep := mustVerify(t, entries, ""); !rep.OK() {
+		t.Errorf("an evidence-free webhook denial was reported as a failure: %s", failureText(rep))
 	}
 }
 
@@ -279,7 +304,7 @@ func TestVerifyDecisionsIgnoresTerminalGates(t *testing.T) {
 			"tool": "fs.write", "subject_digest": testDigest, DetailDecidedBy: "terminal"}),
 	}
 	rep := mustVerify(t, entries, "")
-	if !rep.OK() || len(rep.Unproven) != 0 || rep.Verified != 0 {
+	if !rep.OK() || rep.Verified != 0 {
 		t.Errorf("a terminal-decided gate was not ignored: %+v", rep)
 	}
 }
@@ -345,5 +370,76 @@ func TestVerifyDecisionsApprovalWithRequestButNoDecision(t *testing.T) {
 	}
 	if got := failureText(rep); !strings.Contains(got, "no signed decision is recorded") {
 		t.Errorf("failure did not name the missing decision: %s", got)
+	}
+}
+
+// TestVerifyDecisionsCatchesPartialTransplant: a decision record pasted onto
+// an entry it does not belong to leaves the entry's own tool name and the
+// recorded request naming different calls.
+func TestVerifyDecisionsCatchesPartialTransplant(t *testing.T) {
+	a := newTestApprover(t)
+	rec := decided(a, "hg_gate1", "approved", testDigest)
+	rec.Request.ToolName = "send_email"
+
+	e := gateEntry(t, audit.EventGateApproved, testDigest, rec)
+	e.Details["tool"] = "delete_everything" // only the outer label rewritten
+
+	rep := mustVerify(t, []audit.Entry{e}, a.did)
+	if rep.OK() {
+		t.Fatal("a decision pasted onto another entry passed verification")
+	}
+	if got := failureText(rep); !strings.Contains(got, "delete_everything") {
+		t.Errorf("failure did not name the mismatched tool: %s", got)
+	}
+}
+
+// TestVerifyDecisionsCannotBindToolNameToDigest pins a LIMITATION, not a
+// feature, so that nobody later reads a clean report as proof of something
+// it does not check.
+//
+// The §6 signature commits to subject_digest, and the digest commits to the
+// tool name and the arguments together (§5). Recomputing it needs the
+// arguments, which §9 excludes on purpose because they carry secrets. So a
+// runtime that rewrites the recorded request AND the entry's own tool name
+// together — keeping the captured digest and signature — produces a record
+// that verifies: the approver really did sign that digest, just for a
+// different call than the log now names.
+//
+// This is spec §10's fourth limitation. Closing it inside the log would mean
+// recording the arguments. What settles it instead is the request_id
+// recorded alongside, which the approver's own endpoint can match against
+// what it was actually shown.
+func TestVerifyDecisionsCannotBindToolNameToDigest(t *testing.T) {
+	a := newTestApprover(t)
+	rec := decided(a, "hg_gate1", "approved", testDigest)
+	rec.Request.ToolName = "delete_everything"
+
+	e := gateEntry(t, audit.EventGateApproved, testDigest, rec)
+	e.Details["tool"] = "delete_everything"
+
+	rep := mustVerify(t, []audit.Entry{e}, a.did)
+	if !rep.OK() {
+		t.Fatalf("expected the documented limitation, got failures: %s", failureText(rep))
+	}
+	if rep.Verified != 1 {
+		t.Errorf("Verified = %d, want 1", rep.Verified)
+	}
+	// If this ever starts failing, the limitation was closed — update
+	// spec §10 and this test together rather than deleting the test.
+}
+
+// TestResponseRecordOmitsAbsentDecidedAt: a response that sent no decided_at
+// must be recorded as having sent none, not as having claimed the year 1.
+func TestResponseRecordOmitsAbsentDecidedAt(t *testing.T) {
+	rec := NewResponseRecord(DecisionResponse{RequestID: "hg_1", Decision: "approved"})
+	if rec.DecidedAt != nil {
+		t.Errorf("DecidedAt = %v, want nil for a response that sent none", rec.DecidedAt)
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatalf("json.Marshal() error: %v", err)
+	}
+	if strings.Contains(string(b), "decided_at") {
+		t.Errorf("absent decided_at was still recorded: %s", b)
 	}
 }

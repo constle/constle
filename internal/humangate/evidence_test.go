@@ -55,8 +55,14 @@ func TestRecordedDecisionRoundTrip(t *testing.T) {
 	if got.ApproverPubkey != approver.did {
 		t.Errorf("approver_pubkey = %q, want %q", got.ApproverPubkey, approver.did)
 	}
-	if got.Response == nil || *got.Response != respRec {
-		t.Fatalf("response = %+v, want %+v", got.Response, respRec)
+	if got.Response == nil {
+		t.Fatal("response = nil, want the recorded decision")
+	}
+	if got.Response.wire() != respRec.wire() || got.Response.Truncated != respRec.Truncated {
+		t.Fatalf("response = %+v, want %+v", *got.Response, respRec)
+	}
+	if got.Response.DecidedAt == nil || !got.Response.DecidedAt.Equal(*respRec.DecidedAt) {
+		t.Errorf("decided_at = %v, want %v", got.Response.DecidedAt, respRec.DecidedAt)
 	}
 
 	// The whole point of persisting it: the recovered record reproduces the

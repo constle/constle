@@ -225,7 +225,7 @@ func cmdAuditVerify(a auditVerifyArgs) error {
 // log with no gate decisions in it, rather than printing a row of zeros for
 // every run that never gated a call.
 func reportGateDecisions(d *humangate.DecisionReport, approverPubkey string) {
-	if d.Verified == 0 && d.Unanswered == 0 && len(d.Unproven) == 0 && len(d.Failures) == 0 {
+	if d.Verified == 0 && d.Unanswered == 0 && len(d.Failures) == 0 {
 		return
 	}
 
@@ -239,13 +239,6 @@ func reportGateDecisions(d *humangate.DecisionReport, approverPubkey string) {
 	if approverPubkey == "" && d.Verified > 0 {
 		printf("    · verified against each entry's own recorded approver_pubkey; pass\n")
 		printf("      --approver-pubkey=<did:key:…> from the Agentfile to pin the key\n")
-	}
-	for _, p := range d.Unproven {
-		printf("    ? %s\n", p)
-	}
-	if len(d.Unproven) > 0 {
-		printf("      (this log records no signed decisions at all — expected for a log\n")
-		printf("       written before spec 0.4.0, which did not persist them)\n")
 	}
 	for _, p := range d.Failures {
 		printf("    ✗ %s\n", p)

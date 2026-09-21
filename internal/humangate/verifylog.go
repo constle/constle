@@ -18,11 +18,8 @@ type DecisionReport struct {
 	// Unanswered counts gates that were opened on the decision endpoint and
 	// timed out with no decision to verify.
 	Unanswered int
-	// Unproven lists entries claiming a webhook decision that record no
-	// signed decision to back it up.
-	Unproven []DecisionProblem
-	// Failures lists recorded decisions whose cryptography disagrees with
-	// what the log says happened.
+	// Failures lists every entry whose claim the cryptography does not
+	// support — including an approval that records no decision at all.
 	Failures []DecisionProblem
 }
 
@@ -89,11 +86,8 @@ func safeProblemField(s string) string {
 	return fmt.Sprintf("%s… (%d bytes in all)", s[:cut], len(s))
 }
 
-// OK reports whether every recorded decision held up.
-//
-// Unproven entries are deliberately not counted here: see VerifyDecisions
-// for why an absence of evidence is only conclusive within a log that
-// records evidence at all.
+// OK reports whether every webhook approval in the log is backed by a
+// signature that supports it.
 func (r *DecisionReport) OK() bool { return len(r.Failures) == 0 }
 
 // VerifyDecisions re-verifies, offline, every signed gate decision recorded
@@ -143,14 +137,11 @@ func VerifyDecisions(entries []audit.Entry, pinnedPubkey string) (*DecisionRepor
 		}
 
 		if rec == nil {
-			// No evidence. That is correct and expected for a gate the
-			// terminal answered, and for every entry written before spec
-			// 0.4.0 — but not for an entry that names the webhook as the
-			// source of its decision.
+			// No evidence. Correct and expected for a gate the terminal
+			// answered; a failure for one that says the webhook let a call
+			// through.
 			if claimsUnprovenApproval(e) {
-				rep.Unproven = append(rep.Unproven, problem(
-					"the call was approved by the webhook approver, but no signed decision is "+
-						"recorded to prove the approver ever gave one"))
+				rep.Failures = append(rep.Failures, problem("%s", unprovenApproval))
 			}
 			continue
 		}
@@ -175,8 +166,7 @@ func VerifyDecisions(entries []audit.Entry, pinnedPubkey string) (*DecisionRepor
 			// is, so it fails exactly as claimsUnprovenApproval fails it.
 			switch e.Event {
 			case audit.EventGateApproved:
-				fail("the call was approved by the webhook approver, but no signed " +
-					"decision is recorded to prove the approver ever gave one")
+				fail("%s", unprovenApproval)
 			case audit.EventGateTimeout:
 				rep.Unanswered++
 			}
@@ -192,6 +182,24 @@ func VerifyDecisions(entries []audit.Entry, pinnedPubkey string) (*DecisionRepor
 			d != "" && rec.Request.SubjectDigest != "" && d != rec.Request.SubjectDigest {
 			fail("the gated call's subject_digest is %s but the recorded request names %s",
 				d, rec.Request.SubjectDigest)
+			continue
+		}
+
+		// Same rule applied to the tool name. This catches a decision record
+		// pasted onto an entry it does not belong to, and it deliberately
+		// does not claim more: a runtime that rewrites BOTH halves passes,
+		// because both halves are written by the same runtime. What no
+		// check here can do is tie the tool NAME to the subject_digest —
+		// the digest commits to the name and the arguments together, and
+		// recomputing it needs the arguments, which §9 excludes on purpose.
+		// A captured approval can therefore be relabelled as a different
+		// call by whoever writes the log. That residual is stated in spec
+		// §10; the request_id recorded alongside is what lets the approver's
+		// own records settle it.
+		if name, ok := e.Details["tool"].(string); ok &&
+			name != "" && rec.Request.ToolName != "" && name != rec.Request.ToolName {
+			fail("the gated call names tool %q but the recorded request names %q",
+				name, rec.Request.ToolName)
 			continue
 		}
 
@@ -233,19 +241,23 @@ func VerifyDecisions(entries []audit.Entry, pinnedPubkey string) (*DecisionRepor
 		rep.Verified++
 	}
 
-	// An absence of evidence only means something in a log that carries
-	// evidence elsewhere. A log written entirely by an older constle records
-	// none anywhere, and reporting every one of its gates as unproven would
-	// bury the case that matters under a false alarm. A log that proves some
-	// of its webhook decisions and not others is the real signal, so those
-	// unproven entries are promoted to failures.
-	if rep.Verified > 0 || rep.Unanswered > 0 {
-		rep.Failures = append(rep.Failures, rep.Unproven...)
-		rep.Unproven = nil
-	}
-
 	return rep, nil
 }
+
+// unprovenApproval is the one thing this whole check exists to catch.
+//
+// An earlier revision reported it only when some OTHER entry in the same log
+// carried evidence, so that a log written before spec 0.4.0 would not have
+// every gate in it reported as a failure. That inference was the hole: a log
+// with the evidence stripped from every approval is byte-for-byte the shape
+// it inferred as "old", so removing all of it passed. An absence of proof
+// cannot be excused by the absence being thorough, and a daily file mixing
+// runs from two versions made the same inference flip per entry. Principle:
+// a missing or unverifiable security signal fails loudly; it never succeeds
+// quietly.
+const unprovenApproval = "the call was approved by the webhook approver, but no signed decision " +
+	"is recorded to prove the approver ever gave one — a log written before spec 0.4.0 " +
+	"records none, and is indistinguishable from one the record was removed from"
 
 // claimsUnprovenApproval reports whether an entry says the webhook approver
 // let a call through while recording nothing that could show it did.
