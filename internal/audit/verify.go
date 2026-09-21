@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/constle/constle/pkg/did"
 )
@@ -55,6 +56,32 @@ func (e *TamperError) Error() string {
 type VerifyReport struct {
 	Entries int
 	DID     string
+}
+
+// quoteDID renders a DID for a tamper report.
+//
+// The DID of a mismatching entry is the one value this file echoes that has
+// NOT been through did.PublicKey: only the entry that fixes the log's
+// identity is decoded (and only when the caller pinned nothing), so a later
+// line's did carries neither the did.MaxLen byte cap nor the base58
+// alphabet. It is arbitrary bytes out of a file that, by design, travelled
+// here from somewhere else — internal/mcpgate's gate documents that the
+// audit log is meant to travel, and a fully attacker-authored log is
+// internally consistent by construction, which is exactly what the
+// pinned-DID rewrite test exercises.
+//
+// So it is bounded and quoted, at the point the error is built rather than
+// at the point it is printed: VerifyFile is exported, and an embedder that
+// never touches constle's CLI must not inherit an error that can drive a
+// terminal. strconv.Quote escapes ESC, every other control byte, the bidi
+// overrides and invalid UTF-8; the length cap keeps a whole file out of one
+// error line. This matches pkg/did's own rule — it reports a DID's length
+// rather than its value once the value is too long to be one.
+func quoteDID(s string) string {
+	if len(s) > did.MaxLen {
+		return fmt.Sprintf("%q… (%d bytes in all)", s[:did.MaxLen], len(s))
+	}
+	return strconv.Quote(s)
 }
 
 // VerifyFile reads a signed audit log and verifies it end to end: every
@@ -124,7 +151,7 @@ func VerifyFile(path, expectedDID string) (*VerifyReport, error) {
 			}
 		} else if entry.DID != logDID {
 			return nil, &TamperError{lineNo, TamperDIDMismatch,
-				fmt.Sprintf("entry is attributed to %s, expected %s", entry.DID, logDID)}
+				fmt.Sprintf("entry is attributed to %s, expected %s", quoteDID(entry.DID), quoteDID(logDID))}
 		}
 
 		sig, err := base64.StdEncoding.DecodeString(entry.Sig)

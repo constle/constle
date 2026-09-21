@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode"
 )
 
 // TestStdinIsTerminalRejectsNonTerminals pins the fail-closed half of the
@@ -218,44 +217,6 @@ func TestRenderedArgumentsKeepJSONStructure(t *testing.T) {
 	}
 }
 
-// TestSanitizeForTerminalEscapesWhatCannotBeSeen covers the other half of
-// "the operator saw it": encoding/json rejects raw control bytes inside a
-// string literal, but every rune at or above U+0080 gets through, including
-// the ones that attack the reader rather than the terminal.
-//
-// Both the inputs and the expectations are written as Go escapes on purpose.
-// Pasting these runes into this file as literals is the same trick the code
-// under test exists to defeat, one layer up — and Go rejects a literal
-// U+FEFF in source outright.
-func TestSanitizeForTerminalEscapesWhatCannotBeSeen(t *testing.T) {
-	cases := []struct {
-		name, in, want string
-	}{
-		{"plain ascii is untouched", `{"to":"a@b.example"}`, `{"to":"a@b.example"}`},
-		{"CJK stays readable", "{\"memo\":\"\u8ACB\u6C42\u66F8\"}", "{\"memo\":\"\u8ACB\u6C42\u66F8\"}"},
-		{"accents stay readable", "{\"name\":\"More\u00F1o\"}", "{\"name\":\"More\u00F1o\"}"},
-		{"emoji stays readable", "{\"tag\":\"\U0001F525\"}", "{\"tag\":\"\U0001F525\"}"},
-		{"bidi override is escaped", "{\"to\":\"a\u202Eb\"}", `{"to":"a\u202Eb"}`},
-		{"zero-width space is escaped", "{\"to\":\"a\u200Bb\"}", `{"to":"a\u200Bb"}`},
-		{"byte order mark is escaped", "{\"to\":\"a\uFEFFb\"}", `{"to":"a\uFEFFb"}`},
-		{"non-breaking space is escaped", "{\"to\":\"a\u00A0b\"}", `{"to":"a\u00A0b"}`},
-		{"line separator is escaped", "{\"to\":\"a\u2028b\"}", `{"to":"a\u2028b"}`},
-		{"soft hyphen is escaped", "{\"to\":\"a\u00ADb\"}", `{"to":"a\u00ADb"}`},
-		{"astral non-printable is escaped", "{\"t\":\"\U000E0041\"}", `{"t":"\U000E0041"}`},
-		{"invalid utf-8 is escaped", "{\"t\":\"\xFF\"}", `{"t":"\xFF"}`},
-		{"an escape spelled out in the source keeps its own backslashes",
-			`{"to":"a\\u202eb"}`, `{"to":"a\\u202eb"}`},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := sanitizeForTerminal(tc.in); got != tc.want {
-				t.Errorf("sanitizeForTerminal(%q)\n = %q\nwant %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
 // TestHostileRunesNeverReachTheTerminalVerbatim pins the same property one
 // level up, through the real display path, so an escaper that is correct in
 // isolation cannot be bypassed by how renderArguments calls it. Escaping,
@@ -274,29 +235,6 @@ func TestHostileRunesNeverReachTheTerminalVerbatim(t *testing.T) {
 		if want := fmt.Sprintf(`\u%04X`, r); !strings.Contains(shown, want) {
 			t.Errorf("rune %U was hidden rather than escaped to %s:\n%s", r, want, shown)
 		}
-	}
-}
-
-// TestBlankButPrintableRunesAreEscaped guards the gap unicode.IsPrint leaves.
-// These render as an empty cell in every common terminal font yet IsPrint
-// accepts them — the Hangul fillers are letters and the blank Braille pattern
-// is a symbol — so padding a value with them is otherwise a free way to make
-// displayed text lie.
-func TestBlankButPrintableRunesAreEscaped(t *testing.T) {
-	for _, r := range []rune{0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800} {
-		if !unicode.IsPrint(r) {
-			t.Fatalf("premise wrong: unicode.IsPrint(%U) is already false, the list is unnecessary", r)
-		}
-		got := sanitizeForTerminal(string(r))
-		if want := fmt.Sprintf(`\u%04X`, r); got != want {
-			t.Errorf("sanitizeForTerminal(%U) = %q, want %q", r, got, want)
-		}
-	}
-
-	// The neighbouring real Hangul syllable must stay readable: the list is a
-	// named set, not a range, and must not swallow legitimate text.
-	if got := sanitizeForTerminal("\uD55C"); got != "\uD55C" {
-		t.Errorf("a real Hangul syllable was escaped: %q", got)
 	}
 }
 

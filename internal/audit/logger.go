@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/homedir"
+	"github.com/constle/constle/internal/termsafe"
 )
 
 // EventType identifies the kind of event recorded in an audit log entry.
@@ -371,9 +372,16 @@ func (l *Logger) LogWithIsolation(runID, agentName string, event EventType, isol
 //
 // Stderr, not stdout: stdout is the CLI's styled output channel and is
 // serialised behind its own lock, which this package has no access to.
+//
+// Through termsafe, because err is not this package's text. A write that
+// fails on the log file returns *fs.PathError, whose message quotes the path
+// it failed on — and that path is ~/.constle/logs/<identity.name>-<date>.jsonl,
+// built from a field an Agentfile is free to fill with anything. So the one
+// warning that fires when the audit trail is already broken was also the one
+// carrying an Agentfile's bytes, unescaped, to the terminal.
 func WarnWriteFailure(event EventType, err error) {
-	fmt.Fprintf(os.Stderr, "constle: AUDIT WRITE FAILED for %s: %v\n", event, err)
-	fmt.Fprintf(os.Stderr, "         this run's audit log is incomplete — the event above was not recorded\n")
+	termsafe.Fprintf(os.Stderr, "constle: AUDIT WRITE FAILED for %s: %v\n", event, err)
+	termsafe.Fprintf(os.Stderr, "         this run's audit log is incomplete — the event above was not recorded\n")
 }
 
 // Close closes the underlying log file.

@@ -357,7 +357,7 @@ func (m *AgentManifest) validateSpending() error {
 	if s.MaxPerDayUSD != "" && m.Identity.DID == "" {
 		return fmt.Errorf(
 			"spending.max_per_day_usd: identity.did is required — daily spend is tracked durably per DID "+
-				"(tracking by name would let a rename reset it); create one with: constle identity create %s",
+				"(tracking by name would let a rename reset it); create one with: constle identity create %q",
 			m.Identity.Name)
 	}
 
@@ -473,7 +473,7 @@ func (m *AgentManifest) validateA2A() error {
 	if m.Identity.DID == "" {
 		return fmt.Errorf(
 			"a2a: identity.did is required — every A2A call is signed with the agent's identity; "+
-				"create one with: constle identity create %s", m.Identity.Name)
+				"create one with: constle identity create %q", m.Identity.Name)
 	}
 
 	if len(a.Peers) == 0 {

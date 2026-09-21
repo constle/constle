@@ -472,3 +472,42 @@ identity:
 		})
 	}
 }
+
+// TestRawDecoderTextCannotForgeALine covers the one branch of
+// describeDecodeProblem that does not compose its own message.
+//
+// A type mismatch is not an unknown field, so parseUnknownField declines it
+// and the decoder's own sentence is passed through. That sentence embeds the
+// offending scalar, and yaml.v3 decodes escapes before it formats: a "\n"
+// written into an Agentfile string arrives in the error as a real newline.
+// The CLI's stderr writer preserves the newlines of an error it is relaying,
+// deliberately — so line forgery has to be stopped here, where the untrusted
+// value enters the error, which is the same rule the %q sites in this package
+// already follow.
+func TestRawDecoderTextCannotForgeALine(t *testing.T) {
+	const forged = "APPROVED"
+
+	_, err := Parse(strictAgentfile("sandbox:\n  memory_mb: \"\\nAPPROVED\\n\"\n"))
+	if err == nil {
+		t.Fatal("a string in an int field parsed cleanly, so nothing below is tested")
+	}
+
+	got := err.Error()
+	// Two premises. The first pins the branch: an unknown-field complaint is
+	// rewritten and would never reach the passthrough this test is about.
+	if !strings.Contains(got, "cannot unmarshal") {
+		t.Fatalf("not the decoder type error this test covers: %q", got)
+	}
+	// The second pins reachability: yaml.v3 truncates the values it quotes,
+	// so a payload that never arrives would leave the check below passing
+	// over a message that simply does not contain it.
+	if !strings.Contains(got, forged) {
+		t.Fatalf("the payload never reached the error, so nothing below is tested: %q", got)
+	}
+
+	for _, line := range strings.Split(got, "\n") {
+		if strings.TrimSpace(line) == forged {
+			t.Errorf("an Agentfile scalar opened a line of its own:\n%s", got)
+		}
+	}
+}

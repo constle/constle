@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -54,6 +55,7 @@ import (
 	"github.com/constle/constle/internal/audit"
 	"github.com/constle/constle/internal/humangate"
 	"github.com/constle/constle/internal/spending"
+	"github.com/constle/constle/internal/termsafe"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -285,6 +287,11 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 				scrubHopByHop(req.Header)
 			},
 			ModifyResponse: refuseProtocolSwitch(len(meters) > 0),
+			// ErrorLog rather than ErrorHandler: ReverseProxy routes every
+			// message it emits through this logger, the default error
+			// handler's included, so one writer covers the lot and the 502
+			// that handler sends stays exactly as it was.
+			ErrorLog: log.New(gateLogWriter{"proxy"}, "", 0),
 		}
 
 		g.servers[srv.ID] = &upstream{id: srv.ID, path: target.Path, tools: tools, meters: meters, proxy: proxy}
@@ -336,7 +343,10 @@ func (g *Gate) Bind(runID string, candidateIPs []string) (port int, token string
 
 	g.port = port
 	g.listeners = listeners
-	g.server = &http.Server{Handler: g}
+	// The same omission one level up: an http.Server with no ErrorLog logs
+	// through the global logger too, and what it logs — a handler panic, a
+	// TLS handshake failure — is assembled from whatever the peer sent.
+	g.server = &http.Server{Handler: g, ErrorLog: log.New(gateLogWriter{"server"}, "", 0)}
 	for _, ln := range listeners {
 		go func() {
 			// Serve never returns nil. ErrServerClosed is the ordinary exit
@@ -346,7 +356,7 @@ func (g *Gate) Bind(runID string, candidateIPs []string) (port int, token string
 			// error is telling the operator why, instead of leaving them to
 			// debug an agent that suddenly cannot reach a declared server.
 			if err := g.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				fmt.Fprintf(os.Stderr, "constle: MCP gate listener on %s stopped: %v\n", ln.Addr(), err)
+				termsafe.Fprintf(os.Stderr, "constle: MCP gate listener on %s stopped: %v\n", ln.Addr(), err)
 			}
 		}()
 	}
@@ -1036,13 +1046,68 @@ func (g *Gate) log(event audit.EventType, details map[string]any) {
 // outf writes one piece of operator-facing text — an approval prompt, a
 // webhook warning — to a caller-supplied writer.
 //
+// It is also this package's terminal-integrity chokepoint. Everything it
+// prints is operator-facing plain text: nothing in internal/mcpgate emits
+// styling of its own, so there is no legitimate escape sequence here to
+// preserve, and sanitizing unconditionally costs nothing. That matters
+// because this writer is the same one the human gate draws its prompt on and
+// reads its answer beside — a gate's promise that the bytes shown are the
+// bytes signed for is worth only as much as constle's hold on the screen.
+//
+// Two layers, because they stop different things:
+//
+//   - termsafe.Args escapes the interpolated values before formatting, so an
+//     untrusted string (an unset url_secret_ref out of an Agentfile, a
+//     reason phrase from a decision endpoint) cannot end its line and write
+//     a line that reads as constle speaking. Arguments whose newlines ARE
+//     constle's own say so with termsafe.Preformatted.
+//   - termsafe.Block over the result is the backstop for whatever Args does
+//     not reach — a %v over a composite, a future call site that forgets.
+//     It cannot undo a forged line at that point, but nothing that drives a
+//     terminal survives it.
+//
 // The dropped error is justified once here rather than at a dozen call
 // sites: this writer IS the channel constle reports problems on, so a
 // failure to write to it has nowhere left to be reported. Nothing the gate
 // enforces depends on it either — a gated call is decided and audited
 // whether or not the human ever saw the prompt.
 func outf(w io.Writer, format string, args ...any) {
-	_, _ = fmt.Fprintf(w, format, args...)
+	termsafe.Fprintf(w, format, args...)
+}
+
+// gateLogOut is where this package's standard-library loggers land. It is a
+// package var only so the test can capture it; production writes to stderr,
+// like the listener error that reports the same class of background failure.
+var gateLogOut io.Writer = os.Stderr
+
+// gateLogWriter routes a standard-library logger through this package's
+// chokepoint. what names which one, for the operator reading the line.
+//
+// It exists because these are the writers here that are not call sites.
+// httputil.ReverseProxy and http.Server each do their own logging, and one
+// built with no ErrorLog logs through the standard library's global logger,
+// which writes straight to os.Stderr: around outf, around termsafe, inside
+// the package that draws the approval prompt and reads the answer beside it.
+// Nothing about those lines is constle's to compose, which is exactly why
+// they have to be held.
+//
+// What they log is assembled from whatever the peer did. net/http quotes
+// most of what it reports with %q, and %q escapes a control byte on its own
+// — but that is net/http's wording, not an invariant constle may rest on,
+// and crypto/x509 already does not: x509.HostnameError joins the
+// certificate's DNS names verbatim, so an upstream whose certificate chains
+// to a trusted CA and fails hostname verification puts those bytes on the
+// screen.
+//
+// The logged line goes in as a value and not as preformatted text: a logger
+// relaying someone else's error must not be able to open a line of its own.
+// Only what names the writer is constle's own, and it says so.
+type gateLogWriter struct{ what string }
+
+func (g gateLogWriter) Write(b []byte) (int, error) {
+	outf(gateLogOut, "constle: MCP gate %s: %s\n",
+		termsafe.Preformatted(g.what), strings.TrimSuffix(string(b), "\n"))
+	return len(b), nil
 }
 
 // statusRecorder captures the HTTP status a proxied response was sent with,

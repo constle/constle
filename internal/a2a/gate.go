@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/termsafe"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -149,7 +150,7 @@ func (g *Gate) Bind(runID string, candidateIPs []string) (port int, token string
 			// exit; anything else is this listener dying early, which the
 			// agent sees only as its A2A calls failing.
 			if err := g.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				fmt.Fprintf(os.Stderr, "constle: A2A gate listener on %s stopped: %v\n", ln.Addr(), err)
+				termsafe.Fprintf(os.Stderr, "constle: A2A gate listener on %s stopped: %v\n", ln.Addr(), err)
 			}
 		}()
 	}

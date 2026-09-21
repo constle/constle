@@ -10,10 +10,10 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/mattn/go-isatty"
+
+	"github.com/constle/constle/internal/termsafe"
 )
 
 // The three budgets below bound what one terminal approval can cover. Above
@@ -147,7 +147,9 @@ func (a *TerminalApprover) Decide(ctx context.Context, req Request) Decision {
 		// operator is shown must not depend on whether they can answer, and a
 		// backgrounded run's transcript is the only record of what its gates
 		// were asked about.
-		outf(a.Out, "%s", block)
+		// Preformatted: renderArguments already escaped every line of this
+		// block, and the newlines between them are constle's own.
+		outf(a.Out, "%s", termsafe.Preformatted(block))
 	}
 
 	if !a.Interactive {
@@ -299,8 +301,28 @@ func displayableArguments(raw json.RawMessage) (block string, why string) {
 //     read as a finished one. It also puts one key per line, which is what
 //     makes reading the thing realistic rather than nominal.
 //
-//  2. sanitizeForTerminal on each resulting line, for the hostile runes that
+//  2. termsafe.Line on each resulting line, for the hostile runes that
 //     survive a parse because they are legal inside a JSON string.
+//
+// What reaches step 2 is narrower than what termsafe.Line defends against in
+// general. encoding/json's scanner rejects a raw ESC — and every other byte
+// below 0x20 — inside a string literal, so classical CSI injection cannot
+// arrive by this route at all. What JSON does permit is every byte >= 0x80,
+// including invalid UTF-8 and the runes that attack a reader rather than a
+// terminal: U+202E RIGHT-TO-LEFT OVERRIDE reverses the displayed text, U+200B
+// and U+FEFF are invisible, U+2028 is a line separator to some renderers,
+// U+00A0 is an unselectable space. A body that reads as one transfer and
+// executes as another needs none of them to be printable.
+//
+// No extra backslash-doubling is needed to keep the rendering unambiguous,
+// because what is being displayed is JSON *source*: a backslash there is
+// always already escaped as two backslashes, so a body that spells an escape
+// sequence literally keeps its doubled backslash on screen and stays distinct
+// from the single-backslash escape termsafe emits for a raw rune. The one
+// collision left is between a source that writes the bidi override as a JSON
+// \\u escape and one that writes it as raw UTF-8: those two bodies decode to
+// the identical string at the upstream, so rendering them alike is correct,
+// not lossy.
 //
 // Indent failing is unreachable through the gate proxy — parseJSONRPC has
 // already unmarshalled the whole body, and encoding/json validates a
@@ -317,9 +339,10 @@ func renderArguments(raw json.RawMessage) (text string, lines int) {
 		// body becomes ONE line. Not splitting is the point — an unparseable
 		// body is the only input whose newlines constle did not write, and
 		// letting those through is what would let a caller-supplied body
-		// print lines indistinguishable from the prompt's own. sanitize
-		// escapes them (\n is not a printable rune) along with everything else.
-		return linePrefix + sanitizeForTerminal(string(raw)), 1
+		// print lines indistinguishable from the prompt's own. termsafe.Line
+		// escapes them (\n is not a printable rune) along with everything
+		// else.
+		return linePrefix + termsafe.Line(string(raw)), 1
 	}
 
 	// json.Indent prefixes every line but the first, so the first gets one
@@ -331,109 +354,10 @@ func renderArguments(raw json.RawMessage) (text string, lines int) {
 		} else {
 			b.WriteString(linePrefix)
 		}
-		b.WriteString(sanitizeForTerminal(line))
+		b.WriteString(termsafe.Line(line))
 		lines++
 	}
 	return b.String(), lines
-}
-
-// sanitizeForTerminal makes agent-controlled bytes safe to print on an
-// operator's terminal without hiding any of them.
-//
-// encoding/json's scanner already rejects a raw ESC — and every other byte
-// below 0x20 — inside a string literal, so classical CSI escape injection
-// cannot reach here. What it does permit is every byte >= 0x80, including
-// invalid UTF-8 and the runes that attack a reader rather than a terminal:
-// U+202E RIGHT-TO-LEFT OVERRIDE reverses the displayed text, U+200B and
-// U+FEFF are invisible, U+2028 is a line separator to some renderers, U+00A0
-// is an unselectable space. An argument body that reads as one transfer and
-// executes as another needs none of them to be printable.
-//
-// The rule is one stdlib predicate plus a short list. unicode.IsPrint carries
-// almost all of it: a rune Go calls printable prints verbatim, so legitimate
-// CJK, accented and emoji arguments stay readable, and everything else becomes
-// a visible ASCII escape. Verified against the whole code space, U+0020 is the
-// only rune in the control (Cc), format (Cf — where the bidi overrides and
-// zero-width characters live), private-use, surrogate and separator categories
-// that IsPrint accepts.
-//
-// blankButPrintable is the gap IsPrint leaves. A handful of runes are
-// categorised as letters or symbols — so IsPrint says yes — yet render as an
-// empty cell in every common terminal font: the Hangul fillers and the blank
-// Braille pattern. They are indistinguishable from a space on screen, they
-// have no legitimate place in an MCP tool argument, and padding a value with
-// them is the cheapest way left to make displayed text lie.
-//
-// What this does NOT defend against, stated plainly: homoglyphs. Cyrillic
-// "раураl.com" is printable, non-blank, and renders as "paypal.com". Ruling
-// that out needs a Unicode confusables table and a policy on mixed scripts,
-// not a predicate — and banning non-ASCII outright would break the CJK and
-// accented arguments this function deliberately keeps readable. The subject
-// digest on the prompt distinguishes such a call from the real one, but only
-// for an operator who has something to compare it against.
-//
-// No extra backslash-doubling is needed to keep the rendering unambiguous,
-// because what is being displayed is JSON *source*: a backslash there is
-// always already escaped as two backslashes, so a body that spells an
-// escape sequence literally keeps its doubled backslash on screen and
-// stays distinct from the single-backslash escape this function emits for
-// a raw rune. The one collision left is between a source that writes the
-// bidi override as a JSON \\u escape and one that writes it as raw UTF-8:
-// those two bodies decode to the identical string at the upstream, so
-// rendering them alike is correct, not lossy.
-//
-// It decodes rune by rune and so cannot split one, which also retires the
-// mid-UTF-8 cut the old args[:500] byte slice produced.
-func sanitizeForTerminal(s string) string {
-	// Fast path: nearly every real tool call is plain printable ASCII JSON
-	// and needs no copy at all.
-	needsEscape := false
-	for _, r := range s {
-		if r == utf8.RuneError || !unicode.IsPrint(r) || blankButPrintable(r) {
-			needsEscape = true
-			break
-		}
-	}
-	if !needsEscape {
-		return s
-	}
-
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		switch {
-		case r == utf8.RuneError && size == 1:
-			// Not valid UTF-8. Show the byte itself; \xNN is not JSON escape
-			// syntax, which is the point — it marks a body that no correct
-			// JSON producer emits.
-			fmt.Fprintf(&b, "\\x%02X", s[i])
-		case unicode.IsPrint(r) && !blankButPrintable(r):
-			b.WriteRune(r)
-		case r > 0xFFFF:
-			fmt.Fprintf(&b, "\\U%08X", r)
-		default:
-			fmt.Fprintf(&b, "\\u%04X", r)
-		}
-		i += size
-	}
-	return b.String()
-}
-
-// blankButPrintable reports the runes unicode.IsPrint accepts that still
-// render as an empty cell. Kept as an explicit list rather than a category
-// test because there is no category that holds exactly these: the Hangul
-// fillers are Lo (letters) and the blank Braille pattern is So (a symbol).
-func blankButPrintable(r rune) bool {
-	switch r {
-	case 0x115F, // HANGUL CHOSEONG FILLER
-		0x1160, // HANGUL JUNGSEONG FILLER
-		0x3164, // HANGUL FILLER
-		0xFFA0, // HALFWIDTH HANGUL FILLER
-		0x2800: // BRAILLE PATTERN BLANK
-		return true
-	}
-	return false
 }
 
 // startReader launches the approver's single stdin reader goroutine. It

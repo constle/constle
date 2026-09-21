@@ -146,7 +146,22 @@ func describeTypeError(te *yaml.TypeError) error {
 func describeDecodeProblem(raw string) string {
 	line, key, typeName, ok := parseUnknownField(raw)
 	if !ok {
-		return raw
+		// The decoder's own sentence, quoted rather than passed through.
+		// It embeds the offending scalar, and yaml.v3 decodes escapes before
+		// it formats: a "\n" written into an Agentfile string arrives here
+		// as a real newline, and the CLI's stderr writer preserves the
+		// newlines of an error it is relaying — deliberately, since for
+		// nearly every caller the error IS the message. So a value that
+		// reaches the terminal through this branch could open a line of its
+		// own that reads as constle speaking.
+		//
+		// Held here, where the untrusted value enters the error, which is
+		// the only place it can be held: downstream the newline is
+		// indistinguishable from one constle wrote. Quoting and not dropping,
+		// for the same reason the rest of this file rewrites rather than
+		// swallows — an unrecognised complaint is still a complaint, and the
+		// author needs to read it. Same rule as the %q sites below.
+		return strconv.Quote(raw)
 	}
 
 	section, known := manifestSections()[typeName]
