@@ -1,8 +1,10 @@
 package manifest
 
 import (
+	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInferIsolation(t *testing.T) {
@@ -765,6 +767,100 @@ func TestValidateHumanGates(t *testing.T) {
 	m.HumanGates.ApprovalTimeoutSeconds = -5
 	if err := m.Validate(); err == nil {
 		t.Error("expected error for negative approval_timeout_seconds, got nil")
+	}
+}
+
+// TestValidateApprovalTimeoutIsRepresentable: the gate converts this field
+// with time.Duration(n) * time.Second, which wraps NEGATIVE above
+// maxSecondsField. A wrapped timeout makes the approval context expire the
+// moment it is created, so the gate never waits — and with on_timeout:
+// proceed it forwards the gated tool call with no human in the loop. Only
+// "> 0" was checked, so the whole range above the wrap point validated clean.
+func TestValidateApprovalTimeoutIsRepresentable(t *testing.T) {
+	for _, secs := range representableSeconds(
+		maxSecondsField+1, // the first value that stops meaning what it says
+		9223372037,        // converts to -9223372036709551616ns
+		18446744074,       // wraps all the way round to +290448384ns
+		math.MaxInt64/2,
+		math.MaxInt64,
+	) {
+		m := validManifestWithMCP()
+		m.HumanGates.ApprovalTimeoutSeconds = secs
+		m.HumanGates.OnTimeout = "proceed"
+		if err := m.Validate(); err == nil {
+			t.Errorf("approval_timeout_seconds=%d: want a validation error", secs)
+			continue
+		}
+		// And rejected for the right reason: the value must genuinely fail to
+		// survive the conversion. Checking only "converts negative" would be
+		// wrong — the product is modular, so far enough out it comes back
+		// round positive (18446744074 seconds becomes 290ms) and still has to
+		// be refused. The invariant is that the seconds do not round-trip.
+		if back := int64(time.Duration(secs)*time.Second) / int64(time.Second); back == int64(secs) {
+			t.Errorf("approval_timeout_seconds=%d round-trips cleanly to %d — rejected for the wrong reason", secs, back)
+		}
+	}
+
+	// The largest timeout this platform can express is still accepted, and
+	// still converts to a positive duration.
+	largest := largestValidSeconds()
+	m := validManifestWithMCP()
+	m.HumanGates.ApprovalTimeoutSeconds = largest
+	if err := m.Validate(); err != nil {
+		t.Errorf("the largest representable timeout (%d) must stay valid: %v", largest, err)
+	}
+	if d := time.Duration(largest) * time.Second; d <= 0 {
+		t.Errorf("%d does not convert to a positive duration: %v", largest, d)
+	}
+}
+
+// representableSeconds keeps only the values this platform's int can hold.
+// Both seconds fields are typed int, so on a 32-bit build nothing can exceed
+// maxSecondsField and the upper-bound branch is unreachable — there is no
+// value left to assert. Converting at run time rather than writing 64-bit
+// literals is also what lets this file compile on 386 at all: a constant that
+// overflows int is a compile error, and `go build ./...` never catches it
+// because it does not build test files.
+func representableSeconds(vs ...int64) []int {
+	var out []int
+	for _, v := range vs {
+		if c := int(v); int64(c) == v {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// largestValidSeconds is the biggest value these int fields accept here:
+// maxSecondsField on a 64-bit build, and the largest int on a 32-bit one,
+// which is below the bound and therefore always valid.
+func largestValidSeconds() int {
+	bound := maxSecondsField
+	largest := int(^uint(0) >> 1)
+	if int64(largest) > bound {
+		largest = int(bound)
+	}
+	return largest
+}
+
+// TestValidateLimits: max_duration_seconds was not validated at all. The
+// runtime arms its kill timer behind "> 0", so a negative value left the run
+// unbounded, and a value past the wrap point armed a timer that fires at once.
+func TestValidateLimits(t *testing.T) {
+	for _, secs := range representableSeconds(-1, -300, math.MinInt64, maxSecondsField+1, 9223372037, 18446744074, math.MaxInt64) {
+		m := validManifestWithMCP()
+		m.Limits.MaxDurationSeconds = secs
+		if err := m.Validate(); err == nil {
+			t.Errorf("max_duration_seconds=%d: want a validation error", secs)
+		}
+	}
+
+	for _, secs := range []int{0, 1, 300, largestValidSeconds()} {
+		m := validManifestWithMCP()
+		m.Limits.MaxDurationSeconds = secs
+		if err := m.Validate(); err != nil {
+			t.Errorf("max_duration_seconds=%d must stay valid: %v", secs, err)
+		}
 	}
 }
 

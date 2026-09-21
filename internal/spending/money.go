@@ -59,7 +59,16 @@ func ParseUSD(s string) (MicroCents, error) {
 		if r < '0' || r > '9' {
 			return 0, fmt.Errorf("invalid amount %q", s)
 		}
-		total += MicroCents(r-'0') * scale
+		// Guarded exactly like the whole-number loop above. Without this the
+		// fractional digits can add up to 99,999,999 micro-cents on top of an
+		// already-maximal total and wrap int64 negative — and a negative cap
+		// reads as "not declared" at every enforcement site, so a declared
+		// limit silently became no limit at all.
+		d := MicroCents(r-'0') * scale
+		if total > math.MaxInt64-d {
+			return 0, fmt.Errorf("amount %q is too large", s)
+		}
+		total += d
 		scale /= 10
 	}
 	return total, nil
@@ -69,8 +78,11 @@ func ParseUSD(s string) (MicroCents, error) {
 // trimmed (but always at least two decimal places), e.g. 150000000 → "1.50".
 func (m MicroCents) USD() string {
 	neg := ""
-	v := int64(m)
-	if v < 0 {
+	// The magnitude is taken in uint64: negating MinInt64 as an int64 leaves
+	// it negative, which printed the sign twice and the fraction negative
+	// ("--92233720368.-54775808"). Unsigned negation is exact for every value.
+	v := uint64(m)
+	if m < 0 {
 		neg, v = "-", -v
 	}
 	whole := v / microCentsPerUSD

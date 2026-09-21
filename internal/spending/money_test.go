@@ -2,6 +2,7 @@ package spending
 
 import (
 	"fmt"
+	"math"
 	"testing"
 )
 
@@ -17,6 +18,10 @@ func TestParseUSD(t *testing.T) {
 		"0.00000001": 1,
 		".25":        25_000_000,
 		"92000000":   9_200_000_000_000_000,
+		// The largest representable amount, to the micro-cent. Pinned in the
+		// good set on purpose: the overflow guard below must not be tightened
+		// into rejecting an amount that does fit.
+		"92233720368.54775807": math.MaxInt64,
 	}
 	for in, want := range good {
 		got, err := ParseUSD(in)
@@ -33,6 +38,14 @@ func TestParseUSD(t *testing.T) {
 		"", " ", "-1", "+1", "1e-6", "0.000000001", // 9 decimals — finer than 1e-8
 		"1.2.3", "abc", "$1", "1,000", "0x10",
 		"99999999999999999999", // overflows int64 micro-cents
+
+		// The whole-number loop was guarded and the fractional one was not, so
+		// these parsed to a NEGATIVE MicroCents with a nil error — and every
+		// enforcement site reads a non-positive cap as "not declared", which
+		// turned a declared limit into no limit at all.
+		"92233720368.54775808", // one micro-cent past the maximum
+		"92233720368.6",
+		"92233720368.99999999", // the largest fraction, on a maximal whole part
 	}
 	for _, in := range bad {
 		if got, err := ParseUSD(in); err == nil {
@@ -48,6 +61,13 @@ func TestUSDString(t *testing.T) {
 		300:         "0.000003",
 		50_000_000:  "0.50",
 		150_000_000: "1.50",
+		// Negative amounts cannot come from ParseUSD, but USD() renders values
+		// from the ledger and from audit events too. MinInt64 is the case that
+		// int64 negation cannot represent: it used to print as
+		// "--92233720368.-54775808".
+		-150_000_000:  "-1.50",
+		math.MinInt64: "-92233720368.54775808",
+		math.MaxInt64: "92233720368.54775807",
 	}
 	for in, want := range cases {
 		if got := in.USD(); got != want {

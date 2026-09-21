@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/url"
 	"os"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"golang.org/x/net/idna"
@@ -195,6 +197,10 @@ func (m *AgentManifest) Validate() error {
 		return err
 	}
 
+	if err := m.validateLimits(); err != nil {
+		return err
+	}
+
 	if err := m.validateHumanGates(); err != nil {
 		return err
 	}
@@ -355,6 +361,16 @@ func (m *AgentManifest) validateSpending() error {
 			// A zero cap would silently read as "unset" at enforcement time —
 			// ambiguous, so it fails closed here instead.
 			return fmt.Errorf("%s: a cap of 0 is ambiguous — omit the field to leave the limit unset", f.name)
+		}
+		if v < 0 {
+			// Unreachable while ParseUSD holds: it refuses a leading '-' and
+			// guards both of its accumulation loops, so no manifest string
+			// reaches here negative, and no test can drive this branch through
+			// the public API. It is kept deliberately, as the input boundary's
+			// own statement of the invariant: a negative cap reads as "not
+			// declared" at every enforcement site, and that failure is far too
+			// quiet to rest on one function's arithmetic staying correct.
+			return fmt.Errorf("%s: a negative cap (%s) is not a limit — omit the field to leave the limit unset", f.name, v.USD())
 		}
 	}
 
@@ -574,12 +590,53 @@ func a2aEndpointHost(rawURL string) (string, error) {
 	return normalizeHost(u.Hostname()), nil
 }
 
+// maxSecondsField bounds every *_seconds manifest field to what time.Duration
+// can represent. Duration is int64 nanoseconds, so above this value
+// time.Duration(n) * time.Second no longer means n seconds: the product is
+// modular, so it comes back as some other duration entirely. Just past the
+// bound that is a negative one, which every use site reads as "already
+// elapsed" — the approval context is dead before the prompt is drawn (and
+// on_timeout: proceed then forwards the gated call with no human in the
+// loop), and the run-duration timer fires at once. Further out it wraps round
+// again into small POSITIVE values: 18446744074 seconds converts to 290ms.
+// Both are the same defect — the wait that happens is not the wait that was
+// declared — which is why the bound is on representability rather than on any
+// particular wrong outcome.
+//
+// Held as int64 rather than int so the constant is representable on 32-bit
+// platforms too, where these int fields simply cannot reach it.
+const maxSecondsField int64 = int64(math.MaxInt64) / int64(time.Second)
+
+// validateLimits checks the run limits. A limit is enforced by a "> 0" test at
+// its use site, so a non-positive value there means "not declared" — the same
+// silent unenforcement a negative spending cap used to produce. Both ends of
+// the range fail closed here rather than at each reader.
+func (m *AgentManifest) validateLimits() error {
+	d := m.Limits.MaxDurationSeconds
+	if d < 0 {
+		return fmt.Errorf("limits.max_duration_seconds must not be negative, got %d — omit the field to leave the run unbounded", d)
+	}
+	if int64(d) > maxSecondsField {
+		return fmt.Errorf("limits.max_duration_seconds: %d exceeds the maximum representable duration of %d seconds — above it the value no longer converts to the time it names, so the run would be killed at some arbitrary earlier moment", d, maxSecondsField)
+	}
+	return nil
+}
+
 // validateHumanGates checks gate timing and notification channels.
 func (m *AgentManifest) validateHumanGates() error {
 	g := m.HumanGates
 
 	if g.ApprovalTimeoutSeconds < 0 {
 		return fmt.Errorf("human_gates.approval_timeout_seconds must be positive, got %d", g.ApprovalTimeoutSeconds)
+	}
+	if int64(g.ApprovalTimeoutSeconds) > maxSecondsField {
+		// Above this the value no longer converts to the time it names. Just
+		// past the bound it converts negative, so the approval context is
+		// already expired when it is created and on_timeout: proceed forwards
+		// the gated tool call before any human could answer; further out it
+		// converts to a fraction of a second, which ends the same way. A gate
+		// that reads as a 292-year wait must not be a gate that barely waits.
+		return fmt.Errorf("human_gates.approval_timeout_seconds: %d exceeds the maximum representable timeout of %d seconds — above it the value no longer converts to the time it names, so the gate would stop waiting almost immediately", g.ApprovalTimeoutSeconds, maxSecondsField)
 	}
 
 	switch g.OnTimeout {

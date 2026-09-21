@@ -32,7 +32,13 @@ func TestValidateSpendingAmounts(t *testing.T) {
 		"max_per_day_usd":   func(m *AgentManifest, v string) { m.Spending.MaxPerDayUSD = v },
 		"max_per_month_usd": func(m *AgentManifest, v string) { m.Spending.MaxPerMonthUSD = v },
 	} {
-		for _, bad := range []string{"abc", "-1", "1e3", "0.000000001", "0", "0.00"} {
+		// The last three overflowed int64 micro-cents in ParseUSD's fractional
+		// loop and validated CLEAN as a negative cap — which every enforcement
+		// site then read as "no cap declared".
+		for _, bad := range []string{
+			"abc", "-1", "1e3", "0.000000001", "0", "0.00",
+			"92233720368.54775808", "92233720368.6", "92233720368.99999999",
+		} {
 			m := validSpendingBase()
 			m.Identity.DID = testDID(t, 1) // so the day-cap DID rule doesn't mask the amount error
 			set(m, bad)
