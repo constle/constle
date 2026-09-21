@@ -36,6 +36,15 @@ jobs:
           # everything is what keeps it at zero.
           args: --timeout=5m
 
+      # The generated Squid configuration is only a string to Go. A directive
+      # this Squid does not accept satisfies every assertion in the suite and
+      # then fails every run in the field, at startup, in the proxy the whole
+      # sandbox depends on. Installing it here is what makes
+      # TestGeneratedConfigParsesUnderRealSquid load-bearing rather than a
+      # silent skip.
+      - name: Install Squid (for the generated-config parse test)
+        run: sudo apt-get update && sudo apt-get install -y squid
+
       - name: Test
         run: go test ./...
 

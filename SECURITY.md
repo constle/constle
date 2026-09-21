@@ -53,7 +53,7 @@ The following are in scope for security reports:
 ### Runtime & Sandbox
 - Sandbox escape: an agent process breaking out of its Firecracker microVM or gVisor container
 - Resource limit bypass: an agent consuming CPU, memory, disk, or network beyond its declared limits
-- Network egress bypass: an agent reaching hosts not listed in `capabilities.network.allowed_hosts`
+- Network egress bypass: an agent reaching hosts not listed in `sandbox.network.allowed_hosts`
 - Filesystem mount bypass: an agent reading or writing paths outside its declared mounts
 - Secret leakage: secrets injected at `/run/secrets` accessible outside the sandbox
 

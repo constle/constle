@@ -543,7 +543,9 @@ allowed_hosts:
 
 Entries are hostnames. An entry beginning with `.` matches that domain and all
 its subdomains; otherwise the match is exact. Ports, schemes, and paths are not
-part of the matching.
+part of the matching — an entry names a host, and the ports that host is
+reachable on are fixed by the proxy, not by the entry (see **Destinations and
+ports** below).
 
 Each entry must be a plain hostname: dot-separated labels of lowercase ASCII
 letters, digits, and hyphens (no leading or trailing hyphen, at most 63
@@ -561,7 +563,9 @@ Squid still matched would otherwise slip past them.
 An IPv4 address written in dotted-quad form satisfies this grammar and is
 accepted. Squid then matches it literally, so listing an address permits
 connections to it; the raw-IP rule described under enforcement refuses only
-addresses that are not listed.
+addresses that are not listed. Listing one does not exempt it from the
+destination rule below: a private or link-local address is refused whether it
+was written into the allowlist or arrived as the answer to a DNS query.
 
 The provider hosts used as examples in this document (`api.groq.com`, `api.openai.com`, `api.anthropic.com`, etc.) are illustrative, not endorsements or defaults — substitute whatever hosts the agent's actual tools and model calls need.
 
@@ -578,6 +582,26 @@ drops privileges to). Constle resolves such details from the host at runtime
 rather than assuming any one distribution; `scripts/setup-firecracker` checks
 for the required host tools up front. The Docker backend is unaffected — its
 proxy runs inside a pinned container image.
+
+**Destinations and ports.** An allowlisted name settles which host, not where
+that host turns out to be or what may be carried to it.
+
+Matching is literal, and with reverse lookups disabled: a destination address
+matches only an entry spelling that same address, never by being resolved back
+to a name — a PTR record naming an allowlisted host does not admit the
+address, and that record is written by the address's owner. Separately, the
+address a name resolves to is checked, and a destination in the loopback,
+link-local (which is where cloud instance metadata lives), private, CGNAT or
+unspecified ranges is refused — in both address families, and whatever the DNS answer
+said. That check has to be made on the resolved address: no validation of the
+entry itself can know where a name will point at run time, and the per-run
+proxy reaches the host's own network.
+
+Ports are fixed: a request may name port 80 or 443, and a `CONNECT` tunnel may
+name 443 alone. Without that, an allowlisted hostname is a raw TCP tunnel to
+any port it listens on — SSH, a database, an internal admin service — since the tunnel's
+contents are opaque to the proxy by construction. A host that must be reached
+on another port is out of scope for the allowlist as it stands.
 
 Blocked attempts are recorded as `network_blocked` audit events; permitted ones
 as `network_allowed`.
