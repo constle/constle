@@ -141,16 +141,86 @@ printf "\n\033[1mconstle installer\033[0m\n\n"
 # because anyone who can point this at your own machine is already running
 # code on it.
 #
+# What is compared is the URL's AUTHORITY - what follows "://" and precedes
+# the first "/" - and never a prefix of the URL as a string. A prefix test
+# reads
+#
+#   http://127.0.0.1:80@evil.example/x
+#
+# as loopback, because the string does begin with "http://127.0.0.1:". curl
+# reads the same string the way RFC 3986 says to: everything before the "@"
+# is userinfo, so "127.0.0.1:80" is a username and the host is evil.example.
+# Of the two readings, the one that fetches the bytes is curl's. All three
+# loopback spellings below were reachable that way, not only the IPv4 one.
+#
 # This runs here, rather than beside the assignments, because error() has to
 # exist before anything can call it.
 # ---------------------------------------------------------------------------
+
+# url_authority prints the authority of the URL in $1: what follows "://", up
+# to the first "/", "?" or "#". The caller has already established that there
+# is a scheme.
+#
+# All three terminators are handled, not just "/", so that the authority this
+# returns is the authority RFC 3986 defines. Stopping at "/" alone would fold
+# a query or a fragment into the result, which can only ever refuse more than
+# intended - but it would also report the wrong reason, and a refusal that
+# names the wrong cause is how a correct rule gets "fixed" into a hole later.
+#
+# The "?" is backslash-escaped because it is a pattern here, not a literal:
+# unescaped, "${_rest%%?*}" matches any single character and strips the whole
+# string to nothing.
+url_authority() {
+  _rest="${1#*://}"
+  _rest="${_rest%%/*}"
+  _rest="${_rest%%\?*}"
+  printf '%s' "${_rest%%#*}"
+}
+
+# is_loopback_authority succeeds only for an authority that names this machine
+# and carries nothing else: one of the three loopback spellings, optionally
+# followed by ":" and a port that is digits and nothing but digits.
+#
+# The port is examined rather than skipped over, because the port is where the
+# bypass lived. In "127.0.0.1:80@evil.example" the text after the colon is
+# "80@evil.example", and a test that stops looking once it has seen the colon
+# accepts the whole thing.
+is_loopback_authority() {
+  case "$1" in
+    '127.0.0.1' | 'localhost' | '[::1]') return 0 ;;
+    '127.0.0.1:'*) _port="${1#127.0.0.1:}" ;;
+    'localhost:'*) _port="${1#localhost:}" ;;
+    '[::1]:'*)     _port="${1#\[::1\]:}"   ;;
+    *) return 1 ;;
+  esac
+  # An empty port is not a port. "http://127.0.0.1:/" has no use here, and a
+  # spelling nothing needs is a spelling nothing tests.
+  case "$_port" in '' | *[!0-9]*) return 1 ;; esac
+  return 0
+}
+
+_url_rules='CONSTLE_INSTALL_BASE_URL and CONSTLE_INSTALL_API_URL must be https:// URLs\n(or a loopback http:// address). Nothing has been installed.'
+
 for _url in "$BASE_URL" "$API_BASE_URL"; do
   case "$_url" in
-    https://*) ;;
-    'http://127.0.0.1' | 'http://127.0.0.1:'* | 'http://127.0.0.1/'*) ;;
-    'http://localhost' | 'http://localhost:'* | 'http://localhost/'*) ;;
-    'http://[::1]'     | 'http://[::1]:'*     | 'http://[::1]/'*)     ;;
-    *) error "refusing to download from ${_url}\nCONSTLE_INSTALL_BASE_URL and CONSTLE_INSTALL_API_URL must be https:// URLs\n(or a loopback http:// address). Nothing has been installed." ;;
+    https://* | http://*) ;;
+    *) error "refusing to download from ${_url}\n${_url_rules}" ;;
+  esac
+
+  _authority="$(url_authority "$_url")"
+
+  # Userinfo is refused under both schemes. Over https it is not a downgrade -
+  # the transport is still authenticated - but it is the same address
+  # confusion, and a release mirror has no reason to carry credentials in its
+  # URL. Stating the rule once is cheaper than reasoning about it per scheme.
+  case "$_authority" in
+    *@*) error "refusing to download from ${_url}\nThat fetches from ${_authority##*@}, not ${_authority%%@*}: everything before\nthe '@' is a username, not an address.\n${_url_rules}" ;;
+  esac
+
+  case "$_url" in
+    http://*)
+      is_loopback_authority "$_authority" ||
+        error "refusing to download from ${_url}\n${_url_rules}" ;;
   esac
 done
 
@@ -233,16 +303,29 @@ fi
 #   -S  still show error messages even with -s
 #   -L  follow redirects (GitHub sends release assets to a storage host)
 #
-# --proto and --proto-redir hold the transfer to HTTPS, the second one across
-# those redirects. curl's own default allows a redirect to drop to plain HTTP,
-# and plain HTTP is exactly the position from which someone could serve a
-# matching pair of archive and checksums.txt. The pin is applied per URL, so
-# pointing this script at a non-HTTPS mirror or at the test server still works
-# — there is nothing to downgrade from in that case.
+# --proto and --proto-redir hold the transfer to one scheme, the second one
+# across redirects. curl's own default allows a redirect to drop to plain
+# HTTP, and plain HTTP is exactly the position from which someone could serve
+# a matching pair of archive and checksums.txt.
+#
+# The https branch follows redirects because GitHub sends release assets to a
+# storage host, and pins every hop to https.
+#
+# The loopback branch takes no hops at all. --proto and --proto-redir are
+# protocol allowlists and say nothing about WHERE a redirect points, so a
+# loopback server answering "302 Location: http://elsewhere/" would be
+# followed - and the authority check above, which is the whole reason plain
+# HTTP is allowed at all, is applied to the URL the operator supplied and
+# never to that one. --max-redirs 0 is what makes the exception mean what it
+# says: this machine, plain HTTP, and no onward hop.
+#
+# It has to be --max-redirs 0 rather than dropping -L. Without -L, curl treats
+# a 302 as a completed transfer: exit 0 and an empty body, which reads as a
+# successful download of nothing. With it, the refusal is loud (exit 47).
 fetch() {
   case "$1" in
     https://*) curl -fsSL --proto '=https' --proto-redir '=https' "$1" ;;
-    *)         curl -fsSL "$1" ;;
+    *)         curl -fsSL --proto '=http'  --proto-redir '=http' --max-redirs 0 "$1" ;;
   esac
 }
 
