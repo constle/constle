@@ -46,11 +46,12 @@ import (
 // compilation here rather than silently leaving every test pointed at the real
 // github.com — which would turn this whole file green and meaningless.
 const (
-	envBaseURL    = "CONSTLE_INSTALL_BASE_URL"
-	envAPIURL     = "CONSTLE_INSTALL_API_URL"
-	envInstallDir = "CONSTLE_INSTALL_DIR"
-	envRequireSig = "CONSTLE_REQUIRE_SIGNATURE"
-	envVersion    = "CONSTLE_VERSION"
+	envBaseURL       = "CONSTLE_INSTALL_BASE_URL"
+	envAPIURL        = "CONSTLE_INSTALL_API_URL"
+	envInstallDir    = "CONSTLE_INSTALL_DIR"
+	envRequireSig    = "CONSTLE_REQUIRE_SIGNATURE"
+	envAllowUnsigned = "CONSTLE_ALLOW_UNSIGNED"
+	envVersion       = "CONSTLE_VERSION"
 
 	// Must match the shell's v[0-9]* glob, or scripts/install treats it as a
 	// commit sha and builds from source instead of downloading anything.
@@ -448,11 +449,15 @@ func writeShim(t *testing.T, dir, name, script string) {
 }
 
 type runOpts struct {
-	binDir     string            // PATH for the child; defaults to base tools + sha256sum
-	withCosign bool              // put the cosign stub on PATH
-	argvLog    string            // where the stub records its arguments
-	env        map[string]string // extra or overriding variables
-	installDir string            // filled in by run, for assertions
+	binDir string // PATH for the child; defaults to base tools + sha256sum
+	// The cosign stub is on PATH by default, because an install that cannot
+	// run cosign now refuses. Opting OUT is what a test does when the absence
+	// of cosign is the thing under test; leaving this false in a new test can
+	// no longer make it pass by silently exercising the refusal path instead.
+	withoutCosign bool
+	argvLog       string            // where the stub records its arguments
+	env           map[string]string // extra or overriding variables
+	installDir    string            // filled in by run, for assertions
 }
 
 type result struct {
@@ -481,7 +486,7 @@ func run(t *testing.T, g *fakeGitHub, argv []string, o *runOpts) result {
 
 	path := o.binDir
 	stubMarker := ""
-	if o.withCosign {
+	if !o.withoutCosign {
 		path = path + string(os.PathListSeparator) + cosignStubDir
 		// Without this the stub binary — which is this test binary — would
 		// start as an ordinary test binary and run the entire suite again,
@@ -682,9 +687,8 @@ func TestShInstallsPinnedRelease(t *testing.T) {
 	argv := filepath.Join(t.TempDir(), "argv.log")
 
 	res := runSh(t, g, &runOpts{
-		withCosign: true,
-		argvLog:    argv,
-		env:        map[string]string{envVersion: testTag},
+		argvLog: argv,
+		env:     map[string]string{envVersion: testTag},
 	})
 
 	assertInstalled(t, res, "constle")
@@ -995,9 +999,8 @@ func TestCosignFailureIsRefused(t *testing.T) {
 			g := newFakeGitHub(t, fx)
 
 			res := tc.run(t, g, &runOpts{
-				withCosign: true,
-				argvLog:    filepath.Join(t.TempDir(), "argv.log"),
-				env:        map[string]string{stubExitEnv: "1"},
+				argvLog: filepath.Join(t.TempDir(), "argv.log"),
+				env:     map[string]string{stubExitEnv: "1"},
 			})
 			assertRefused(t, res, "SIGNATURE VERIFICATION FAILED")
 			assertNotExtracted(t, res)
@@ -1021,8 +1024,7 @@ func TestCosignExitStatusBeatsItsOutput(t *testing.T) {
 				fx := buildFixtures(t)
 				g := newFakeGitHub(t, fx)
 				res := runner.run(t, g, &runOpts{
-					withCosign: true,
-					argvLog:    filepath.Join(t.TempDir(), "argv.log"),
+					argvLog: filepath.Join(t.TempDir(), "argv.log"),
 					env: map[string]string{
 						stubExitEnv: "1",
 						stubSayEnv:  "Verified OK",
@@ -1035,8 +1037,7 @@ func TestCosignExitStatusBeatsItsOutput(t *testing.T) {
 				fx := buildFixtures(t)
 				g := newFakeGitHub(t, fx)
 				res := runner.run(t, g, &runOpts{
-					withCosign: true,
-					argvLog:    filepath.Join(t.TempDir(), "argv.log"),
+					argvLog: filepath.Join(t.TempDir(), "argv.log"),
 					env: map[string]string{
 						stubSayEnv: "error: no matching signatures found",
 					},
@@ -1065,7 +1066,7 @@ func TestCosignIsCalledWithThePinnedIdentity(t *testing.T) {
 			g := newFakeGitHub(t, fx)
 			argv := filepath.Join(t.TempDir(), "argv.log")
 
-			res := runner.run(t, g, &runOpts{withCosign: true, argvLog: argv})
+			res := runner.run(t, g, &runOpts{argvLog: argv})
 			if res.exit != 0 {
 				t.Fatalf("exit = %d, want 0\n%s", res.exit, res.out())
 			}
@@ -1130,32 +1131,39 @@ func TestCosignIsCalledWithThePinnedIdentity(t *testing.T) {
 	}
 }
 
-// The acknowledged downgrades, pinned as tests so that changing either one
-// later is a visible change to this file rather than a silent drift.
+// CATCHES: the lenient default coming back.
 //
-// Both are load-bearing today: the only published release, v0.5.0, has a
-// checksums.txt but no checksums.txt.sig or .pem — they 404.
-func TestSignatureAbsenceDowngradesLoudly(t *testing.T) {
+// Until 2026-09, both scripts printed a line and installed anyway when the
+// signature could not be checked. That was the default path, so it was the
+// path essentially every install took: v0.5.0 ships no checksums.txt.sig at
+// all, and cosign is not on a typical machine. checksums.txt comes from the
+// same release as the archive, so against anyone who can write to that release
+// it agrees with whatever they put there — the lenient path bought a
+// corruption check and nothing else, while the README promised a signature.
+//
+// Both reasons are tested, because they fail in different places in the script:
+// one before cosign would be invoked at all, one after the .sig fetch 404s.
+func TestUnsignedReleaseIsRefusedByDefault(t *testing.T) {
 	t.Parallel()
 	for _, runner := range []struct {
 		name string
 		run  func(*testing.T, *fakeGitHub, *runOpts) result
-		bin  string
-	}{{"sh", runSh, "constle"}, {"ps1", runPs1, "constle.exe"}} {
+	}{{"sh", runSh}, {"ps1", runPs1}} {
 		t.Run(runner.name, func(t *testing.T) {
 			t.Run("cosign_not_installed", func(t *testing.T) {
+				t.Parallel()
 				fx := buildFixtures(t)
 				g := newFakeGitHub(t, fx)
 				argv := filepath.Join(t.TempDir(), "argv.log")
 
-				res := runner.run(t, g, &runOpts{argvLog: argv}) // no cosign on PATH
-				assertInstalled(t, res, runner.bin)
+				res := runner.run(t, g, &runOpts{withoutCosign: true, argvLog: argv})
+				assertRefused(t, res, "cosign is not installed")
+				assertNotExtracted(t, res)
 
-				if !strings.Contains(res.out(), "cosign is not installed") {
-					t.Errorf("the skipped signature check was not reported\n%s", res.out())
-				}
-				if !strings.Contains(res.out(), "signature NOT checked") {
-					t.Errorf("the success line claims more than was verified\n%s", res.out())
+				// The refusal has to say what to do about it, or it just gets
+				// worked around with a download from the releases page.
+				if !strings.Contains(res.out(), envAllowUnsigned) {
+					t.Errorf("the refusal does not name %s, the one way past it\n%s", envAllowUnsigned, res.out())
 				}
 				if _, err := os.Stat(argv); err == nil {
 					t.Error("cosign was invoked even though it is not on PATH")
@@ -1164,16 +1172,20 @@ func TestSignatureAbsenceDowngradesLoudly(t *testing.T) {
 
 			for _, missing := range []string{"checksums.txt.sig", "checksums.txt.pem"} {
 				t.Run("release_missing_"+missing, func(t *testing.T) {
+					t.Parallel()
 					fx := buildFixtures(t)
 					delete(fx.assets, missing)
 					g := newFakeGitHub(t, fx)
 					argv := filepath.Join(t.TempDir(), "argv.log")
 
-					res := runner.run(t, g, &runOpts{withCosign: true, argvLog: argv})
-					assertInstalled(t, res, runner.bin)
+					res := runner.run(t, g, &runOpts{argvLog: argv})
+					assertRefused(t, res, "without a signature")
+					assertNotExtracted(t, res)
 
-					if !strings.Contains(res.out(), "without a signature") {
-						t.Errorf("an unsigned release was not reported as such\n%s", res.out())
+					// Installing cosign cannot fix a release that has no
+					// signature, so the refusal must not tell anyone to.
+					if strings.Contains(res.out(), "Install cosign") {
+						t.Errorf("an unsigned release is blamed on the local cosign\n%s", res.out())
 					}
 					if _, err := os.Stat(argv); err == nil {
 						t.Error("cosign was invoked with no signature to check")
@@ -1184,16 +1196,18 @@ func TestSignatureAbsenceDowngradesLoudly(t *testing.T) {
 	}
 }
 
-// CATCHES: the opt-in being honoured only for the literal string "1".
-// Measured before the fix: CONSTLE_REQUIRE_SIGNATURE=true installed happily,
-// exit 0, with output identical to an unconfigured run. In PowerShell,
-// 'true' -eq '1' is False.
-func TestRequireSignatureRefusesWhenItCannotCheck(t *testing.T) {
+// CATCHES: the opt-out being honoured only for the literal string "1", and the
+// warning that goes with it being dropped or demoted to an ordinary step line.
+//
+// The whole value of an escape hatch is that it is loud. An unsigned install
+// that reads exactly like a verified one is how the old default survived.
+func TestAllowUnsignedInstallsWithALoudWarning(t *testing.T) {
 	t.Parallel()
 	for _, runner := range []struct {
 		name string
 		run  func(*testing.T, *fakeGitHub, *runOpts) result
-	}{{"sh", runSh}, {"ps1", runPs1}} {
+		bin  string
+	}{{"sh", runSh, "constle"}, {"ps1", runPs1, "constle.exe"}} {
 		t.Run(runner.name, func(t *testing.T) {
 			for _, value := range []string{"1", "true", "YES"} {
 				t.Run("value_"+value, func(t *testing.T) {
@@ -1202,27 +1216,202 @@ func TestRequireSignatureRefusesWhenItCannotCheck(t *testing.T) {
 					g := newFakeGitHub(t, fx)
 
 					res := runner.run(t, g, &runOpts{
-						env: map[string]string{envRequireSig: value},
+						withoutCosign: true,
+						env:           map[string]string{envAllowUnsigned: value},
 					})
-					assertRefused(t, res, "CONSTLE_REQUIRE_SIGNATURE")
-					assertNotExtracted(t, res)
+					assertInstalled(t, res, runner.bin)
+
+					if !strings.Contains(res.out(), "cosign is not installed") {
+						t.Errorf("the skipped signature check was not reported\n%s", res.out())
+					}
+					if !strings.Contains(res.out(), "signature NOT checked") {
+						t.Errorf("the success line claims more than was verified\n%s", res.out())
+					}
+					if !strings.Contains(res.out(), envAllowUnsigned) {
+						t.Errorf("the output does not say which setting weakened this install\n%s", res.out())
+					}
+
+					// scripts/install writes warnings to stderr on purpose, so
+					// that `curl | sh | tee log` and a scrollback that kept only
+					// the last few lines both still show it. PowerShell's
+					// Write-Host goes to stdout whatever colour it is, so this
+					// half of the assertion is sh-only rather than fudged into
+					// something both can pass.
+					if runner.name == "sh" && !strings.Contains(res.stderr, envAllowUnsigned) {
+						t.Errorf("the downgrade notice did not reach stderr\nstderr: %s", res.stderr)
+					}
 				})
 			}
 
-			// The same opt-in must also bite when cosign is present but the
-			// release carries no signature.
-			t.Run("cosign_present_release_unsigned", func(t *testing.T) {
+			// The other reason: cosign is here, the release is not signed.
+			t.Run("release_unsigned", func(t *testing.T) {
+				t.Parallel()
 				fx := buildFixtures(t)
 				delete(fx.assets, "checksums.txt.sig")
 				g := newFakeGitHub(t, fx)
 
 				res := runner.run(t, g, &runOpts{
-					withCosign: true,
-					argvLog:    filepath.Join(t.TempDir(), "argv.log"),
-					env:        map[string]string{envRequireSig: "1"},
+					env: map[string]string{envAllowUnsigned: "1"},
 				})
-				assertRefused(t, res, "CONSTLE_REQUIRE_SIGNATURE")
+				assertInstalled(t, res, runner.bin)
+				if !strings.Contains(res.out(), "without a signature") {
+					t.Errorf("an unsigned release was not reported as such\n%s", res.out())
+				}
 			})
+		})
+	}
+}
+
+// CATCHES: a falsy spelling of the opt-out being treated as opting out.
+//
+// Nothing pinned this direction before: every test set the old opt-in to a
+// truthy value, so a parser that treated any non-empty string as "yes" —
+// including "0" and "false" — would have passed the whole suite while doing
+// the opposite of what the variable says.
+func TestAllowUnsignedFalsySpellingsDoNotOptOut(t *testing.T) {
+	t.Parallel()
+	for _, runner := range []struct {
+		name string
+		run  func(*testing.T, *fakeGitHub, *runOpts) result
+	}{{"sh", runSh}, {"ps1", runPs1}} {
+		t.Run(runner.name, func(t *testing.T) {
+			for _, value := range []string{"0", "false", "no", "NO", ""} {
+				t.Run("value_"+value, func(t *testing.T) {
+					t.Parallel()
+					fx := buildFixtures(t)
+					g := newFakeGitHub(t, fx)
+
+					res := runner.run(t, g, &runOpts{
+						withoutCosign: true,
+						env:           map[string]string{envAllowUnsigned: value},
+					})
+					assertRefused(t, res, "cosign is not installed")
+					assertNotExtracted(t, res)
+				})
+			}
+		})
+	}
+}
+
+// CATCHES: the opt-out reaching the branch it must never reach.
+//
+// This is the invariant the whole design rests on. CONSTLE_ALLOW_UNSIGNED
+// covers "there was nothing to check". A signature that WAS checked and came
+// back bad is a different event entirely, and no environment variable may
+// forgive it — an override there would turn every blocked network, every
+// proxy, every failed fetch into a silent downgrade.
+func TestAllowUnsignedDoesNotRescueAFailedSignature(t *testing.T) {
+	t.Parallel()
+	for _, runner := range []struct {
+		name string
+		run  func(*testing.T, *fakeGitHub, *runOpts) result
+	}{{"sh", runSh}, {"ps1", runPs1}} {
+		t.Run(runner.name, func(t *testing.T) {
+			t.Parallel()
+			fx := buildFixtures(t)
+			g := newFakeGitHub(t, fx)
+
+			res := runner.run(t, g, &runOpts{
+				argvLog: filepath.Join(t.TempDir(), "argv.log"),
+				env: map[string]string{
+					envAllowUnsigned: "1",
+					stubExitEnv:      "1",
+				},
+			})
+			assertRefused(t, res, "SIGNATURE VERIFICATION FAILED")
+			assertNotExtracted(t, res)
+		})
+	}
+}
+
+// CATCHES: the opt-out leaking into link 2 of the chain.
+//
+// It is named for the signature and must touch nothing else. A tampered
+// archive is refused on the checksum alone, opt-out or not.
+func TestAllowUnsignedDoesNotWeakenTheChecksum(t *testing.T) {
+	t.Parallel()
+	for _, runner := range []struct {
+		name   string
+		run    func(*testing.T, *fakeGitHub, *runOpts) result
+		tamper func(*testing.T, *fixtures)
+	}{
+		{"sh", runSh, func(t *testing.T, f *fixtures) {
+			f.assets[f.shArchive] = makeTarGz(t, "constle", tamperedMarker)
+		}},
+		{"ps1", runPs1, func(t *testing.T, f *fixtures) {
+			f.assets[f.psArchive] = makeZip(t, "constle.exe", tamperedMarker)
+		}},
+	} {
+		t.Run(runner.name, func(t *testing.T) {
+			t.Parallel()
+			fx := buildFixtures(t)
+			good := checksumsFor(fx.assets) // digests of the genuine archives
+			runner.tamper(t, fx)
+			fx.assets["checksums.txt"] = []byte(good)
+			g := newFakeGitHub(t, fx)
+
+			res := runner.run(t, g, &runOpts{
+				withoutCosign: true,
+				env:           map[string]string{envAllowUnsigned: "1"},
+			})
+			assertRefused(t, res, "CHECKSUM MISMATCH")
+			assertNotExtracted(t, res)
+		})
+	}
+}
+
+// CATCHES: CONSTLE_REQUIRE_SIGNATURE=0 reinstating the old lenient default.
+//
+// The variable was the opt-IN back when leniency was the default. A CI file
+// still carrying it must not be silently ignored, and — the part that matters —
+// the one spelling that would weaken anything has to be refused rather than
+// honoured. Honouring it would reopen the hole by name.
+func TestLegacyRequireSignatureIsRedundantAndNeverWeakens(t *testing.T) {
+	t.Parallel()
+	for _, runner := range []struct {
+		name string
+		run  func(*testing.T, *fakeGitHub, *runOpts) result
+		bin  string
+	}{{"sh", runSh, "constle"}, {"ps1", runPs1, "constle.exe"}} {
+		t.Run(runner.name, func(t *testing.T) {
+			// Truthy: redundant. The install still succeeds, because a
+			// verified signature is now what happens anyway.
+			for _, value := range []string{"1", "true", "YES"} {
+				t.Run("redundant_"+value, func(t *testing.T) {
+					t.Parallel()
+					fx := buildFixtures(t)
+					g := newFakeGitHub(t, fx)
+
+					res := runner.run(t, g, &runOpts{
+						env: map[string]string{envRequireSig: value},
+					})
+					assertInstalled(t, res, runner.bin)
+					if !strings.Contains(res.out(), "redundant") {
+						t.Errorf("a legacy setting was accepted in silence\n%s", res.out())
+					}
+				})
+			}
+
+			// Falsy: reported and ignored, never honoured.
+			for _, value := range []string{"0", "false", "no"} {
+				t.Run("ignored_"+value, func(t *testing.T) {
+					t.Parallel()
+					fx := buildFixtures(t)
+					g := newFakeGitHub(t, fx)
+
+					res := runner.run(t, g, &runOpts{
+						withoutCosign: true,
+						env:           map[string]string{envRequireSig: value},
+					})
+					assertRefused(t, res, "cosign is not installed")
+					assertNotExtracted(t, res)
+
+					if !strings.Contains(res.out(), "is ignored") {
+						t.Errorf("%s=%s was honoured or dropped silently instead of being reported\n%s",
+							envRequireSig, value, res.out())
+					}
+				})
+			}
 		})
 	}
 }
@@ -1489,13 +1678,41 @@ func TestInstallersPinTheSigningIdentity(t *testing.T) {
 
 		// An env-var allowlist only catches the escape hatches somebody
 		// already thought of. This catches the next one.
+		//
+		// CONSTLE_ALLOW_UNSIGNED is deliberately not on this list, and matches no
+		// entry on it: it does not switch verification off, it acknowledges that
+		// there was nothing to verify. The names below are the ones that would.
 		lower := strings.ToLower(body)
 		for _, forbidden := range []string{
 			"skip_check", "skip_sig", "skip_verify", "no_verify", "--insecure-",
+			"skip_signature", "allow_unverified", "allow_bad_sig", "ignore_sig",
 		} {
 			if strings.Contains(lower, forbidden) {
 				t.Errorf("%s contains %q, which reads like a way to switch verification off", name, forbidden)
 			}
+		}
+	}
+
+	// The opt-out has to be spelled identically everywhere, including in the
+	// README: a refusal that names a variable the script does not read is worse
+	// than no refusal, because it sends people to the releases page to download
+	// by hand instead.
+	for name, body := range map[string]string{"scripts/install": sh, "scripts/install.ps1": ps, "README.md": readme} {
+		if !strings.Contains(body, envAllowUnsigned) {
+			t.Errorf("%s does not name %s", name, envAllowUnsigned)
+		}
+	}
+
+	// The README described the old lenient default for as long as it was true.
+	// Leaving that text after the default flipped would document a guarantee
+	// nobody gets — which is the failure this whole change is about.
+	for _, stale := range []string{
+		"makes the signature mandatory",
+		"enforces the checksum alone",
+		"no release publishes one yet",
+	} {
+		if strings.Contains(readme, stale) {
+			t.Errorf("README.md still describes the old lenient installer: %q", stale)
 		}
 	}
 
