@@ -1,7 +1,10 @@
 package manifest
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -20,15 +23,39 @@ func ParseFile(path string) (*AgentManifest, error) {
 		return nil, fmt.Errorf("cannot read Agentfile at %q: %w", path, err)
 	}
 
-	return Parse(data)
+	m, err := Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return m, nil
 }
 
 // Parse unmarshals YAML bytes into an AgentManifest.
 // Useful for tests — callers can supply YAML directly without a file.
+//
+// Decoding is strict: a key the schema does not define is an error, not a
+// silent no-op. Every control in an Agentfile is opt-in, so a key that is
+// quietly discarded removes the control it was meant to declare —
+// `capabilties:` empties the capability list and drops the isolation floor to
+// none, `requre_approval_for:` leaves a gate declared and unarmed. The failure
+// is invisible in both cases: the manifest validates, and the CLI reports the
+// weakened configuration as though it had been asked for. Strict decoding is
+// the same judgement already made for an unrecognised capability value and an
+// unrecognised isolation level, applied to the key rather than the value.
 func Parse(data []byte) (*AgentManifest, error) {
 	var m AgentManifest
 
-	if err := yaml.Unmarshal(data, &m); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	// An empty or comment-only document decodes to nothing and returns io.EOF,
+	// where yaml.Unmarshal returned no error at all. Keep the old behaviour:
+	// the defaults below still apply, and Validate is what refuses the file,
+	// naming the missing apiVersion rather than an unexplained EOF.
+	if err := dec.Decode(&m); err != nil && !errors.Is(err, io.EOF) {
+		var typeErr *yaml.TypeError
+		if errors.As(err, &typeErr) {
+			return nil, describeTypeError(typeErr)
+		}
 		return nil, fmt.Errorf("invalid YAML in Agentfile: %w", err)
 	}
 

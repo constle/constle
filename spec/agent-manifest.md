@@ -1,9 +1,9 @@
 # Constle AgentManifest Specification
 
-**Spec version:** 0.2.0
+**Spec version:** 0.3.0
 **apiVersion:** `constle.dev/v1alpha1`
 **Status:** Draft. Field names and semantics may change before v1.0.
-**Last updated:** 2026-09-13
+**Last updated:** 2026-09-21
 **Source of truth:** `pkg/manifest/manifest.go` and `pkg/manifest/parser.go`
 **Annotated reference file:** [`spec/agent-manifest.yaml`](https://github.com/constle/constle/blob/main/spec/agent-manifest.yaml)
 **Canonical URL:** https://docs.constle.dev/reference/agent-manifest/
@@ -119,6 +119,17 @@ metadata: ...      # descriptive only
 ```
 
 All sections except `apiVersion`, `kind`, and `identity.name` are optional.
+
+A key this specification does not define is a **validation error**, not a
+warning and not a silently ignored line. Every control in an Agentfile is
+opt-in, so a discarded key removes the control it was written to declare:
+`capabilties:` empties the capability list and drops the isolation floor,
+`requre_approval_for:` leaves a gate declared and unarmed. Neither failure is
+visible — the manifest validates, and the runtime reports the weakened
+configuration as if it had been asked for. Matching is exact, so a
+case-variant key (`apiversion:`) is rejected on the same grounds as a
+misspelled one. The only open namespace is `metadata.labels`, whose keys are
+free-form by design.
 
 ---
 
@@ -1388,6 +1399,7 @@ inert or bypassed.
 | An `mcp.servers[].pricing` block must declare at least one meter | Would read as priced while metering nothing |
 | `human_gates.notify[].channel` must be `webhook`, with a `url_secret_ref` | A declared notification path must never look real when it isn't |
 | An unrecognised capability is rejected | A typo must not silently lower the capability floor |
+| An unrecognised key is rejected (§3) | A typo must not silently drop the control the key declares |
 | A declared `sandbox.isolation` may not be weaker than its capabilities require | Writing the line must not make the boundary weaker than omitting it |
 
 Warnings — surfaced, but not fatal — cover the cases where a declaration is
@@ -1562,7 +1574,7 @@ by any declared server, `constle validate` would warn that they gate nothing.
 
 | Number | What it versions | Current |
 |--------|-----------------|---------|
-| **Spec version** | This document — its prose, structure, and accuracy | `0.2.0` |
+| **Spec version** | This document — its prose, structure, and accuracy | `0.3.0` |
 | **`apiVersion`** | The wire format the runtime accepts | `constle.dev/v1alpha1` |
 
 The spec version changes whenever this document changes materially, including
@@ -1616,6 +1628,39 @@ called out in the changelog.
 ---
 
 ## 20. Changelog
+
+### 0.3.0 — 2026-09-21
+
+**Changed — an unrecognised key is now rejected (§3, §16):**
+
+- The runtime decoded Agentfiles leniently: a key this specification does not
+  define was discarded without a word. Because every control here is opt-in,
+  a discarded key silently removed a control — `capabilties:` produced an
+  empty capability list and an isolation floor of `none`, `requre_approval_for:`
+  produced a gate section with nothing in it. The manifest then validated, and
+  `constle validate` reported the weakened configuration as the intended one.
+  Unknown keys are now errors, reported together with the line, the section,
+  its accepted keys, and the nearest match.
+- Matching is exact, so `apiversion:` and `Human_Gates:` are rejected for the
+  same reason as a misspelling; the runtime never guessed which key was meant
+  and does not start now.
+- `metadata.labels` is unaffected: its keys are an open namespace by design.
+- This is a **breaking change** under §19.3 — a previously valid manifest is
+  now rejected — and it is not covered by any §19.4 exemption. It is recorded
+  here rather than treated as a bug fix. `apiVersion` is unchanged: `v1alpha1`
+  is documented as unstable (§19.2), and the format itself did not change.
+
+**Fixed — human gates are no longer reported as enforced while disabled (§13.1, §16):**
+
+- `constle validate` classified `require_approval_for` entries purely by
+  whether they matched a declared MCP tool, without consulting the master
+  switch. A manifest with `enabled: false` beside an entry matching a real
+  tool was reported as `enforced … paused at the MCP gate proxy for approval`,
+  while the gate proxy — which had always honoured the switch — forwarded every
+  such call ungated. `constle run` said nothing at all.
+- Such entries are now reported as not enforced, and warned about by name,
+  identifying the master switch as the reason. No semantics changed: `enabled`
+  still defaults to `false` and still disarms every entry.
 
 ### 0.2.0 — 2026-09-13
 
