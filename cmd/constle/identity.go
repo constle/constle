@@ -177,24 +177,45 @@ func warnUnverifiableIdentity(m *manifest.AgentManifest) {
 // an approval nobody signed.
 func cmdAuditVerify(a auditVerifyArgs) error {
 	path := a.path
-	expectedDID, approverPubkey, err := a.resolvePins()
+	pins, err := a.resolvePins()
 	if err != nil {
 		return err
+	}
+	expectedDID, approverPubkey := pins.did, pins.approverPubkey
+
+	// Settle the trust anchor before reading anything. A pin that is not a
+	// usable key is an operator error about what this run is held to, and
+	// reporting it only after a whole log has verified would tell them the
+	// log is fine in the same breath as telling them nothing checked it
+	// against the key they named. Passing no entries makes this exactly a
+	// validation of the pin.
+	if approverPubkey != "" {
+		if _, err := humangate.VerifyDecisions(nil, approverPubkey); err != nil {
+			return fmt.Errorf("%s", termsafe.Line(err.Error()))
+		}
 	}
 
 	report, err := audit.VerifyFile(path, expectedDID)
 	if err != nil {
 		if te, ok := err.(*audit.TamperError); ok {
-			// te's detail is already bounded and quoted by internal/audit;
-			// path is whatever the operator typed on the command line.
-			return fmt.Errorf("TAMPERING DETECTED in %s\n  %v", termsafe.Line(path), te)
+			// The newline here is constle's own; the two values around it
+			// are not. Escaped individually so neither can add a third line
+			// of its own — errf's Block backstop removes control bytes but
+			// deliberately keeps newlines, and cannot tell which of them
+			// this format string wrote.
+			return fmt.Errorf("TAMPERING DETECTED in %s\n  %s",
+				termsafe.Line(path), termsafe.Line(te.Error()))
 		}
-		return err
+		// Not a tamper report: a filesystem or read error, whose text
+		// quotes the path it failed on.
+		return fmt.Errorf("%s", termsafe.Line(err.Error()))
 	}
 
 	decisions, err := humangate.VerifyDecisions(report.Parsed, approverPubkey)
 	if err != nil {
-		return err
+		// Quotes the rejected pin, which came off the command line or the
+		// Agentfile.
+		return fmt.Errorf("%s", termsafe.Line(err.Error()))
 	}
 
 	printf("\n✓ audit log verified: %s\n\n", termsafe.Line(path))
@@ -209,14 +230,14 @@ func cmdAuditVerify(a auditVerifyArgs) error {
 	if a.agentfile != "" {
 		// Same reason #54 wraps path a few lines up: whatever the operator
 		// typed on the command line.
-		printf("  pins from: %s (%s)\n", termsafe.Line(a.agentfile), describePins(expectedDID, approverPubkey))
+		printf("%s", pinsFromLine(a.agentfile, pins))
 	}
 	printf("\n")
 
 	reportGateDecisions(decisions, approverPubkey)
 	if !decisions.OK() {
 		return fmt.Errorf("%d human-gate decision(s) in %s do not hold up — see above",
-			len(decisions.Failures), path)
+			len(decisions.Failures), termsafe.Line(path))
 	}
 	return nil
 }
@@ -297,27 +318,50 @@ func parseAuditVerifyArgs(args []string) (auditVerifyArgs, error) {
 // different answers to "which key do we trust" is a question the operator
 // has to settle, not one this command should quietly pick a side in. Giving
 // the same value twice is not a contradiction and passes.
-func (a auditVerifyArgs) resolvePins() (expectedDID, approverPubkey string, err error) {
+func (a auditVerifyArgs) resolvePins() (resolvedPins, error) {
 	if a.agentfile == "" {
-		return a.did, a.approverPubkey, nil
+		return resolvedPins{did: a.did, approverPubkey: a.approverPubkey}, nil
 	}
 
 	m, err := manifest.ParseFile(a.agentfile)
 	if err != nil {
-		return "", "", fmt.Errorf("cannot read the Agentfile at %s: %w", a.agentfile, err)
+		// Both halves are attacker-shaped: the path is whatever was typed,
+		// and a parser or filesystem error quotes it back. Escaped before
+		// formatting, not after — errf's Block backstop strips control
+		// bytes but deliberately keeps newlines, so a path containing one
+		// would otherwise write a second line that reads as constle's own.
+		// The wrap is dropped with it; nothing inspects this error, it is
+		// reported and the process exits.
+		return resolvedPins{}, fmt.Errorf("cannot read the Agentfile at %s: %s",
+			termsafe.Line(a.agentfile), termsafe.Line(err.Error()))
 	}
 
-	expectedDID, err = reconcilePin("--did", "identity.did", a.did, m.Identity.DID, a.agentfile)
-	if err != nil {
-		return "", "", err
+	p := resolvedPins{
+		declaredDID:      m.Identity.DID,
+		declaredApprover: m.HumanGates.ApproverPubkey,
 	}
-	approverPubkey, err = reconcilePin(
+	if p.did, err = reconcilePin("--did", "identity.did", a.did, p.declaredDID, a.agentfile); err != nil {
+		return resolvedPins{}, err
+	}
+	if p.approverPubkey, err = reconcilePin(
 		"--approver-pubkey", "human_gates.approver_pubkey",
-		a.approverPubkey, m.HumanGates.ApproverPubkey, a.agentfile)
-	if err != nil {
-		return "", "", err
+		a.approverPubkey, p.declaredApprover, a.agentfile); err != nil {
+		return resolvedPins{}, err
 	}
-	return expectedDID, approverPubkey, nil
+	return p, nil
+}
+
+// resolvedPins is the outcome of settling the two trust anchors, and a
+// record of which of them the Agentfile itself supplied.
+//
+// The provenance is kept separately from the values because the report line
+// makes a claim about where a pin came from. A flag can supply a pin the
+// file omits, and saying "pins from: <file>" over that would credit the file
+// with a pin it never declared — the same species of overclaim §9 was
+// rewritten to remove.
+type resolvedPins struct {
+	did, approverPubkey           string
+	declaredDID, declaredApprover string
 }
 
 // reconcilePin picks between a flag and an Agentfile field, refusing a
@@ -329,26 +373,38 @@ func reconcilePin(flag, field, explicit, declared, agentfile string) (string, er
 	case declared == "" || declared == explicit:
 		return explicit, nil
 	default:
+		// Every interpolated value here came off the command line or out of
+		// the Agentfile. Escaped individually for the reason given in
+		// resolvePins.
 		return "", fmt.Errorf(
 			"%s=%s contradicts %s in %s (%s) — pass one or the other, not two different "+
 				"answers to which key this log is held to",
-			flag, explicit, field, agentfile, declared)
+			flag, termsafe.Line(explicit), field, termsafe.Line(agentfile), termsafe.Line(declared))
 	}
 }
 
-// describePins names which anchors an Agentfile actually supplied, so a flag
-// that resolved nothing cannot look like a pin that happened.
-func describePins(expectedDID, approverPubkey string) string {
+// pinsFromLine reports what an Agentfile actually contributed, as one
+// escaped line ready to print.
+//
+// It describes the FILE's declarations rather than the resolved values, so a
+// pin that arrived on the command line is never presented as having come
+// from the file.
+func pinsFromLine(agentfile string, p resolvedPins) string {
+	var what string
 	switch {
-	case expectedDID != "" && approverPubkey != "":
-		return "identity.did, human_gates.approver_pubkey"
-	case expectedDID != "":
-		return "identity.did only — it declares no approver_pubkey, so gate decisions are unpinned"
-	case approverPubkey != "":
-		return "human_gates.approver_pubkey only — it declares no identity.did"
+	case p.declaredDID != "" && p.declaredApprover != "":
+		what = "identity.did, human_gates.approver_pubkey"
+	case p.declaredDID != "":
+		what = "identity.did only — it declares no approver_pubkey"
+		if p.approverPubkey == "" {
+			what += ", so gate decisions are unpinned"
+		}
+	case p.declaredApprover != "":
+		what = "human_gates.approver_pubkey only — it declares no identity.did"
 	default:
-		return "it declares neither identity.did nor approver_pubkey — nothing was pinned"
+		what = "it declares neither identity.did nor approver_pubkey"
 	}
+	return fmt.Sprintf("  pins from: %s (%s)\n", termsafe.Line(agentfile), what)
 }
 
 // auditVerifyUsage is the one usage string `constle audit verify` reports,

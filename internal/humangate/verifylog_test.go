@@ -443,3 +443,96 @@ func TestResponseRecordOmitsAbsentDecidedAt(t *testing.T) {
 		t.Errorf("absent decided_at was still recorded: %s", b)
 	}
 }
+
+// TestVerifyDecisionsProvenanceCannotBeDeclined: the exemption for an
+// evidence-free approval is an explicit `decided_by: terminal` and nothing
+// else. An earlier revision demanded evidence only when the field read
+// exactly "webhook", so the same writer that omitted the evidence could
+// also decline to state provenance and pass.
+func TestVerifyDecisionsProvenanceCannotBeDeclined(t *testing.T) {
+	a := newTestApprover(t)
+	base := func() map[string]any {
+		return map[string]any{"tool": "send_email", "subject_digest": testDigest}
+	}
+
+	for _, tc := range []struct {
+		name      string
+		decidedBy any // nil means the field is absent entirely
+	}{
+		{"absent", nil},
+		{"unknown value", "orchestrator"},
+		{"empty string", ""},
+		{"misspelled", "webhooks"},
+		{"wrong case", "Terminal"},
+		{"not a string", 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := base()
+			if tc.decidedBy != nil {
+				d[DetailDecidedBy] = tc.decidedBy
+			}
+			rep := mustVerify(t, []audit.Entry{logEntry(t, audit.EventGateApproved, d)}, a.did)
+			if rep.OK() {
+				t.Error("an evidence-free approval passed by not stating its provenance")
+			}
+		})
+	}
+
+	// Only the explicit terminal case is exempt, and it must stay exempt:
+	// spec §8.3 says a terminal approval signs nothing to re-verify.
+	d := base()
+	d[DetailDecidedBy] = DecidedByTerminal
+	if rep := mustVerify(t, []audit.Entry{logEntry(t, audit.EventGateApproved, d)}, a.did); !rep.OK() {
+		t.Errorf("an explicit terminal approval was reported as a failure: %s", failureText(rep))
+	}
+}
+
+// TestVerifyDecisionsCrossChecksRequireTheirFields: the two comparisons that
+// hold a decision to the call the entry names used to run only when both
+// sides were present, so deleting either side removed the check and let a
+// captured decision be attached to a different call.
+func TestVerifyDecisionsCrossChecksRequireTheirFields(t *testing.T) {
+	a := newTestApprover(t)
+
+	build := func(t *testing.T, mutate func(details map[string]any, request map[string]any)) audit.Entry {
+		t.Helper()
+		rec := decided(a, "hg_1", "approved", testDigest)
+		rec.Request.ToolName = "send_email"
+		e := gateEntry(t, audit.EventGateApproved, testDigest, rec)
+		e.Details["tool"] = "send_email"
+		req, _ := e.Details[DetailDecisionRequest].(map[string]any)
+		if req == nil {
+			t.Fatal("decision_request did not survive the round trip as a map")
+		}
+		mutate(e.Details, req)
+		return e
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(details, request map[string]any)
+	}{
+		{"record drops tool_name", func(_, r map[string]any) { delete(r, "tool_name") }},
+		{"entry drops tool", func(d, _ map[string]any) { delete(d, "tool") }},
+		{"record drops subject_digest", func(_, r map[string]any) { delete(r, "subject_digest") }},
+		{"entry drops subject_digest", func(d, _ map[string]any) { delete(d, "subject_digest") }},
+		{"entry tool emptied", func(d, _ map[string]any) { d["tool"] = "" }},
+		{"record tool_name emptied", func(_, r map[string]any) { r["tool_name"] = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rep := mustVerify(t, []audit.Entry{build(t, tc.mutate)}, a.did)
+			if rep.OK() {
+				t.Error("a decision passed with one side of a cross-check removed")
+			}
+			if rep.Verified != 0 {
+				t.Errorf("Verified = %d, want 0", rep.Verified)
+			}
+		})
+	}
+
+	// The unmutated entry must still verify, or the test above proves nothing.
+	rep := mustVerify(t, []audit.Entry{build(t, func(map[string]any, map[string]any) {})}, a.did)
+	if !rep.OK() || rep.Verified != 1 {
+		t.Errorf("an intact decision stopped verifying: %s", failureText(rep))
+	}
+}

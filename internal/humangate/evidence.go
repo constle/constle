@@ -44,6 +44,10 @@ const (
 	// records no signed decision, is an approval nothing can prove.
 	DetailDecidedBy  = "decided_by"
 	DecidedByWebhook = "webhook"
+	// DecidedByTerminal is the value runGate records for a gate answered at
+	// the keyboard, and the only provenance that exempts an approval from
+	// having to show a signed decision (spec §8.3).
+	DecidedByTerminal = "terminal"
 )
 
 // EvidenceFieldMax bounds every string copied out of a decision response

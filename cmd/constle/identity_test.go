@@ -159,22 +159,29 @@ const (
 func TestResolvePinsFromAgentfile(t *testing.T) {
 	path := writeAgentfile(t, testDIDKey, testApproverKey)
 
-	gotDID, gotApprover, err := auditVerifyArgs{agentfile: path}.resolvePins()
+	got, err := auditVerifyArgs{agentfile: path}.resolvePins()
 	if err != nil {
 		t.Fatalf("resolvePins() error: %v", err)
 	}
-	if gotDID != testDIDKey || gotApprover != testApproverKey {
-		t.Errorf("resolvePins() = (%q, %q), want the Agentfile's two keys", gotDID, gotApprover)
+	if got.did != testDIDKey || got.approverPubkey != testApproverKey {
+		t.Errorf("resolvePins() = (%q, %q), want the Agentfile's two keys", got.did, got.approverPubkey)
+	}
+	if got.declaredDID != testDIDKey || got.declaredApprover != testApproverKey {
+		t.Errorf("declared = (%q, %q), want both attributed to the file", got.declaredDID, got.declaredApprover)
 	}
 }
 
 // TestResolvePinsWithoutAgentfile: the explicit flags still stand alone.
 func TestResolvePinsWithoutAgentfile(t *testing.T) {
-	gotDID, gotApprover, err := auditVerifyArgs{
+	got, err := auditVerifyArgs{
 		did: testDIDKey, approverPubkey: testApproverKey,
 	}.resolvePins()
-	if err != nil || gotDID != testDIDKey || gotApprover != testApproverKey {
-		t.Errorf("resolvePins() = (%q, %q, %v), want the flags unchanged", gotDID, gotApprover, err)
+	if err != nil || got.did != testDIDKey || got.approverPubkey != testApproverKey {
+		t.Errorf("resolvePins() = (%+v, %v), want the flags unchanged", got, err)
+	}
+	if got.declaredDID != "" || got.declaredApprover != "" {
+		t.Errorf("declared = (%q, %q), want nothing attributed to a file that was never read",
+			got.declaredDID, got.declaredApprover)
 	}
 }
 
@@ -192,7 +199,7 @@ func TestResolvePinsRefusesContradiction(t *testing.T) {
 		{"approver", auditVerifyArgs{agentfile: path, approverPubkey: testDIDKey}, "approver_pubkey"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, _, err := tc.args.resolvePins()
+			_, err := tc.args.resolvePins()
 			if err == nil {
 				t.Fatal("resolvePins() accepted a flag contradicting the Agentfile")
 			}
@@ -203,7 +210,7 @@ func TestResolvePinsRefusesContradiction(t *testing.T) {
 	}
 
 	// Saying the same thing twice is not a contradiction.
-	if _, _, err := (auditVerifyArgs{agentfile: path, did: testDIDKey}).resolvePins(); err != nil {
+	if _, err := (auditVerifyArgs{agentfile: path, did: testDIDKey}).resolvePins(); err != nil {
 		t.Errorf("resolvePins() refused a flag that agrees with the Agentfile: %v", err)
 	}
 }
@@ -211,19 +218,97 @@ func TestResolvePinsRefusesContradiction(t *testing.T) {
 // TestResolvePinsMissingAgentfile fails loudly rather than degrading to an
 // unpinned verification that looks like a pinned one.
 func TestResolvePinsMissingAgentfile(t *testing.T) {
-	_, _, err := auditVerifyArgs{agentfile: filepath.Join(t.TempDir(), "nope.yaml")}.resolvePins()
+	_, err := auditVerifyArgs{agentfile: filepath.Join(t.TempDir(), "nope.yaml")}.resolvePins()
 	if err == nil {
 		t.Fatal("resolvePins() accepted a missing Agentfile")
 	}
 }
 
-// TestDescribePinsNamesWhatWasNotPinned: an Agentfile that supplies nothing
-// must not be reported as though it had pinned something.
-func TestDescribePinsNamesWhatWasNotPinned(t *testing.T) {
-	if got := describePins("", ""); !strings.Contains(got, "nothing was pinned") {
-		t.Errorf("describePins(\"\", \"\") = %q, want it to say nothing was pinned", got)
+// TestPinsFromLineCreditsOnlyTheFile: the line claims provenance, so a pin
+// that arrived on the command line must not be presented as the Agentfile's.
+func TestPinsFromLineCreditsOnlyTheFile(t *testing.T) {
+	// Flag supplied the approver key; the file declared only the DID.
+	line := pinsFromLine("Agentfile.yaml", resolvedPins{
+		did: testDIDKey, approverPubkey: testApproverKey, declaredDID: testDIDKey,
+	})
+	if strings.Contains(line, "approver_pubkey,") {
+		t.Errorf("line credits the file with a pin it did not declare: %q", line)
 	}
-	if got := describePins(testDIDKey, ""); !strings.Contains(got, "unpinned") {
-		t.Errorf("describePins(did, \"\") = %q, want it to flag the unpinned gate decisions", got)
+	if !strings.Contains(line, "declares no approver_pubkey") {
+		t.Errorf("line does not say the file omitted it: %q", line)
 	}
+	// ...and it must not then claim gate decisions are unpinned, since the
+	// flag did pin them.
+	if strings.Contains(line, "unpinned") {
+		t.Errorf("line calls a pinned verification unpinned: %q", line)
+	}
+
+	if line := pinsFromLine("Agentfile.yaml", resolvedPins{}); !strings.Contains(line, "declares neither") {
+		t.Errorf("a file supplying nothing was not reported as such: %q", line)
+	}
+}
+
+// TestPinsFromLineEscapesThePath is the regression test the success-output
+// escaping lacked: a path carrying a newline could otherwise emit a second
+// line that reads as constle's own verdict.
+func TestPinsFromLineEscapesThePath(t *testing.T) {
+	line := pinsFromLine("missing\n\u2713 audit log verified", resolvedPins{declaredDID: testDIDKey})
+	if strings.Count(line, "\n") != 1 || !strings.HasSuffix(line, "\n") {
+		t.Errorf("path newline survived into the output: %q", line)
+	}
+}
+
+// TestAuditVerifyErrorsEscapeInterpolatedValues: every error this command
+// builds is printed by errf, whose termsafe.Block backstop strips control
+// bytes but deliberately preserves newlines — it cannot tell a newline the
+// format string wrote from one that arrived inside a value. So a path or a
+// pin carrying a newline could emit a forged standalone line that reads as
+// constle's own verdict. Each value is escaped before formatting instead.
+func TestAuditVerifyErrorsEscapeInterpolatedValues(t *testing.T) {
+	forged := "missing\n✓ audit log verified"
+
+	t.Run("unreadable agentfile", func(t *testing.T) {
+		_, err := auditVerifyArgs{agentfile: forged}.resolvePins()
+		if err == nil {
+			t.Fatal("resolvePins() accepted an unreadable Agentfile")
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Errorf("error carries a newline from the path: %q", err.Error())
+		}
+	})
+
+	t.Run("contradicting pin", func(t *testing.T) {
+		path := writeAgentfile(t, testDIDKey, testApproverKey)
+		_, err := auditVerifyArgs{agentfile: path, did: forged}.resolvePins()
+		if err == nil {
+			t.Fatal("resolvePins() accepted a contradicting pin")
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Errorf("error carries a newline from the flag value: %q", err.Error())
+		}
+	})
+
+	t.Run("unreadable log", func(t *testing.T) {
+		err := cmdAuditVerify(auditVerifyArgs{path: forged})
+		if err == nil {
+			t.Fatal("cmdAuditVerify() accepted an unreadable log")
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Errorf("error carries a newline from the log path: %q", err.Error())
+		}
+	})
+
+	t.Run("invalid pinned approver key", func(t *testing.T) {
+		log := filepath.Join(t.TempDir(), "audit.jsonl")
+		if writeErr := os.WriteFile(log, []byte("{}\n"), 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		err := cmdAuditVerify(auditVerifyArgs{path: log, approverPubkey: forged})
+		if err == nil {
+			t.Fatal("cmdAuditVerify() accepted an invalid pinned key")
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Errorf("error carries a newline from the pin: %q", err.Error())
+		}
+	})
 }

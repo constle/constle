@@ -178,10 +178,7 @@ func VerifyDecisions(entries []audit.Entry, pinnedPubkey string) (*DecisionRepor
 		// different subject, the two halves of the same entry disagree
 		// about which call was gated, and no signature over either one
 		// settles which is the real subject.
-		if d, ok := e.Details["subject_digest"].(string); ok &&
-			d != "" && rec.Request.SubjectDigest != "" && d != rec.Request.SubjectDigest {
-			fail("the gated call's subject_digest is %s but the recorded request names %s",
-				d, rec.Request.SubjectDigest)
+		if !agree(e.Details["subject_digest"], rec.Request.SubjectDigest, "subject_digest", fail) {
 			continue
 		}
 
@@ -196,10 +193,7 @@ func VerifyDecisions(entries []audit.Entry, pinnedPubkey string) (*DecisionRepor
 		// call by whoever writes the log. That residual is stated in spec
 		// §10; the request_id recorded alongside is what lets the approver's
 		// own records settle it.
-		if name, ok := e.Details["tool"].(string); ok &&
-			name != "" && rec.Request.ToolName != "" && name != rec.Request.ToolName {
-			fail("the gated call names tool %q but the recorded request names %q",
-				name, rec.Request.ToolName)
+		if !agree(e.Details["tool"], rec.Request.ToolName, "tool", fail) {
 			continue
 		}
 
@@ -259,8 +253,24 @@ const unprovenApproval = "the call was approved by the webhook approver, but no 
 	"is recorded to prove the approver ever gave one — a log written before spec 0.4.0 " +
 	"records none, and is indistinguishable from one the record was removed from"
 
-// claimsUnprovenApproval reports whether an entry says the webhook approver
-// let a call through while recording nothing that could show it did.
+// claimsUnprovenApproval reports whether an approval recorded nothing that
+// could show the approver ever gave it.
+//
+// The exemption is an explicit `decided_by: terminal` and nothing else. An
+// earlier revision inverted this — it demanded evidence only when the field
+// read exactly "webhook" — which made the check turn on a string the same
+// writer that omitted the evidence also controls: deleting the field,
+// misspelling it, or giving it any other value made an evidence-free
+// approval pass with the approver key pinned. A test of provenance that a
+// forger can answer by declining to state provenance is not a test.
+//
+// Absence is not ambiguity here. runGate writes this field on every gate it
+// decides, defaulting to "terminal" and overridden to "webhook" only by an
+// approver that says so, so exactly two values are producible and a missing
+// or unrecognized one is a malformed record rather than an old one. Only
+// "terminal" is exempt, because spec §8.3 already says a terminal approval
+// signs nothing and leaves no artifact to re-verify — an exemption the spec
+// grants explicitly, not one inferred from silence.
 //
 // Deliberately approvals only. A webhook DENIAL with no evidence is the
 // fail-closed direction — the call was blocked, and nothing about blocking
@@ -274,8 +284,35 @@ func claimsUnprovenApproval(e audit.Entry) bool {
 	if e.Event != audit.EventGateApproved {
 		return false
 	}
-	by, _ := e.Details[DetailDecidedBy].(string)
-	return by == DecidedByWebhook
+	by, ok := e.Details[DetailDecidedBy].(string)
+	return !ok || by != DecidedByTerminal
+}
+
+// agree holds one of an entry's own fields and the matching field of the
+// decision record it carries to being present, non-empty and equal.
+//
+// Requiring presence is the whole point. The earlier form compared the two
+// only when both were non-empty strings, so deleting either one skipped the
+// comparison entirely and a captured decision could be attached to an entry
+// naming a different call. Every writer of a record like this emits both
+// fields, so a missing one is not a record from an older constle — it is a
+// record with a check removed from it.
+func agree(fromEntry any, fromRecord, field string, fail func(string, ...any)) bool {
+	s, ok := fromEntry.(string)
+	switch {
+	case !ok || s == "":
+		fail("the entry records a decision but no %s of its own, so there is nothing "+
+			"to hold the decision to", field)
+		return false
+	case fromRecord == "":
+		fail("the recorded decision carries no %s, so it cannot be tied to the call "+
+			"this entry names", field)
+		return false
+	case s != fromRecord:
+		fail("the gated call's %s is %q but the recorded request names %q", field, s, fromRecord)
+		return false
+	}
+	return true
 }
 
 // terminalReason maps a terminal gate event onto the VerifyDecision reason

@@ -988,7 +988,7 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 	defer cancel()
 
 	decision := DecisionNone
-	decidedBy := "terminal"
+	decidedBy := humangate.DecidedByTerminal
 	var eventOverride audit.EventType
 	if ra, ok := g.approver.(ReasoningApprover); ok {
 		outcome := ra.DecideWithReason(ctx, req)
