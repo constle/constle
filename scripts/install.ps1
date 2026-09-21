@@ -156,8 +156,51 @@ Write-Host ""
 # exist before anything can call it.
 # ---------------------------------------------------------------------------
 foreach ($Pair in @(@('CONSTLE_INSTALL_BASE_URL', $BaseUrl), @('CONSTLE_INSTALL_API_URL', $ApiBaseUrl))) {
-    if ($Pair[1] -notmatch '^https://' -and
-        $Pair[1] -notmatch '^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$)') {
+    # Three gates, in the same order and with the same meaning as the ones in
+    # scripts/install: the scheme, then userinfo, then - for http only - the
+    # authority. The two installers answer to one shared regression test, so a
+    # rule spelled differently here is a rule that only ever gets tested once.
+    #
+    # Every comparison is case-SENSITIVE (-cmatch / -cnotmatch). PowerShell's
+    # default operators are case-insensitive, so the plain forms accept
+    # "HTTP://localhost/" and "http://LOCALHOST/" where the sh glob refuses
+    # them. Neither spelling is dangerous on its own; the divergence is.
+    # Control characters first. Neither installer can treat them sanely: the
+    # sh side reads its authority through a command substitution, which strips
+    # trailing newlines, and .NET regex treats a newline as a line boundary, so
+    # the same string means different things on each side. A URL cannot
+    # legitimately contain one, so both refuse it outright and say so.
+    if ($Pair[1] -match '[\x00-\x1F\x7F]') {
+        Write-Fail "$($Pair[0]) contains control characters.`nIt must be an https:// URL (or a loopback http:// address). Nothing has been installed."
+    }
+
+    if ($Pair[1] -cnotmatch '^https?://') {
+        Write-Fail "$($Pair[0]) must be an https:// URL (or a loopback http:// address).`nRefusing to download over an unauthenticated transport. Nothing has been installed."
+    }
+
+    # The authority is what follows "://" up to the first "/", "?" or "#".
+    # Userinfo is refused under both schemes, because everything before an "@"
+    # is a username: the host a reader sees in the URL is then not the host
+    # this script connects to. Over https that is not a downgrade, but it is
+    # the same address confusion, and a release mirror has no reason to carry
+    # credentials in its URL.
+    $Authority = (($Pair[1] -replace '^[A-Za-z][A-Za-z0-9+.\-]*://', '') -replace '[/?#].*$', '')
+    if ($Authority -like '*@*') {
+        $RealHost  = $Authority -replace '^.*@', ''
+        $ClaimedAs = $Authority -replace '@.*$', ''
+        Write-Fail "$($Pair[0]) fetches from $RealHost, not $ClaimedAs - everything before the '@' is a username, not an address.`nIt must be an https:// URL (or a loopback http:// address). Nothing has been installed."
+    }
+
+    # Plain HTTP reaches this machine and nowhere else. The test is against the
+    # AUTHORITY and is anchored at both ends, so a loopback spelling that is
+    # merely the beginning of a longer host does not satisfy it.
+    #
+    # [0-9] rather than \d: .NET's \d matches every Unicode decimal digit, so a
+    # port written in full-width digits passed this gate and was caught later,
+    # inside System.Uri. A rule that holds at the boundary is worth more than
+    # one that happens to be caught downstream.
+    if ($Pair[1] -cmatch '^http://' -and
+        $Authority -cnotmatch '^(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$') {
         Write-Fail "$($Pair[0]) must be an https:// URL (or a loopback http:// address).`nRefusing to download over an unauthenticated transport. Nothing has been installed."
     }
 }
