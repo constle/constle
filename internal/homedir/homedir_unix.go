@@ -155,6 +155,32 @@ func mkdirAll(base string, comps []string, perm os.FileMode) error {
 	return nil
 }
 
+// tightenDir narrows the mode of base/comps... to at most perm, through a
+// descriptor opened with O_NOFOLLOW at every level. A directory already no
+// wider than perm is left alone, so this never loosens anything.
+//
+// mkdirAll's perm only applies to levels it creates: a directory an earlier
+// version left at a wider mode keeps it forever otherwise. The chmod goes
+// through the verified descriptor rather than the path, so a link swapped in
+// after the walk cannot redirect it.
+func tightenDir(base string, comps []string, perm os.FileMode) error {
+	dir, err := openDir(base, comps)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+
+	fi, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	cur := fi.Mode().Perm()
+	if cur&^perm.Perm() == 0 {
+		return nil
+	}
+	return dir.Chmod(cur & perm.Perm())
+}
+
 // readDir lists base/comps... through a descriptor opened with O_NOFOLLOW
 // at every level.
 func readDir(base string, comps []string) ([]fs.DirEntry, error) {

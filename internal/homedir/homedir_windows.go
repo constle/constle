@@ -85,6 +85,25 @@ func mkdirAll(base string, comps []string, perm os.FileMode) error {
 	return nil
 }
 
+// tightenDir narrows the mode of base/comps... to at most perm. Windows maps
+// Go's permission bits onto the read-only attribute alone, so this is close to
+// a no-op there; it exists so the callers compile and behave the same way.
+func tightenDir(base string, comps []string, perm os.FileMode) error {
+	if err := walk(base, comps); err != nil {
+		return err
+	}
+	path := filepath.Join(append([]string{base}, comps...)...)
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	cur := fi.Mode().Perm()
+	if cur&^perm.Perm() == 0 {
+		return nil
+	}
+	return os.Chmod(path, cur&perm.Perm())
+}
+
 func readDir(base string, comps []string) ([]fs.DirEntry, error) {
 	if err := walk(base, comps); err != nil {
 		return nil, err

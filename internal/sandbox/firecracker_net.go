@@ -178,21 +178,8 @@ func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, gate
 		return 0, "", err
 	}
 
-	// Pre-create the access log writable by Squid's effective user, so the
-	// run directory itself can stay root-owned.
-	logFile, err := os.OpenFile(accessLogPath, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
+	if err := createSquidAccessLog(accessLogPath, squidUser); err != nil {
 		return 0, "", err
-	}
-	// Nothing was written — the file exists purely so Squid can open it —
-	// so there is no data a failed close could cost.
-	_ = logFile.Close()
-	// Best effort: if the chown does not take, Squid falls back to its own
-	// error handling and the run continues without an access log rather
-	// than not at all. A missing log is already visible downstream, where
-	// the flush reports that network events were not fully recorded.
-	if uid, gid, err := lookupUserIDs(squidUser); err == nil {
-		_ = os.Chown(accessLogPath, uid, gid)
 	}
 
 	// Startup failures (a bad directive, a port clash) are fatal before the
@@ -224,6 +211,86 @@ func startHostSquid(runID, runDir, gatewayIP string, allowedHosts []string, gate
 		return 0, "", err
 	}
 	return cmd.Process.Pid, accessLogPath, nil
+}
+
+// createSquidAccessLog pre-creates the per-run access log so Squid, which
+// has already dropped to squidUser by the time it opens it, can write into
+// a run directory that stays root-owned.
+//
+// 0640 owned by squidUser with group root, not 0644. The log is a complete
+// record of the agent's network activity — every host it reached, when, and
+// how many bytes moved — and the run directory around it is 0755 so
+// unprivileged `constle ps` works. Squid needs to write it (owner), the
+// flush that turns it into audit events runs as root and reads it either
+// way, and no third party has a reason to see it.
+func createSquidAccessLog(path, squidUser string) error {
+	logFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0640)
+	if err != nil {
+		return err
+	}
+	// Nothing was written — the file exists purely so Squid can open it —
+	// so there is no data a failed close could cost.
+	_ = logFile.Close()
+	// Restate the mode: O_CREATE's is masked by the umask, and a file left
+	// by an earlier run at this path would keep whatever mode it had.
+	if err := os.Chmod(path, 0640); err != nil {
+		return err
+	}
+	// Best effort, as before: if the chown does not take, Squid falls back
+	// to its own error handling and the run continues without an access log
+	// rather than not at all. A missing log is already visible downstream,
+	// where the flush reports that network events were not fully recorded.
+	_ = applyAccessLogOwnerFn(path, squidUser)
+	return nil
+}
+
+// applyAccessLogOwnerFn is the seam createSquidAccessLog calls through, and
+// exists for one reason: to let an unprivileged test prove the call happens.
+//
+// The chown's error is discarded at the call site by design, and an
+// unprivileged process cannot tell a chown that was attempted and refused
+// from one that was never made — the file keeps the owner it was created with
+// either way. Asserting on the helper directly proves only that the helper
+// works; substituting this variable is what proves createSquidAccessLog
+// reaches it. Deleting the call used to leave the whole suite green.
+var applyAccessLogOwnerFn = applyAccessLogOwner
+
+// applyAccessLogOwner gives the access log the owner accessLogOwner chose.
+//
+// It is a function of its own, returning the chown's error rather than
+// discarding it inline, so that the attempt itself can be asserted on. Only
+// root can complete it, which is why the end-to-end ownership test skips on an
+// unprivileged runner — but an unprivileged caller still gets EPERM back from
+// the attempt, while a version that had lost the chown altogether would return
+// nil. That difference is what TestAccessLogOwnerIsApplied asserts; the call
+// site is covered separately, through applyAccessLogOwnerFn.
+func applyAccessLogOwner(path, squidUser string) error {
+	uid, gid, err := accessLogOwner(squidUser)
+	if err != nil {
+		return err
+	}
+	return os.Chown(path, uid, gid)
+}
+
+// accessLogOwner returns the uid and gid the per-run Squid access log must be
+// given: the Squid user, and group 0.
+//
+// Group 0, never the Squid user's own group. On a distribution where the squid
+// account shares a group with other service accounts, 0640 with that group
+// hands the agent's whole network history to every one of them — the same
+// disclosure the mode was set to prevent, one ring further in. Root reads the
+// file for the audit flush regardless of its group.
+//
+// This is split out from the chown so the choice can be asserted where the
+// chown itself cannot be: changing another file's owner requires root, so a
+// test that performs it is skipped on every unprivileged CI runner and the
+// claim goes unverified exactly where it is most likely to regress.
+func accessLogOwner(squidUser string) (uid, gid int, err error) {
+	uid, _, err = lookupUserIDs(squidUser)
+	if err != nil {
+		return 0, 0, err
+	}
+	return uid, 0, nil
 }
 
 // waitForHostSquid polls the proxy port until Squid accepts connections, or

@@ -158,18 +158,54 @@ func New(loc homedir.Location) (*Logger, error) {
 	// Every level of the log directory is created or, when left root-owned
 	// by a run that predates ownership restoration, healed here. The file
 	// itself is handed over only when this run creates it.
-	if err := loc.Dir().MkdirAllOwned(0755); err != nil {
+	//
+	// 0700, and tightened rather than merely requested: the log holds the
+	// agent's whole network history — every host reached, when, and how many
+	// bytes moved — alongside every other event of every run. At 0755 the
+	// filenames alone disclose which agents ran on which days. Raising the
+	// mode without tightening would protect new installations and leave every
+	// existing one exactly as exposed, which is the case that matters, since
+	// the exposure is in the records already written.
+	if err := loc.Dir().MkdirAllOwnedTightened(0700); err != nil {
 		return nil, fmt.Errorf("cannot create log directory: %w", err)
 	}
 
 	// O_RDWR rather than O_WRONLY so NewSigned can resume the hash chain
 	// from this same descriptor instead of re-opening by pathname.
-	f, err := loc.OpenFileOwned(os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	f, err := loc.OpenFileOwned(os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open log file %q: %w", loc, err)
 	}
 
+	// A log this process did not create keeps the mode it already had, so a
+	// file an earlier release opened 0644 stays world-readable for as long as
+	// that day's log is appended to. Narrow it on the descriptor — by fd, so
+	// a path swapped after the open cannot redirect the chmod, and only ever
+	// removing bits.
+	if err := tightenFile(f, 0600); err != nil {
+		// The descriptor is being abandoned, so only the chmod failure is
+		// worth reporting; refusing to log at all would be a worse outcome
+		// than logging to a file whose mode could not be narrowed, but the
+		// caller must be the one to decide that.
+		_ = f.Close()
+		return nil, fmt.Errorf("cannot restrict log file %q: %w", loc, err)
+	}
+
 	return &Logger{file: f, path: loc.String()}, nil
+}
+
+// tightenFile narrows an open file's mode to at most perm. A file already no
+// wider than perm is left alone, so this never loosens anything.
+func tightenFile(f *os.File, perm os.FileMode) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	cur := fi.Mode().Perm()
+	if cur&^perm.Perm() == 0 {
+		return nil
+	}
+	return f.Chmod(cur & perm.Perm())
 }
 
 // NewSigned creates a Logger that signs and hash-chains every entry with the
