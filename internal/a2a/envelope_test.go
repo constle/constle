@@ -248,6 +248,96 @@ func TestReplayGuardRejectsStaleTimestamp(t *testing.T) {
 
 	future := &Envelope{MsgID: "future", Timestamp: time.Now().UTC().Add(replayWindow + time.Minute)}
 	assertReject(t, guard.check(future), ReasonStaleTimestamp)
+
+	// The window keeps its full width in both directions: moving the drift
+	// check off Duration arithmetic must not narrow it or make it one-sided.
+	// Tested a second inside each edge rather than exactly on it — check reads
+	// its own time.Now(), which has already advanced past the one used here,
+	// so an exactly-on-the-edge assertion would be a race.
+	for name, at := range map[string]time.Time{
+		"inside-past-edge":   time.Now().UTC().Add(-replayWindow + time.Second),
+		"inside-future-edge": time.Now().UTC().Add(replayWindow - time.Second),
+	} {
+		if err := guard.check(&Envelope{MsgID: name, Timestamp: at}); err != nil {
+			t.Errorf("%s: envelope inside the window rejected: %v", name, err)
+		}
+	}
+}
+
+// TestReplayGuardRejectsSaturatingTimestamp covers the far-future timestamps
+// that broke the drift arithmetic. The check used to measure drift as a
+// time.Duration: int64 nanoseconds, a range of about ±292 years. Past that,
+// Sub SATURATES to MinInt64, and negating MinInt64 leaves it negative — so
+// the "absolute" drift compared below the window and the envelope was
+// admitted. A year-9999 envelope therefore never went stale: once its msg_id
+// aged out of the seen set and the durable store, the identical bytes were
+// accepted again, indefinitely.
+//
+// The years on either side of the saturation point are both pinned, so a
+// future rewrite cannot quietly restore the cliff.
+func TestReplayGuardRejectsSaturatingTimestamp(t *testing.T) {
+	for _, ts := range []string{
+		"2200-01-01T00:00:00Z",
+		"2300-01-01T00:00:00Z",
+		"2319-01-01T00:00:00Z", // just before Sub saturates
+		"2400-01-01T00:00:00Z", // saturates: admitted before the fix
+		"9999-01-01T00:00:00Z", // the largest RFC 3339 year
+		"0001-01-01T00:00:00Z", // saturates the other way
+	} {
+		var when time.Time
+		if err := json.Unmarshal([]byte(`"`+ts+`"`), &when); err != nil {
+			t.Fatalf("%s: %v", ts, err)
+		}
+		guard := newReplayGuard(nil)
+		assertReject(t, guard.check(&Envelope{MsgID: ts, Timestamp: when}), ReasonStaleTimestamp)
+	}
+}
+
+// TestReplayGuardRejectsSaturatingTimestampFromWire runs the same case over a
+// real signed envelope decoded from wire bytes, so the rejection is proven on
+// the path a peer actually uses rather than on a hand-built struct.
+func TestReplayGuardRejectsSaturatingTimestampFromWire(t *testing.T) {
+	alice := newTestSigner(t, 1)
+	bobDID := newTestSigner(t, 2).DID()
+
+	wire, _, err := Seal(alice, bobDID, "", []byte(`{"n":1}`))
+	if err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+	// A declared peer controls its own clock, so it can emit any timestamp it
+	// likes and sign it: rewrite the field and re-seal with the same key.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(wire, &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	var far Envelope
+	far.From, far.To = alice.DID(), bobDID
+	far.MsgID = "far-future"
+	far.Timestamp = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	far.Body = json.RawMessage(`{"n":1}`)
+	unsigned, err := json.Marshal(far)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	far.Sig = base64.StdEncoding.EncodeToString(alice.Sign(unsigned))
+	forged, err := json.Marshal(far)
+	if err != nil {
+		t.Fatalf("marshal signed: %v", err)
+	}
+
+	env, err := Open(forged)
+	if err != nil {
+		t.Fatalf("Open: the envelope is validly signed and must parse: %v", err)
+	}
+	assertReject(t, newReplayGuard(nil).check(env), ReasonStaleTimestamp)
+}
+
+// TestReplayGuardRejectsMissingTimestamp: an envelope with no timestamp field
+// decodes to the zero time, which is outside the window in the stale
+// direction. Open does not require the field, so this is the check that keeps
+// an omitted timestamp from being a way around the window.
+func TestReplayGuardRejectsMissingTimestamp(t *testing.T) {
+	assertReject(t, newReplayGuard(nil).check(&Envelope{MsgID: "no-ts"}), ReasonStaleTimestamp)
 }
 
 // assertReject fails the test unless err is a *RejectError with the reason.

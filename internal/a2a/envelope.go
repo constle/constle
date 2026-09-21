@@ -57,8 +57,11 @@ type Envelope struct {
 	// caller rejects a response that does not quote its request's id.
 	InReplyTo string `json:"in_reply_to,omitempty"`
 
-	// Timestamp is the sender's UTC send time, bounded by replayWindow at
-	// the receiver.
+	// Timestamp is the sender's UTC send time. The listener bounds it to
+	// replayWindow on every INBOUND envelope (see replayGuard). A response
+	// the gate collects for its own outbound call is NOT window-checked: it
+	// is bound instead to the fresh msg_id it must quote and to the open HTTP
+	// exchange it arrives on. Stated here because the two paths differ.
 	Timestamp time.Time `json:"timestamp"`
 
 	// Body is the application payload, opaque to constle. Must be valid
@@ -238,11 +241,13 @@ func newReplayGuard(store *replayStore) *replayGuard {
 func (g *replayGuard) check(env *Envelope) error {
 	now := time.Now().UTC()
 
-	drift := now.Sub(env.Timestamp)
-	if drift < 0 {
-		drift = -drift
-	}
-	if drift > replayWindow {
+	// Compared as instants, never through a Duration. Duration is int64
+	// nanoseconds — a range of about ±292 years — so Sub SATURATES to
+	// MinInt64 for a timestamp far enough in the future, and negating
+	// MinInt64 leaves it negative: the "absolute" drift stayed below the
+	// window and a year-9999 envelope was admitted, never going stale. The
+	// bounds are inclusive, as the Duration comparison was.
+	if env.Timestamp.Before(now.Add(-replayWindow)) || env.Timestamp.After(now.Add(replayWindow)) {
 		return &RejectError{ReasonStaleTimestamp,
 			fmt.Sprintf("timestamp %s is outside the ±%s replay window", env.Timestamp.Format(time.RFC3339), replayWindow)}
 	}

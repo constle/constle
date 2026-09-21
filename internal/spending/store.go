@@ -191,6 +191,13 @@ func sumLedger(f *os.File) (MicroCents, error) {
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			return 0, fmt.Errorf("spending ledger %s line %d is corrupt: %v", f.Name(), lineNo, err)
 		}
+		// Append refuses a negative charge on the way in, so one on the way out
+		// means the file was edited or damaged. Summing it would shrink the day
+		// total and hand back budget that was already spent — the same "free
+		// budget" this function exists to refuse.
+		if rec.MicroCents < 0 {
+			return 0, fmt.Errorf("spending ledger %s line %d records a negative charge (%d micro-cents)", f.Name(), lineNo, rec.MicroCents)
+		}
 		var err error
 		total, err = Add(total, MicroCents(rec.MicroCents))
 		if err != nil {

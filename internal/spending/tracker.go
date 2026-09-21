@@ -7,7 +7,7 @@ import (
 )
 
 // Limits are the enforced caps, already parsed to exact MicroCents.
-// A zero cap means "not declared".
+// A zero cap means "not declared"; a negative one is refused by NewTracker.
 type Limits struct {
 	PerRun MicroCents
 	PerDay MicroCents
@@ -58,8 +58,36 @@ type Tracker struct {
 
 // NewTracker builds a tracker for one run. store may be nil only when
 // limits.PerDay is zero — a daily cap without durable state would reset on
-// every process exit and enforce nothing.
+// every process exit and enforce nothing. Negative caps are refused: see
+// below for why the sign is settled here and not at each reader.
 func NewTracker(limits Limits, store *DailyStore) (*Tracker, error) {
+	// Every enforcement site reads "> 0" as "declared", so a negative cap is
+	// indistinguishable from an unset one — it would skip the durable ledger,
+	// skip the pre-run budget check, and leave both trip conditions in Charge
+	// unreachable. Limits is an exported struct with exported fields and is
+	// built field by field by its callers, so the guarantee is made at the one
+	// gate every Tracker passes through rather than trusted to each reader.
+	// Changing those readers to "!= 0" instead would be the opposite error: a
+	// negative cap would then trip everything on the first charge.
+	if limits.PerRun < 0 || limits.PerDay < 0 {
+		return nil, fmt.Errorf(
+			"spending limits must not be negative (max_per_run_usd=%s, max_per_day_usd=%s)",
+			limits.PerRun.USD(), limits.PerDay.USD())
+	}
+	// Charge reads WarnAtPctOfDaily the same way — "> 0" means configured —
+	// so a negative threshold silently means "no warning" rather than being
+	// refused. Bounded here to the range the manifest validator already
+	// requires, since this constructor is also reachable from Go directly.
+	if limits.WarnAtPctOfDaily < 0 || limits.WarnAtPctOfDaily > 100 {
+		return nil, fmt.Errorf("warn_at_pct_of_daily must be between 0 (unset) and 100, got %d", limits.WarnAtPctOfDaily)
+	}
+	// Charge computes the warning against PerDay, so a threshold without a
+	// daily cap can never fire. The manifest validator already refuses that
+	// pairing; refusing it here too keeps a declared warning from looking real
+	// when nothing can raise it.
+	if limits.WarnAtPctOfDaily > 0 && limits.PerDay <= 0 {
+		return nil, fmt.Errorf("warn_at_pct_of_daily is set but there is no max_per_day_usd to warn about")
+	}
 	if limits.PerDay > 0 && store == nil {
 		return nil, fmt.Errorf("max_per_day_usd requires a durable daily store")
 	}
@@ -76,6 +104,14 @@ func (t *Tracker) Charge(runID, serverID string, amount MicroCents) (Result, err
 	defer t.mu.Unlock()
 
 	res := Result{Amount: amount}
+
+	// A negative charge would subtract from the run total and hand budget
+	// back. Cost never produces one and the daily store refuses one on
+	// append, so this only closes the store-less per-run path — but that is
+	// the same "free budget" the ledger refuses, and it belongs on both.
+	if amount < 0 {
+		return res, fmt.Errorf("negative charge %s", amount.USD())
+	}
 
 	newRunTotal, err := Add(t.runTotal, amount)
 	if err != nil {

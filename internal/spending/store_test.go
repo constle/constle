@@ -73,6 +73,35 @@ func TestStoreCorruptLedgerFailsClosed(t *testing.T) {
 	}
 }
 
+// TestStoreNegativeLedgerRecordFailsClosed: Append refuses a negative charge
+// on the way in, so one on the way out means the file was edited or damaged.
+// Summing it would shrink the day total and hand back budget already spent —
+// the same silent "free budget" a corrupt line is refused for.
+func TestStoreNegativeLedgerRecordFailsClosed(t *testing.T) {
+	s := testStore(t)
+	if _, err := s.Append("run1", "srv", 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.OpenFile(s.dayFile().String(), os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"ts":"2026-09-21T00:00:00Z","run_id":"tamper","server_id":"srv","microcents":-900}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if total, err := s.TodayTotal(); err == nil {
+		t.Errorf("negative ledger record must be an error, got total=%d", total)
+	}
+	if _, err := s.Append("run2", "srv", 5); err == nil {
+		t.Error("appending over a negative record must fail, not continue from a wrong total")
+	}
+}
+
 // TestStoreConcurrentHandles hammers one ledger from many goroutines, each
 // with its OWN DailyStore (own file descriptor — flock is per-fd, so this
 // exercises real lock contention). Every appended charge must survive and

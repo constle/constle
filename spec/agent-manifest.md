@@ -1386,6 +1386,15 @@ limits:
 Maximum wall-clock run time. On expiry the runtime stops the sandbox and
 records a `terminated_by_limit` audit event. `0` or omitted means no limit.
 
+A negative value is rejected rather than read as "no limit", and so is a value
+above `9223372036`, the largest number of seconds the runtime's timer can
+represent. Above that the number no longer converts to the time it names: just
+past the bound it converts to a negative duration and the run is killed at
+once, and further out it comes back round as a fraction of a second. Either
+way a limit written to be effectively infinite would end the run almost
+immediately, so both are refused. (The field is an integer, so on a 32-bit
+build its own width is the lower limit in practice.)
+
 This is a supervisor-side timer, not a request the agent can decline.
 
 ---
@@ -1495,7 +1504,14 @@ by accident**.
 | Enforcement | **ENFORCED** |
 
 How long a gated call waits for a decision before `on_timeout` applies. A
-negative value is rejected.
+negative value is rejected, and so is a value above `9223372036`, the largest
+number of seconds the wait can represent. Above that the number no longer
+converts to the time it names — just past the bound it converts to a negative
+duration and the gate expires the instant it opens, and further out it comes
+back round as a fraction of a second. With `on_timeout: proceed` either one
+forwards the call with no human in the loop, so both are refused. (The field
+is an integer, so on a 32-bit build its own width is the lower limit in
+practice.)
 
 When stdin is not a terminal — a backgrounded run, a pipe, CI — no human can
 answer, so the gate says so once and simply waits for the deadline, letting

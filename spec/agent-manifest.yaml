@@ -375,7 +375,10 @@ spending:
 limits:
   # ENFORCED. Maximum wall-clock run time. On expiry constle stops the
   # sandbox and records a terminated_by_limit audit event. 0 or omitted
-  # means no limit.
+  # means no limit. A negative value is refused rather than read as "no
+  # limit", and so is anything above 9223372036 seconds, past which the
+  # number no longer converts to the time it names and the run would be
+  # killed at some arbitrary earlier moment.
   max_duration_seconds: 300
 
 # ---------------------------------------------------------------------------
@@ -422,6 +425,9 @@ human_gates:
     - "send_email"
 
   # How long a gated call waits for a decision. Default 300 when omitted.
+  # Refused below 0 and above 9223372036, past which the number no longer
+  # converts to the time it names and the gate would stop waiting almost
+  # immediately.
   approval_timeout_seconds: 300
 
   # What happens when approval does not arrive in time.
