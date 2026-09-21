@@ -344,6 +344,20 @@ type HumanGates struct {
 	ApproverPubkey string `yaml:"approver_pubkey,omitempty"`
 }
 
+// GatesArmed reports whether human gates are enforced for this manifest at
+// all — the master switch of spec/agent-manifest.md §13.1. When Enabled is
+// false, no gating occurs even if RequireApprovalFor lists entries.
+//
+// It is the single definition of "gates are on". The gate proxy arms its
+// gated-tool set behind it (internal/mcpgate.New) and the CLI reports
+// enforcement behind it (AgentManifest.EnforcedGateEntries), so the two can
+// never drift into disagreeing about whether a declared gate is real — the
+// drift that let `constle validate` print an entry as enforced while the
+// proxy forwarded every call to it ungated.
+func (g HumanGates) GatesArmed() bool {
+	return g.Enabled
+}
+
 // NotifyChannel is one notification target for gate events.
 type NotifyChannel struct {
 	// Channel is the delivery mechanism. Supported: "webhook".

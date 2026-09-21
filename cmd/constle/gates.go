@@ -15,7 +15,10 @@ import (
 var gatesWarnOut io.Writer = os.Stdout
 
 // warnUnenforcedHumanGates warns about the require_approval_for entries the
-// gate engine cannot enforce for this manifest.
+// gate engine cannot enforce for this manifest, and says which of the two
+// reasons applies: the master switch is off (human_gates.enabled: false, which
+// disarms every entry — spec/agent-manifest.md §13.1), or the entry matches no
+// declared MCP tool.
 //
 // Human gates ARE enforced now — for MCP tool calls: an entry that exactly
 // matches a tool name on a declared mcp.servers entry pauses that call at
@@ -31,7 +34,25 @@ var gatesWarnOut io.Writer = os.Stdout
 // printf.
 func warnUnenforcedHumanGates(m *manifest.AgentManifest) {
 	gates := m.HumanGates
-	if !gates.Enabled && len(gates.RequireApprovalFor) == 0 {
+	if len(gates.RequireApprovalFor) == 0 {
+		return
+	}
+
+	// The master switch and the tool mapping are two different reasons for the
+	// same outcome, and they need two different messages. Reporting a disabled
+	// gate as "matches no tool on any declared MCP server" sends an operator
+	// hunting for a tool-name typo that isn't there, while the one line that
+	// would fix it — enabled: true — goes unmentioned.
+	if !gates.GatesArmed() {
+		lines := []string{
+			"⚠️  warning: human_gates.enabled is false — NO gate is enforced:",
+			fmt.Sprintf("   these require_approval_for entries will run WITHOUT approval: %s",
+				strings.Join(gates.RequireApprovalFor, ", ")),
+			"   set human_gates.enabled: true to enforce them",
+		}
+		stdoutMu.Lock()
+		defer stdoutMu.Unlock()
+		warnBlock(gatesWarnOut, lines)
 		return
 	}
 

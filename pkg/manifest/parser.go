@@ -1,7 +1,10 @@
 package manifest
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -20,16 +23,64 @@ func ParseFile(path string) (*AgentManifest, error) {
 		return nil, fmt.Errorf("cannot read Agentfile at %q: %w", path, err)
 	}
 
-	return Parse(data)
+	m, err := Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return m, nil
 }
 
 // Parse unmarshals YAML bytes into an AgentManifest.
 // Useful for tests — callers can supply YAML directly without a file.
+//
+// Decoding is strict: a key the schema does not define is an error, not a
+// silent no-op. Every control in an Agentfile is opt-in, so a key that is
+// quietly discarded removes the control it was meant to declare —
+// `capabilties:` empties the capability list and drops the isolation floor to
+// none, `requre_approval_for:` leaves a gate declared and unarmed. The failure
+// is invisible in both cases: the manifest validates, and the CLI reports the
+// weakened configuration as though it had been asked for. Strict decoding is
+// the same judgement already made for an unrecognised capability value and an
+// unrecognised isolation level, applied to the key rather than the value.
+//
+// An Agentfile is exactly one YAML document. Strictness that stopped at the
+// first document would be strictness in name only: a decoder reads one
+// document and returns, so everything after a `---` is discarded by the same
+// silence, whether it holds an unknown key, a whole second policy, or YAML
+// that does not parse at all.
 func Parse(data []byte) (*AgentManifest, error) {
 	var m AgentManifest
 
-	if err := yaml.Unmarshal(data, &m); err != nil {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	// An empty or comment-only document decodes to nothing and returns io.EOF,
+	// where yaml.Unmarshal returned no error at all. Keep the old behaviour:
+	// the defaults below still apply, and Validate is what refuses the file,
+	// naming the missing apiVersion rather than an unexplained EOF.
+	if err := dec.Decode(&m); err != nil && !errors.Is(err, io.EOF) {
+		var typeErr *yaml.TypeError
+		if errors.As(err, &typeErr) {
+			return nil, describeTypeError(typeErr)
+		}
 		return nil, fmt.Errorf("invalid YAML in Agentfile: %w", err)
+	}
+
+	// Require the stream to end here. A leading `---` or a trailing `...` is a
+	// marker on this one document and still reaches io.EOF; a genuine second
+	// document does not.
+	var extra yaml.Node
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+		// Exactly one document, as required.
+	case err == nil:
+		return nil, fmt.Errorf(
+			"an Agentfile must be a single YAML document; found a second one at line %d "+
+				"(everything after the first document is ignored, so it would declare nothing)",
+			extra.Line)
+	default:
+		// Not even well-formed. Reported rather than discarded: a file whose
+		// tail does not parse must never be answered with "is valid".
+		return nil, fmt.Errorf("invalid YAML in Agentfile after the first document: %w", err)
 	}
 
 	// If isolation is not set explicitly, infer it from the declared
@@ -558,11 +609,25 @@ func (m *AgentManifest) validateHumanGates() error {
 // declared MCP tool (enforced by the gate proxy) and entries that provably
 // match nothing (unenforced — surfaced as a warning by the CLI).
 //
-// An entry is "possibly enforced" when any declared server omits its tools
-// allowlist: the runtime match is exact on the tool name of every tools/call,
-// so such an entry may still gate a real call. Only entries that cannot match
-// under any declared server are reported as unenforced.
+// The master switch comes first: when human_gates.enabled is false, the gate
+// proxy arms nothing (spec/agent-manifest.md §13.1), so EVERY entry is
+// unenforced however well it matches a declared tool. Consulting the tool
+// mapping without consulting HumanGates.GatesArmed first is what let the CLI
+// report a gate as "paused at the MCP gate proxy for approval" while the
+// proxy forwarded every call to it ungated.
+//
+// Beyond the switch, an entry is "possibly enforced" when any declared server
+// omits its tools allowlist: the runtime match is exact on the tool name of
+// every tools/call, so such an entry may still gate a real call. Only entries
+// that cannot match under any declared server are reported as unenforced.
 func (m *AgentManifest) EnforcedGateEntries() (enforced, unenforced []string) {
+	if !m.HumanGates.GatesArmed() {
+		if len(m.HumanGates.RequireApprovalFor) == 0 {
+			return nil, nil
+		}
+		return nil, append([]string(nil), m.HumanGates.RequireApprovalFor...)
+	}
+
 	anyServerWithoutToolList := false
 	declaredTools := map[string]bool{}
 	for _, srv := range m.MCP.Servers {
