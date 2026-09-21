@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -187,10 +188,17 @@ func parseUnknownField(raw string) (line int, key, typeName string, ok bool) {
 	if err != nil {
 		return 0, "", "", false
 	}
-	key, typeName, ok = strings.Cut(rest, " not found in type ")
-	if !ok {
+	// The delimiter can legitimately occur inside a YAML key, so the split is
+	// anchored at the LAST occurrence: yaml appends the type name after the
+	// final one. Cutting at the first truncated the key of a manifest whose
+	// key genuinely contained "not found in type", and named a key the author
+	// never wrote.
+	sep := strings.LastIndex(rest, " not found in type ")
+	if sep < 0 {
 		return 0, "", "", false
 	}
+	key = rest[:sep]
+	typeName = rest[sep+len(" not found in type "):]
 	return line, key, typeName, true
 }
 
@@ -198,6 +206,11 @@ func parseUnknownField(raw string) (line int, key, typeName string, ok bool) {
 // close enough to be worth naming. The thresholds are deliberately tight: a
 // wrong suggestion is worse than none, because it sends the author to edit a
 // line that was never the problem.
+//
+// Both sides of the proportional threshold are counted in runes. Measuring the
+// written key in bytes made a short non-ASCII key look long enough to justify
+// any suggestion — a two-emoji key is eight bytes, so a distance of three
+// passed and "💣💣" was answered with "did you mean a2a?".
 func nearestKey(written string, keys []string) (string, bool) {
 	best, bestDist := "", -1
 	for _, key := range keys {
@@ -206,7 +219,7 @@ func nearestKey(written string, keys []string) (string, bool) {
 			best, bestDist = key, d
 		}
 	}
-	if bestDist < 0 || bestDist > 3 || bestDist*2 > len(written) {
+	if bestDist < 0 || bestDist > 3 || bestDist*2 > utf8.RuneCountInString(written) {
 		return "", false
 	}
 	return best, true

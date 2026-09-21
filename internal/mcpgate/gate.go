@@ -214,8 +214,14 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 	}
 
 	// The master switch, read through the one predicate the CLI also reports
-	// from, so neither side can start disagreeing about whether a declared
-	// gate is real (manifest.HumanGates.GatesArmed).
+	// from, so neither side can start disagreeing about whether gates are on
+	// at all (manifest.HumanGates.GatesArmed).
+	//
+	// The entry set built below is deliberately wider than what the CLI calls
+	// enforced: an entry no declared server could serve stays here so the
+	// case-fold near-miss refusal further down still covers it, while
+	// EnforcedGateEntries drops it rather than promise a gate on a tool the
+	// tools allowlist rejects first.
 	if m.HumanGates.GatesArmed() {
 		for _, entry := range m.HumanGates.RequireApprovalFor {
 			g.gated[entry] = true

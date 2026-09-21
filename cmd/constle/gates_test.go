@@ -377,3 +377,45 @@ func TestRunWarnsWhenGatesAreDeclaredButDisabled(t *testing.T) {
 		t.Errorf("run warning must name the ungated entry, got:\n%s", out)
 	}
 }
+
+// TestValidateNeverClaimsEnforcementFromCapabilitiesAlone closes the gap an
+// independent review found in the first pass of this fix.
+//
+// The capability list is spec-level advice: declaring send_email there gates no
+// call on its own (spec §8). Enforcement comes only from require_approval_for.
+// With the master switch on and require_approval_for EMPTY, the proxy arms
+// nothing — and validate used to print "approval required by spec — enforced
+// for matching MCP tools" anyway. Guarding that row on the master switch was
+// not enough, because the switch was on; the row simply must not speak about
+// enforcement at all.
+func TestValidateNeverClaimsEnforcementFromCapabilitiesAlone(t *testing.T) {
+	withCapturedGatesWarn(t)
+	// The helper's header already opens a capabilities list; continue it
+	// rather than declaring a second one, which is a duplicate key.
+	path := writeTempAgentfile(t, `  - send_email
+mcp:
+  servers:
+    - id: email
+      url: "http://10.0.0.5:9000/mcp"
+      tools: [send_email]
+human_gates:
+  enabled: true
+  require_approval_for: []
+`)
+
+	var cmdErr error
+	out := captureStdout(t, func() { cmdErr = cmdValidate(path) })
+	if cmdErr != nil {
+		t.Fatalf("cmdValidate() error = %v, want nil", cmdErr)
+	}
+
+	if !strings.Contains(out, "human gates") || !strings.Contains(out, "send_email") {
+		t.Fatalf("the spec-level advice row should still appear, got:\n%s", out)
+	}
+	if strings.Contains(out, "enforced") {
+		t.Errorf("nothing is gated — require_approval_for is empty — yet validate says enforced:\n%s", out)
+	}
+	if strings.Contains(out, "paused at the MCP gate proxy") {
+		t.Errorf("validate promises a pause for a call the proxy forwards:\n%s", out)
+	}
+}

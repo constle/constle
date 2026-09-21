@@ -42,6 +42,12 @@ func ParseFile(path string) (*AgentManifest, error) {
 // weakened configuration as though it had been asked for. Strict decoding is
 // the same judgement already made for an unrecognised capability value and an
 // unrecognised isolation level, applied to the key rather than the value.
+//
+// An Agentfile is exactly one YAML document. Strictness that stopped at the
+// first document would be strictness in name only: a decoder reads one
+// document and returns, so everything after a `---` is discarded by the same
+// silence, whether it holds an unknown key, a whole second policy, or YAML
+// that does not parse at all.
 func Parse(data []byte) (*AgentManifest, error) {
 	var m AgentManifest
 
@@ -57,6 +63,24 @@ func Parse(data []byte) (*AgentManifest, error) {
 			return nil, describeTypeError(typeErr)
 		}
 		return nil, fmt.Errorf("invalid YAML in Agentfile: %w", err)
+	}
+
+	// Require the stream to end here. A leading `---` or a trailing `...` is a
+	// marker on this one document and still reaches io.EOF; a genuine second
+	// document does not.
+	var extra yaml.Node
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+		// Exactly one document, as required.
+	case err == nil:
+		return nil, fmt.Errorf(
+			"an Agentfile must be a single YAML document; found a second one at line %d "+
+				"(everything after the first document is ignored, so it would declare nothing)",
+			extra.Line)
+	default:
+		// Not even well-formed. Reported rather than discarded: a file whose
+		// tail does not parse must never be answered with "is valid".
+		return nil, fmt.Errorf("invalid YAML in Agentfile after the first document: %w", err)
 	}
 
 	// If isolation is not set explicitly, infer it from the declared

@@ -131,6 +131,12 @@ case-variant key (`apiversion:`) is rejected on the same grounds as a
 misspelled one. The only open namespace is `metadata.labels`, whose keys are
 free-form by design.
 
+An Agentfile is **exactly one YAML document**. A second document — anything
+after a `---` separator — is a validation error rather than ignored content,
+for the same reason: a decoder reads one document and stops, so a trailing
+document declares nothing while reading as though it does. `---` at the start
+and `...` at the end are markers on the single document and remain valid.
+
 ---
 
 ## 4. Top-level fields
@@ -1400,6 +1406,7 @@ inert or bypassed.
 | `human_gates.notify[].channel` must be `webhook`, with a `url_secret_ref` | A declared notification path must never look real when it isn't |
 | An unrecognised capability is rejected | A typo must not silently lower the capability floor |
 | An unrecognised key is rejected (§3) | A typo must not silently drop the control the key declares |
+| A second YAML document is rejected (§3) | Everything after the first document is ignored, so it would declare nothing |
 | A declared `sandbox.isolation` may not be weaker than its capabilities require | Writing the line must not make the boundary weaker than omitting it |
 
 Warnings — surfaced, but not fatal — cover the cases where a declaration is
@@ -1645,6 +1652,13 @@ called out in the changelog.
   same reason as a misspelling; the runtime never guessed which key was meant
   and does not start now.
 - `metadata.labels` is unaffected: its keys are an open namespace by design.
+- An Agentfile is now required to be a single YAML document. Strictness that
+  stopped at the first one would have been strictness in name only: a decoder
+  reads one document and returns, so a second document — an unknown key, a
+  whole second policy, or YAML that does not parse at all — was discarded by
+  exactly the silence this change exists to end, and a file whose tail was
+  malformed was still answered with "is valid". A leading `---` and a trailing
+  `...` are markers on the one document and stay valid.
 - This is a **breaking change** under §19.3 — a previously valid manifest is
   now rejected — and it is not covered by any §19.4 exemption. It is recorded
   here rather than treated as a bug fix. `apiVersion` is unchanged: `v1alpha1`

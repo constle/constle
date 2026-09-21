@@ -324,3 +324,151 @@ func TestManifestSectionsCoverTheSchema(t *testing.T) {
 		}
 	}
 }
+
+// TestParseSuggestionThresholdCountsRunes closes a defect an independent review
+// found: the edit distance is counted in runes but was compared against the
+// byte length of the written key, so a short non-ASCII key looked long enough
+// to justify almost any suggestion.
+func TestParseSuggestionThresholdCountsRunes(t *testing.T) {
+	// Two runes, eight bytes. Against the byte length a distance of three
+	// passed, and the parser answered with "did you mean a2a?".
+	_, err := Parse(strictAgentfile("\"\U0001F4A3\U0001F4A3\": 1\n"))
+	if err == nil {
+		t.Fatal("Parse accepted an unknown key")
+	}
+	if strings.Contains(err.Error(), "did you mean") {
+		t.Errorf("suggested a key for input nothing resembles: %v", err)
+	}
+
+	// Genuine typos must still be answered, including short ones where the
+	// proportional threshold binds tightest: "mc" is two runes one edit from
+	// "mcp", so it sits exactly on the limit and must still suggest.
+	for _, tc := range []struct{ written, want string }{
+		{"mc", "mcp"},
+		{"a2", "a2a"},
+		{"kin", "kind"},
+	} {
+		_, err := Parse(strictAgentfile(tc.written + ": 1\n"))
+		if err == nil {
+			t.Fatalf("Parse accepted the unknown key %q", tc.written)
+		}
+		if !strings.Contains(err.Error(), `did you mean "`+tc.want+`"`) {
+			t.Errorf("%q lost its suggestion of %q: %v", tc.written, tc.want, err)
+		}
+	}
+
+	// And a longer typo inside a nested section, for the same reason.
+	_, err = Parse(strictAgentfile("mcp:\n  server: []\n"))
+	if err == nil {
+		t.Fatal("Parse accepted an unknown key")
+	}
+	if !strings.Contains(err.Error(), `did you mean "servers"`) {
+		t.Errorf("a real short typo lost its suggestion: %v", err)
+	}
+}
+
+// TestParseKeyContainingTheDiagnosticDelimiter closes a second review finding:
+// the rewriter split yaml's message on the first " not found in type ", so a
+// key legitimately containing that text was truncated and the error named a key
+// the author never wrote.
+func TestParseKeyContainingTheDiagnosticDelimiter(t *testing.T) {
+	_, err := Parse(strictAgentfile("\"x not found in type y\": 1\n"))
+	if err == nil {
+		t.Fatal("Parse accepted an unknown key")
+	}
+	if !strings.Contains(err.Error(), `unknown key "x not found in type y"`) {
+		t.Errorf("the error must name the key as written, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "at the top level") {
+		t.Errorf("the section must still be resolved, got: %v", err)
+	}
+}
+
+// TestParseRejectsTrailingDocument: strictness that stopped at the first
+// document would be strictness in name only. A decoder reads one document and
+// returns, so everything after a `---` was discarded by exactly the silence
+// KnownFields was added to end — including YAML that does not parse, which the
+// CLI answered with "is valid".
+func TestParseRejectsTrailingDocument(t *testing.T) {
+	const doc1 = `apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity:
+  name: strict-agent
+`
+	tests := []struct {
+		name string
+		yaml string
+		want string // a fragment the error must contain
+	}{
+		{
+			name: "unknown key in the second document",
+			yaml: doc1 + "---\ncapabilties: [send_email]\n",
+			want: "single YAML document",
+		},
+		{
+			name: "a whole second policy",
+			yaml: doc1 + "---\nhuman_gates:\n  enabled: true\n",
+			want: "single YAML document",
+		},
+		{
+			name: "malformed second document",
+			yaml: doc1 + "---\ncapabilities: [\n",
+			want: "after the first document",
+		},
+		{
+			name: "empty first document then content",
+			yaml: "---\n---\napiVersion: constle.dev/v1alpha1\n",
+			want: "single YAML document",
+		},
+		{
+			name: "empty first document then malformed",
+			yaml: "---\n---\ncapabilities: [\n",
+			want: "after the first document",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.yaml))
+			if err == nil {
+				t.Fatal("Parse accepted a file whose tail it silently discards")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %v, want it to mention %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseAcceptsDocumentMarkers is the counterweight. `---` and `...` are
+// markers on a single document and are ordinary YAML style; rejecting them
+// would break manifests that are entirely well-formed.
+func TestParseAcceptsDocumentMarkers(t *testing.T) {
+	const body = `apiVersion: constle.dev/v1alpha1
+kind: AgentManifest
+identity:
+  name: strict-agent
+`
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{"leading start marker", "---\n" + body},
+		{"trailing end marker", body + "...\n"},
+		{"both markers", "---\n" + body + "...\n"},
+		{"trailing blank lines", body + "\n\n"},
+		{"trailing comment", body + "# done\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := Parse([]byte(tt.yaml))
+			if err != nil {
+				t.Fatalf("Parse rejected a single well-formed document: %v", err)
+			}
+			if m.Identity.Name != "strict-agent" {
+				t.Errorf("identity.name = %q, want the document to have been read", m.Identity.Name)
+			}
+		})
+	}
+}
