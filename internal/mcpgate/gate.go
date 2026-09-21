@@ -225,6 +225,20 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 			return nil, fmt.Errorf("mcp server %q: invalid url: %w", srv.ID, err)
 		}
 
+		// The endpoint path is the base every forwarded request is held to, so
+		// it has to be unambiguous itself. A declared ".../safe/.." would pass
+		// withinEndpoint for "/safe/../admin" while an origin that normalises
+		// serves "/admin": the gate's promise would hold for the string and
+		// fail for the resource. Refused here rather than in the parser
+		// because this is where the base is taken, so no caller can reach the
+		// rewrite with a base that was never checked.
+		if reason := ambiguousPathReason(strings.TrimPrefix(target.Path, "/")); reason != "" {
+			return nil, fmt.Errorf(
+				"mcp server %q: url path %q cannot be an endpoint — %s; "+
+					"declare the endpoint the server actually serves",
+				srv.ID, target.Path, reason)
+		}
+
 		tools := map[string]bool{}
 		for _, tool := range srv.Tools {
 			tools[tool] = true
@@ -259,10 +273,9 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 				req.URL.Scheme = target.Scheme
 				req.URL.Host = target.Host
 				req.Host = target.Host
+				scrubHopByHop(req.Header)
 			},
-		}
-		if len(meters) > 0 {
-			proxy.ModifyResponse = meterResponse
+			ModifyResponse: refuseProtocolSwitch(len(meters) > 0),
 		}
 
 		g.servers[srv.ID] = &upstream{id: srv.ID, path: target.Path, tools: tools, meters: meters, proxy: proxy}
@@ -369,15 +382,16 @@ func (g *Gate) Close() error {
 // here is a hole in the allowlist, the human gate, the spending meter and the
 // audit trail at once.
 //
-// KNOWN GAPS, in this handler, neither closed by the method allowlist:
-// the sub-path after the server id is forwarded without normalising dot
-// segments, so a client can address paths on the upstream origin other than
-// the declared endpoint; and a request carrying Connection: Upgrade is
-// forwarded on an admitted method like any other, so an upstream that answers
-// 101 leaves the gate splicing a raw tunnel it cannot inspect. Both predate
-// the method allowlist and both are tracked separately — the guarantee this
-// handler makes is over the JSON-RPC a request carries, not yet over every
-// byte it can move.
+// Two further rules hold the request to the shape the gate can make a promise
+// about. The target must address the declared endpoint or a path under it, and
+// a sub-path that some second reading of the same bytes would turn into
+// structure — a dot segment, an interior empty segment, a percent sign that
+// survives one decode, a path parameter, a backslash — is refused rather than
+// normalised, because normalising it would silently pick one of the readings.
+// And a request asking to stop speaking HTTP (Connection: Upgrade) is refused,
+// with an upstream's 101 refused in turn, so no tunnel is ever spliced through
+// the gate. The guarantee is over every byte a request can move, not only over
+// the JSON-RPC it carries.
 func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rest, ok := strings.CutPrefix(r.URL.Path, "/"+g.token+"/servers/")
 	if !ok {
@@ -438,14 +452,198 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The sub-path is forwarded, so it decides which resource on the origin
+	// this request reaches. A segment either side would resolve — "..", an
+	// interior empty segment, or a separator or dot hidden behind
+	// percent-encoding — lets a client address a path other than the declared
+	// endpoint: another MCP server mounted beside this one, whose tool
+	// allowlist was never consulted, or anything else the origin serves.
+	//
+	// The check runs on the decoded sub-path, which is what r.URL.Path holds:
+	// "%2e%2e%2f" has already become "../" by the time it arrives here, and
+	// because the rewrite below clears RawPath, it is also what an upstream
+	// decodes back out of the wire. Refusing rather than resolving is the rule
+	// parseJSONRPC already applies to an ambiguous body: the gate does not
+	// forward what it cannot read exactly one way.
+	if reason := ambiguousPathReason(remainder); reason != "" {
+		g.log(audit.EventMCPRequestBlocked, map[string]any{
+			"server": up.id,
+			"method": clampMethod(r.Method),
+			"reason": reason,
+		})
+		http.Error(w, "constle mcp gate: "+reason, http.StatusBadRequest)
+		return
+	}
+
+	// A protocol upgrade asks to stop speaking HTTP. Streamable HTTP defines
+	// none — POST carries every message, GET opens the SSE stream, DELETE ends
+	// the session — so nothing legitimate is lost by refusing one. Forwarded,
+	// an upgrade the upstream accepts turns the reverse proxy into a raw
+	// bidirectional splice: the gate would hold open a tunnel it cannot
+	// inspect, to a host the sandbox is otherwise forbidden to reach directly
+	// at all, since an MCP server's host must not appear in
+	// network.allowed_hosts. The Director scrubs the headers as well, so the
+	// splice stays unreachable even if this refusal is ever moved or skipped.
+	if requestsUpgrade(r.Header) {
+		g.log(audit.EventMCPRequestBlocked, map[string]any{
+			"server": up.id,
+			"method": clampMethod(r.Method),
+			"reason": reasonProtocolUpgrade,
+		})
+		http.Error(w, "constle mcp gate: "+reasonProtocolUpgrade, http.StatusBadRequest)
+		return
+	}
+
 	// Rewrite the path so the upstream sees exactly its own endpoint path,
-	// plus any sub-path the client appended after the server id.
+	// plus any sub-path the client appended after the server id. RawPath is
+	// cleared with it: it still describes the original target, and leaving it
+	// in place would let EscapedPath put bytes on the wire that were never the
+	// path checked above.
 	r.URL.Path = up.path
 	if remainder != "" {
 		r.URL.Path = strings.TrimSuffix(up.path, "/") + "/" + remainder
 	}
+	r.URL.RawPath = ""
+
+	// A post-condition on the rewrite, not a check on the client: after the
+	// refusals above nothing can reach this line with a path outside the
+	// endpoint. It stays because the guarantee belongs to the joining, and a
+	// later change to it would otherwise reopen the gap with nothing failing.
+	if !withinEndpoint(up.path, r.URL.Path) {
+		g.log(audit.EventMCPRequestBlocked, map[string]any{
+			"server": up.id,
+			"method": clampMethod(r.Method),
+			"reason": reasonPathEscapedEndpoint,
+		})
+		http.Error(w, "constle mcp gate: "+reasonPathEscapedEndpoint, http.StatusBadRequest)
+		return
+	}
 
 	g.serveInspected(w, r, up)
+}
+
+// Refusal reasons for a request the gate will not forward. They are fixed
+// strings: each one reaches the audit log and the sandbox, and the offending
+// path is attacker-controlled, so naming it in either place would let the
+// sender write its own text into the signed log.
+const (
+	reasonDotSegment          = "dot or empty segment in the request path"
+	reasonPercentEncoding     = "percent-encoding in the request path"
+	reasonPathParameter       = "path parameter in the request path"
+	reasonBackslash           = "backslash in the request path"
+	reasonProtocolUpgrade     = "the MCP transport defines no protocol upgrade"
+	reasonPathEscapedEndpoint = "forwarded path outside the declared endpoint"
+)
+
+// ambiguousPathReason reports why a sub-path cannot be forwarded, or "" when
+// it can.
+//
+// It judges the decoded sub-path, which is the form the gate reads and — since
+// the rewrite clears RawPath and lets Go re-escape from it — also the form an
+// upstream gets back after decoding the wire once. Everything refused here is
+// a segment that some second reading of the same bytes turns into structure:
+//
+//   - "." and ".." are structure to every reader, and an empty segment is
+//     refused when another follows it, because a leading or doubled slash
+//     puts "//host" on the wire, which a parser is entitled to read as an
+//     authority rather than a path. A trailing empty segment is a path a
+//     server may legitimately distinguish, so it stays.
+//   - A percent sign in the *decoded* sub-path means the sender encoded a
+//     percent sign, and the only thing that reveals is an upstream decoding
+//     twice: "%252e%252e%252f" arrives here as "%2e%2e%2f" and becomes "../"
+//     on a second pass. Ordinary encoding is unaffected — "report%2Ejson"
+//     decodes to "report.json", which holds no percent sign and is forwarded.
+//   - A semicolon starts a path parameter, which several servers strip before
+//     they normalise, turning "..;" back into "..".
+//   - A backslash is not a separator in a URL, but an origin on a platform
+//     that treats it as one resolves "..\..\x" exactly like "../../x".
+//
+// Segments are compared whole, so "..foo", "foo..bar" and a name that merely
+// contains a dot stay legal; only a segment that *is* a dot segment does not.
+func ambiguousPathReason(remainder string) string {
+	segments := strings.Split(remainder, "/")
+	for i, segment := range segments {
+		switch {
+		case segment == "." || segment == "..":
+			return reasonDotSegment
+		case segment == "" && i != len(segments)-1:
+			return reasonDotSegment
+		case strings.Contains(segment, "%"):
+			return reasonPercentEncoding
+		case strings.Contains(segment, ";"):
+			return reasonPathParameter
+		case strings.Contains(segment, "\\"):
+			return reasonBackslash
+		}
+	}
+	return ""
+}
+
+// withinEndpoint reports whether a forwarded path is the declared endpoint or
+// sits beneath it. The comparison is on whole segments: "/mcp-admin" is not
+// under "/mcp", where a plain prefix test would say it is.
+func withinEndpoint(endpoint, forwarded string) bool {
+	endpoint = strings.TrimSuffix(endpoint, "/")
+	return forwarded == endpoint || strings.HasPrefix(forwarded, endpoint+"/")
+}
+
+// requestsUpgrade reports whether a request asks to switch protocols. Both
+// spellings count: the Upgrade header naming a protocol, and the "upgrade"
+// token inside Connection, which is what net/http's reverse proxy reads when
+// it decides whether to splice a 101 response.
+func requestsUpgrade(h http.Header) bool {
+	if len(h.Values("Upgrade")) > 0 {
+		return true
+	}
+	return headerHasToken(h, "Connection", "upgrade")
+}
+
+// headerHasToken reports whether a comma-separated header carries one token,
+// compared case-insensitively as RFC 9110 requires. net/http keeps repeated
+// headers as separate values, so every value is scanned.
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, candidate := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(candidate), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hopByHopHeaders are the connection-scoped headers of RFC 9110 §7.6.1, which
+// a proxy consumes rather than forwards. httputil.ReverseProxy strips them
+// itself — except that it deliberately restores Connection and Upgrade for an
+// upgrade request, which is the splice this gate refuses. scrubHopByHop runs
+// in the Director, before the proxy decides whether an upgrade was asked for,
+// so with these gone the decision can only be "no".
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// scrubHopByHop removes the connection-scoped headers from an outbound
+// request: first the ones the sender named in Connection, as RFC 9110 requires,
+// then Connection itself and the rest of the fixed set.
+func scrubHopByHop(h http.Header) {
+	for _, value := range h.Values("Connection") {
+		for _, named := range strings.Split(value, ",") {
+			if named = strings.TrimSpace(named); named != "" {
+				h.Del(named)
+			}
+		}
+	}
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
 }
 
 // serveInspected inspects one request — whatever its method — and applies
@@ -502,7 +700,7 @@ func (g *Gate) serveInspected(w http.ResponseWriter, r *http.Request, up *upstre
 		// its session in a header, so for both of them a legitimate body is
 		// an absent one, and that is all there is to inspect in the JSON-RPC
 		// a request of theirs can carry. (It is not all a request can carry —
-		// see the KNOWN GAPS on ServeHTTP.)
+		// the path and upgrade rules on ServeHTTP hold the rest.)
 		//
 		// A body on one of them is refused rather than run through the gate
 		// below. It cannot have come from a conforming client, and gating it
