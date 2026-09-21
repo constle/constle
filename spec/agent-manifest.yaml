@@ -356,6 +356,13 @@ human_gates:
 
   # What happens when approval does not arrive in time.
   # Accepted: abort | proceed. Default abort. There is no "retry".
+  #
+  # "Does not arrive" is wider than "nobody answered": an unreachable decision
+  # endpoint, one that never returns a parseable decision, and an
+  # approver_pubkey whose notify URL never resolved all end up here. abort
+  # refuses the call and stops the run; proceed forwards it unapproved. A
+  # decision that DOES arrive and fails verification is a denial, not a
+  # timeout, and this field does not affect it.
   on_timeout: abort
 
   # ENFORCED. "webhook" is the only channel this version supports, and an

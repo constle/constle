@@ -1289,10 +1289,20 @@ resolve, and it does not silently treat "nobody is watching" as approval.
 | Value | Behaviour |
 |-------|-----------|
 | `abort` | The gated call is refused and the run stops. The safe default. |
-| `proceed` | The call continues without approval. |
+| `proceed` | The call is forwarded **without approval.** |
+
+This field decides every gate that reaches its deadline without a decision,
+which is a wider set than "nobody was watching." An unreachable decision
+endpoint, an endpoint that answers but never with a parseable decision, and a
+declared `approver_pubkey` whose notify URL never resolved all arrive here too
+(`spec/human-gates-webhook.md` §8.2) — Constle cannot tell a silent approver
+from a broken channel, and does not try to. A decision that *does* arrive and
+fails verification is a denial rather than a timeout, and this field does not
+affect it.
 
 There is deliberately no `retry`. Use `abort`: an agent that proceeds without
-approval after a timeout has a gate that reduces to a delay.
+approval after a timeout has a gate that reduces to a delay — and under
+`proceed`, a broken decision channel reduces to the same thing.
 
 ### 13.6 `human_gates.notify`
 
@@ -1312,10 +1322,21 @@ likewise rejected.
 keeping the secret out of the committed manifest — the same indirection as
 `identity.did` keeping the private key out.
 
-Delivery is fire-and-forget: the gate never blocks on a notification, and a
-failed delivery never blocks the approval flow. The local prompt and timeout
-are the enforcement; the webhook is the signal. An unset environment variable
-produces a visible warning and the gate still enforces locally.
+Delivery of the *notification* is fire-and-forget: the gate never blocks on it,
+and a failed delivery never blocks the approval flow. An unset environment
+variable produces a visible warning and the gate still enforces locally.
+
+The same URL is also where a **decision** is fetched from when
+`human_gates.approver_pubkey` is set — one URL serves both, and the signed
+decision channel is specified in `spec/human-gates-webhook.md`. Where several
+entries resolve, notifications fan out to every resolved URL but decisions are
+polled from the **first** one only; the others are signal endpoints and cannot
+answer a gate. With no `approver_pubkey` declared, or with none of the notify
+URLs resolving, the webhook is a signal only, and the local prompt plus
+`on_timeout` are the whole enforcement. In the second case Constle warns at run
+time rather than refusing to start, so a gate can be armed with its remote
+decision channel silently absent — `on_timeout` (§13.5) is what decides such a
+gate.
 
 ---
 
