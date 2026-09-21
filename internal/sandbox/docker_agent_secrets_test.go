@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"strings"
@@ -300,9 +301,17 @@ func TestAgentRunCommandReachesTheContainer(t *testing.T) {
 
 	probe := exec.Command("docker", run...)
 	probe.Env = cmd.Env
-	out, err := probe.CombinedOutput()
+
+	// Stdout only. The container's output is on stdout; the docker client's own
+	// diagnostics are on stderr, and on a runner without the image cached those
+	// diagnostics are a pull progress report that CombinedOutput would prepend
+	// to the value being asserted on. What the container received must not
+	// depend on what the client had to say about fetching the image first.
+	var clientErr bytes.Buffer
+	probe.Stderr = &clientErr
+	out, err := probe.Output()
 	if err != nil {
-		t.Fatalf("docker run: %v\n%s", err, out)
+		t.Fatalf("docker run: %v\n%s", err, clientErr.Bytes())
 	}
 
 	want := env["CONSTLE_A2A_URL"]
