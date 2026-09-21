@@ -61,6 +61,37 @@ type meterJob struct {
 	reqID json.RawMessage
 }
 
+// refuseProtocolSwitch builds the ModifyResponse every upstream carries,
+// priced or not.
+//
+// Its first job is the response half of the gate's upgrade rule. A 101 is the
+// point where httputil.ReverseProxy stops proxying and starts splicing: it
+// hijacks the client connection and copies bytes both ways until one side
+// closes, past every check in this package. ReverseProxy calls ModifyResponse
+// before it does that, and treats an error as a failed response — the
+// upstream body is closed and the agent gets a 502 — so refusing here is what
+// keeps the tunnel from existing, including when the upstream answers 101 to
+// a request that never asked to upgrade.
+//
+// Anything below 200 is refused, not 101 alone. The transport delivers the
+// other informational responses itself and never surfaces them here, so the
+// wider test costs nothing and does not depend on that staying true.
+//
+// A priced upstream's response is then handed to meterResponse. Installing
+// both through one function is what keeps a future third hook from having to
+// choose between them.
+func refuseProtocolSwitch(metered bool) func(*http.Response) error {
+	return func(resp *http.Response) error {
+		if resp.StatusCode < 200 {
+			return fmt.Errorf("upstream answered %d: the MCP transport defines no protocol upgrade", resp.StatusCode)
+		}
+		if !metered {
+			return nil
+		}
+		return meterResponse(resp)
+	}
+}
+
 // meterResponse is installed as ModifyResponse on priced upstreams: it
 // wraps the response body so bytes stream through to the agent while a
 // bounded copy is retained, then meters once the body is fully read (or

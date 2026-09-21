@@ -751,6 +751,41 @@ two strings the gate routes on, `method` and `params.name`, are refused on the
 same principle when they differ from the spelling the gate matches only by
 case, by surrounding whitespace, or by a control character.
 
+**One endpoint, no traversal.** A client may append a sub-path after the server
+id, and the gate forwards it under the declared endpoint: with a declared
+`url` of `https://mcp.example.com/v1/mcp`, a request to
+`$CONSTLE_MCP_<ID>_URL/messages` reaches `https://mcp.example.com/v1/mcp/messages`
+and nothing else. The sub-path can only descend.
+
+The gate judges the sub-path after one decode, which is also what the origin
+gets back off the wire, and refuses — with `400` and an `mcp_request_blocked`
+event — any segment that a second reading of the same bytes would turn into
+structure: a `.` or `..` segment however it was encoded, an interior empty
+segment, a percent sign that survives the first decode (the mark of an origin
+being asked to decode twice, as in `%252e%252e%252f`), a path parameter
+(`..;/`, which servers that strip `;...` before normalising read as `..`), and
+a backslash (a separator to an origin on a platform that treats it as one).
+Ordinary encoding is untouched: `report%2Ejson` decodes to `report.json` and
+is forwarded.
+
+Nothing is normalised, because normalising picks one of the readings and the
+gate cannot know which one the origin will pick. The declared `url` is held to
+the same rule: an endpoint path that is itself ambiguous is refused when the
+gate is built, since a base that does not mean one thing cannot bound anything.
+
+This keeps the tool allowlist meaningful when several MCP servers share one
+origin. A traversal out of the declared endpoint would otherwise reach a
+neighbouring server's endpoint, which the gate would forward under *this*
+server's allowlist, human gates and metering.
+
+**No protocol upgrades.** Streamable HTTP defines none, so a request carrying
+an `Upgrade` header or the `upgrade` token in `Connection` is refused with
+`400` and an `mcp_request_blocked` event, and a `101 Switching Protocols` from
+an upstream fails the response with `502`. An accepted upgrade would stop the
+exchange being HTTP at all: the gate would be holding open a raw bidirectional
+tunnel it cannot inspect, to a host the sandbox is forbidden to reach directly
+(§7.2), for as long as either side kept it open.
+
 ### 9.1 `mcp.servers[].id`
 
 | | |
@@ -1376,7 +1411,7 @@ private key is not available on this machine.
 | `sandbox.network.allowed_hosts` | **ENFORCED** | Per-run Squid allowlist; the real egress control |
 | `capabilities` | **ENFORCED** (capability floor) / DECLARED (gate advice) | Unknown values rejected |
 | `mcp.servers[].id` | VALIDATED | Unique; names `CONSTLE_MCP_<ID>_URL` |
-| `mcp.servers[].url` | **ENFORCED** | Host side only; never enters the sandbox |
+| `mcp.servers[].url` | **ENFORCED** | Host side only; never enters the sandbox; forwarding is scoped to this endpoint |
 | `mcp.servers[].tools` | **ENFORCED** | Non-listed tools blocked at the gate |
 | `mcp.servers[].pricing` | **ENFORCED** | Meters every `tools/call` response; fails closed on missing usage |
 | `a2a.listen` | **ENFORCED** | Host-side listener; verifies before relaying inward |
