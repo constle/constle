@@ -26,13 +26,16 @@ import (
 // egress control, and "api.example.com 10.1.2.3" is refused instead of
 // becoming two entries that the MCP and A2A overlap checks never saw.
 //
-// Uppercase is refused for the same reason rather than folded. Squid
-// matches dstdomain values case-insensitively, but the guards that keep an
-// MCP server or the sandbox host out of the allowlist (hostsOverlap,
-// isHostLoopbackAlias) compare exactly — so "HOST.DOCKER.INTERNAL" would
-// pass those guards and still resolve to the gate transport at the proxy.
-// One spelling per host closes that, and matches the id charset used
-// elsewhere in this package.
+// Uppercase is refused rather than folded, so that an entry means one host
+// and reads as one host: Squid matches dstdomain values case-insensitively,
+// and two entries differing only in case would be one rule rendered twice.
+// It also matches the id charset used elsewhere in this package.
+//
+// The guards that keep an MCP server or the sandbox host out of the
+// allowlist (hostsOverlap, isHostLoopbackAlias) no longer depend on that.
+// They normalise both sides themselves, because the host they compare an
+// entry against comes from a URL, where uppercase and a trailing dot are
+// legal spellings of the same name and this grammar never sees them.
 //
 // buildSquidConfig (internal/sandbox/docker.go) calls this again before it
 // renders, so a manifest built in Go without Validate cannot skip it; a
