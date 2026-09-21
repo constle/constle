@@ -2555,3 +2555,75 @@ func TestUpstreamProxiesCarryTheirGuards(t *testing.T) {
 		t.Error("unpriced upstream accepted a 101 Switching Protocols")
 	}
 }
+
+// TestDisabledGatesAgreeWithEnforcedGateEntries pins the invariant that
+// F17/F24/F77 broke: the gate proxy and the CLI must never disagree about
+// whether a declared gate is real.
+//
+// human_gates.enabled: false disarms the proxy (spec/agent-manifest.md §13.1),
+// and it always did — the proxy was correct. What was wrong was that
+// EnforcedGateEntries classified purely on the tool mapping, so
+// `constle validate` reported "send_email … paused at the MCP gate proxy for
+// approval" while a denying approver here never saw the call. The test asserts
+// both halves at once so a future edit cannot fix one side alone.
+func TestDisabledGatesAgreeWithEnforcedGateEntries(t *testing.T) {
+	calls := &atomic.Int64{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"sent"}]}}`)
+	}))
+	t.Cleanup(up.Close)
+
+	logger, err := audit.New(homedir.Under(t.TempDir(), "audit.jsonl"))
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "test-agent"},
+		MCP: manifest.MCP{Servers: []manifest.MCPServer{
+			{ID: "email", URL: up.URL, Tools: []string{"send_email"}},
+		}},
+		HumanGates: manifest.HumanGates{
+			Enabled:                false, // the master switch, off
+			RequireApprovalFor:     []string{"send_email"},
+			ApprovalTimeoutSeconds: 300,
+			OnTimeout:              "abort",
+		},
+	}
+
+	// The CLI half: nothing may be reported as enforced.
+	enforced, unenforced := m.EnforcedGateEntries()
+	if len(enforced) != 0 {
+		t.Errorf("EnforcedGateEntries reported %v as enforced while the master switch is off", enforced)
+	}
+	if len(unenforced) != 1 || unenforced[0] != "send_email" {
+		t.Errorf("unenforced = %v, want [send_email]", unenforced)
+	}
+
+	// The runtime half: the proxy arms nothing, and says so by forwarding.
+	g, err := New(m, &fixedApprover{decision: DecisionDenied}, nil, logger, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if len(g.gated) != 0 {
+		t.Errorf("gate armed %v with the master switch off", g.gated)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	port, token, err := g.Bind("testrun01", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/%s/servers/email", port, token)
+
+	// A denying approver would refuse this call if any gate were armed.
+	if code, _ := postJSON(t, url, toolCallBody("send_email")); code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: an unarmed gate forwards", code)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1: the call must reach the upstream ungated", got)
+	}
+}

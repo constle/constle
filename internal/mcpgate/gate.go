@@ -213,7 +213,10 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 		agentName: m.Identity.Name,
 	}
 
-	if m.HumanGates.Enabled {
+	// The master switch, read through the one predicate the CLI also reports
+	// from, so neither side can start disagreeing about whether a declared
+	// gate is real (manifest.HumanGates.GatesArmed).
+	if m.HumanGates.GatesArmed() {
 		for _, entry := range m.HumanGates.RequireApprovalFor {
 			g.gated[entry] = true
 		}

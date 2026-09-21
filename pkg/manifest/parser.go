@@ -558,11 +558,25 @@ func (m *AgentManifest) validateHumanGates() error {
 // declared MCP tool (enforced by the gate proxy) and entries that provably
 // match nothing (unenforced — surfaced as a warning by the CLI).
 //
-// An entry is "possibly enforced" when any declared server omits its tools
-// allowlist: the runtime match is exact on the tool name of every tools/call,
-// so such an entry may still gate a real call. Only entries that cannot match
-// under any declared server are reported as unenforced.
+// The master switch comes first: when human_gates.enabled is false, the gate
+// proxy arms nothing (spec/agent-manifest.md §13.1), so EVERY entry is
+// unenforced however well it matches a declared tool. Consulting the tool
+// mapping without consulting HumanGates.GatesArmed first is what let the CLI
+// report a gate as "paused at the MCP gate proxy for approval" while the
+// proxy forwarded every call to it ungated.
+//
+// Beyond the switch, an entry is "possibly enforced" when any declared server
+// omits its tools allowlist: the runtime match is exact on the tool name of
+// every tools/call, so such an entry may still gate a real call. Only entries
+// that cannot match under any declared server are reported as unenforced.
 func (m *AgentManifest) EnforcedGateEntries() (enforced, unenforced []string) {
+	if !m.HumanGates.GatesArmed() {
+		if len(m.HumanGates.RequireApprovalFor) == 0 {
+			return nil, nil
+		}
+		return nil, append([]string(nil), m.HumanGates.RequireApprovalFor...)
+	}
+
 	anyServerWithoutToolList := false
 	declaredTools := map[string]bool{}
 	for _, srv := range m.MCP.Servers {

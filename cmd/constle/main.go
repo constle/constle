@@ -441,11 +441,16 @@ func cmdRun(opts runOptions) error {
 					Out:            lockedStdout{},
 				},
 			}}
-		case wn == nil && m.HumanGates.ApproverPubkey != "":
+		case wn == nil && m.HumanGates.ApproverPubkey != "" && m.HumanGates.GatesArmed():
 			// Declared but unusable: approver_pubkey names a verifier with
 			// nothing to verify, because no notify webhook URL resolved.
 			// Same principle as warnUnenforcedHumanGates — a declared
 			// protection must never look real when it isn't.
+			//
+			// Gated by GatesArmed for that same reason in the other
+			// direction: with the master switch off nothing is ever decided
+			// at this terminal either, and promising that it would be is the
+			// false assurance rather than a warning about one.
 			printf("⚠️  warning: human_gates.approver_pubkey is set but no notify " +
 				"webhook URL resolved — gated calls will only be decided at this terminal\n")
 		}
@@ -1018,9 +1023,15 @@ func printValidatePlain(agentfilePath string, m *manifest.AgentManifest) {
 	if len(gates) > 0 {
 		// Careful wording: capability-derived gates are spec-level advice;
 		// enforcement happens on MCP tool calls whose names exactly match
-		// require_approval_for entries.
-		printf("  human gates: %s (approval required by spec — enforced for matching MCP tools)\n",
-			strings.Join(gates, ", "))
+		// require_approval_for entries — and only while the master switch is
+		// on, so the qualifier must not survive human_gates.enabled: false.
+		if m.HumanGates.GatesArmed() {
+			printf("  human gates: %s (approval required by spec — enforced for matching MCP tools)\n",
+				strings.Join(gates, ", "))
+		} else {
+			printf("  human gates: %s (approval required by spec — human_gates.enabled is false, nothing is gated)\n",
+				strings.Join(gates, ", "))
+		}
 	}
 
 	if enforced, _ := m.EnforcedGateEntries(); len(enforced) > 0 {
@@ -1053,7 +1064,11 @@ func renderValidateStyled(agentfilePath string, m *manifest.AgentManifest) {
 		rows = append(rows, kv{"allowed", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", "))})
 	}
 	if gates := manifest.InferRequiredGates(m.Capabilities); len(gates) > 0 {
-		rows = append(rows, kv{"human gates", stInk.Render(strings.Join(gates, ", ")) + stMuted.Render("  ∙  by spec")})
+		note := stMuted.Render("  ∙  by spec")
+		if !m.HumanGates.GatesArmed() {
+			note += stAmber.Render("  ∙  gates off")
+		}
+		rows = append(rows, kv{"human gates", stInk.Render(strings.Join(gates, ", ")) + note})
 	}
 	if enforced, _ := m.EnforcedGateEntries(); len(enforced) > 0 {
 		rows = append(rows, kv{"enforced", stInk.Render(strings.Join(enforced, ", ")) + stMuted.Render("  ∙  at gate")})

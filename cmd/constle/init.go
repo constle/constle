@@ -155,7 +155,9 @@ limits:
 # constle warns about them at validate and run time.
 human_gates:
   # Master switch. Set to false only for fully automated pipelines where
-  # no human can reasonably be reached during a run.
+  # no human can reasonably be reached during a run. false disarms EVERY
+  # entry below, however well it matches a declared tool — constle then
+  # reports them as not enforced and warns at validate and run time.
   enabled: true
 
   # MCP tool names that must be explicitly approved before each call.

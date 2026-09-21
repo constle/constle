@@ -650,6 +650,10 @@ func TestValidateApproverPubkey(t *testing.T) {
 
 func TestEnforcedGateEntries(t *testing.T) {
 	m := validManifestWithMCP()
+	// The master switch is load-bearing here and is set deliberately: without
+	// it nothing is enforced whatever the tool mapping says, which is what
+	// TestEnforcedGateEntriesRespectsMasterSwitch covers.
+	m.HumanGates.Enabled = true
 	m.HumanGates.RequireApprovalFor = []string{"send_email", "payment"}
 
 	enforced, unenforced := m.EnforcedGateEntries()
@@ -672,6 +676,50 @@ func TestEnforcedGateEntries(t *testing.T) {
 	enforced, unenforced = m.EnforcedGateEntries()
 	if len(enforced) != 0 || len(unenforced) != 2 {
 		t.Errorf("with no servers: enforced = %v, unenforced = %v, want all unenforced", enforced, unenforced)
+	}
+}
+
+// TestEnforcedGateEntriesRespectsMasterSwitch pins the precedence between the
+// master switch and the tool mapping. human_gates.enabled: false disarms the
+// gate proxy outright (spec/agent-manifest.md §13.1), so an entry that matches
+// a declared tool perfectly is still not enforced — reporting it as enforced
+// is what made `constle validate` promise a pause the proxy never performed.
+func TestEnforcedGateEntriesRespectsMasterSwitch(t *testing.T) {
+	m := validManifestWithMCP()
+	m.HumanGates.Enabled = false
+	m.HumanGates.RequireApprovalFor = []string{"send_email"}
+
+	enforced, unenforced := m.EnforcedGateEntries()
+	if len(enforced) != 0 {
+		t.Errorf("enforced = %v, want none: the master switch is off", enforced)
+	}
+	if len(unenforced) != 1 || unenforced[0] != "send_email" {
+		t.Errorf("unenforced = %v, want [send_email]", unenforced)
+	}
+
+	// A server with no tools allowlist does not resurrect the entry either:
+	// "may match at runtime" is only true while the proxy is arming gates.
+	m.MCP.Servers[0].Tools = nil
+	if enforced, _ := m.EnforcedGateEntries(); len(enforced) != 0 {
+		t.Errorf("with an open tool list: enforced = %v, want none", enforced)
+	}
+
+	// Flipping the switch on, and nothing else, enforces it.
+	m.MCP.Servers[0].Tools = []string{"send_email"}
+	m.HumanGates.Enabled = true
+	enforced, unenforced = m.EnforcedGateEntries()
+	if len(enforced) != 1 || enforced[0] != "send_email" {
+		t.Errorf("with the switch on: enforced = %v, want [send_email]", enforced)
+	}
+	if len(unenforced) != 0 {
+		t.Errorf("with the switch on: unenforced = %v, want none", unenforced)
+	}
+
+	// An empty list reports nothing either way — there is no gate to report.
+	m.HumanGates.Enabled = false
+	m.HumanGates.RequireApprovalFor = nil
+	if enforced, unenforced := m.EnforcedGateEntries(); len(enforced) != 0 || len(unenforced) != 0 {
+		t.Errorf("with no entries: enforced = %v, unenforced = %v, want both empty", enforced, unenforced)
 	}
 }
 

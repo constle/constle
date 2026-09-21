@@ -1162,6 +1162,11 @@ The master switch. When `false`, **no gating occurs at all**, even if
 `require_approval_for` lists entries. Set it to `true` for any agent whose
 gates you intend to rely on.
 
+Because the default is `false`, a `require_approval_for` list written without
+`enabled: true` gates nothing. `constle validate` and `constle run` report such
+entries as NOT enforced and warn, naming this switch — the entries are declared
+but disarmed, and a declared protection must never look real when it isn't.
+
 ### 13.2 `human_gates.require_approval_for`
 
 | | |
@@ -1386,9 +1391,10 @@ inert or bypassed.
 | A declared `sandbox.isolation` may not be weaker than its capabilities require | Writing the line must not make the boundary weaker than omitting it |
 
 Warnings — surfaced, but not fatal — cover the cases where a declaration is
-well-formed but the runtime cannot act on it: unenforceable gate entries,
-unmetered spending limits, `max_per_month_usd`, and an `identity.did` whose
-private key is not available on this machine.
+well-formed but the runtime cannot act on it: unenforceable gate entries, gate
+entries declared beneath `enabled: false`, unmetered spending limits,
+`max_per_month_usd`, and an `identity.did` whose private key is not available
+on this machine.
 
 ---
 

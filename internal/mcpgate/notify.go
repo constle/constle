@@ -32,6 +32,16 @@ type WebhookNotifier struct {
 // a warning on out and are skipped — the gate still enforces locally.
 // Returns nil when no webhook ends up configured.
 func NewWebhookNotifier(gates manifest.HumanGates, out io.Writer) *WebhookNotifier {
+	// A disarmed gate triggers nothing, so there is nothing to notify about.
+	// Resolving the URLs anyway would warn that "gate events will only be
+	// visible on this terminal", which is the same false assurance the gate
+	// reporting was just fixed for: it says enforcement moved somewhere, when
+	// no gate is going to fire at all. warnUnenforcedHumanGates has already
+	// said the accurate thing by then.
+	if !gates.GatesArmed() {
+		return nil
+	}
+
 	var urls []string
 	for _, n := range gates.Notify {
 		if n.Channel != "webhook" {
