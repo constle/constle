@@ -838,7 +838,7 @@ func TestEnforcedGateEntries(t *testing.T) {
 
 // TestEnforcedGateEntriesRespectsMasterSwitch pins the precedence between the
 // master switch and the tool mapping. human_gates.enabled: false disarms the
-// gate proxy outright (spec/agent-manifest.md §13.1), so an entry that matches
+// gate proxy outright (spec/agent-manifest.md §14.1), so an entry that matches
 // a declared tool perfectly is still not enforced — reporting it as enforced
 // is what made `constle validate` promise a pause the proxy never performed.
 func TestEnforcedGateEntriesRespectsMasterSwitch(t *testing.T) {

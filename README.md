@@ -210,6 +210,7 @@ The installer fetches `checksums.txt` for the release it is installing and refus
   image:       basic-agent:latest
   memory:      512MB
   allowed:     api.groq.com
+  credentials: GROQ_API_KEY, AGENT_TASK
 
 ⚠️  warning: spending limits are declared but NOT enforced:
    no mcp.servers entry declares a pricing block, so there is nothing to meter.
@@ -236,6 +237,7 @@ constle v0.5.0
      isolation: network
      memory:    512MB
      network:   restricted → api.groq.com
+     credentials: GROQ_API_KEY, AGENT_TASK
      spending:  run≤$0.10 (NOT ENFORCED — no priced MCP servers)
 
   → detecting backend
@@ -253,7 +255,7 @@ constle v0.5.0
 ```
 
 > [!NOTE]
-> `constle run` takes no `--env` flag. Exactly three host variables are forwarded into the sandbox — `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, and `AGENT_TASK` — and they're never written into the image or the manifest.
+> `constle run` takes no `--env` flag. An agent receives exactly the host variables its manifest declares under `credentials:` — the example declares `GROQ_API_KEY` and `AGENT_TASK` — and nothing else from your environment crosses into the sandbox. Only the variable *name* goes in the manifest; the value stays in your shell, and is never written into the image, the manifest, or the audit log. Declare nothing and the agent gets nothing.
 
 **4. Sign the audit trail** (optional, ~20 seconds more): `constle identity create`, paste the DID into the manifest, run again, then `constle audit verify` catches a single edited byte.
 

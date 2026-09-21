@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/constle/constle/internal/agentenv"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -91,6 +92,18 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 		// Same fail-closed rule for A2A: declared peers without the signing
 		// gate must never fall back to unsigned direct access.
 		return nil, fmt.Errorf("manifest declares a2a peers but no A2A gate is attached to the backend")
+	}
+
+	// Resolve the declared credentials before the first resource is created. A
+	// credential the host cannot supply fails the run (credentials.Resolve), and
+	// failing here costs no networks, no proxy container and no rollback —
+	// whereas the same refusal one step later would have to unwind them. It sits
+	// with the two fail-closed gate checks above for that reason: everything
+	// that can refuse the run on the manifest alone happens before anything
+	// exists to clean up.
+	credEnv, err := agentenv.Resolve(m)
+	if err != nil {
+		return nil, err
 	}
 
 	extNet := "constle-ext-" + runID
@@ -199,19 +212,15 @@ func (d *DockerBackend) Start(m *manifest.AgentManifest) (*RunContext, error) {
 		agentLabels[k] = v
 	}
 
-	// Forward API keys from the host environment into the agent container.
-	// Only included when the variable is set on the host; absent key → omitted flag.
-	agentEnv := forwardedHostEnv()
-
 	// Point the agent at the MCP and A2A gates. Gate traffic rides the proxy
 	// env vars like all other egress; Squid only lets it through to the gate
 	// ports.
-	for k, v := range mcpGateEnv(m, gateHost, gatePort, gateToken) {
-		agentEnv[k] = v
-	}
+	gateEnv := mcpGateEnv(m, gateHost, gatePort, gateToken)
 	for k, v := range a2aGateEnv(gateHost, a2aPort, a2aToken) {
-		agentEnv[k] = v
+		gateEnv[k] = v
 	}
+
+	agentEnv := agentContainerEnv(credEnv, gateEnv)
 
 	agentID, err := startAgentContainer(agentName, intNet, image, m.Sandbox.MemoryMB, m.Sandbox.Command, agentLabels, agentEnv)
 	if err != nil {
@@ -517,17 +526,106 @@ func a2aGateEnv(gateHost string, gatePort int, gateToken string) map[string]stri
 	}
 }
 
-// forwardedHostEnv collects the host environment variables forwarded into
-// every agent sandbox, regardless of backend. Only variables actually set
-// on the host are included.
-func forwardedHostEnv() map[string]string {
-	env := map[string]string{}
-	for _, key := range []string{"ANTHROPIC_API_KEY", "GROQ_API_KEY", "AGENT_TASK"} {
-		if value := os.Getenv(key); value != "" {
-			env[key] = value
-		}
+// agentContainerEnv composes the environment the agent container receives, in
+// the one order that is safe: declared credentials first, then the addresses
+// constle minted for this run.
+//
+// The order is a guard, not a style. A gate URL carries this run's gate token
+// and is the agent's only route to the MCP and A2A gates, so it must be
+// impossible for an Agentfile to replace it with a stale value out of the
+// operator's shell. This backend already applied the gate addresses last, when
+// the forwarded set was a hardcoded list; naming the property here is what
+// keeps it true now that the other operand comes from the Agentfile.
+// manifest.Validate refuses a credential named CONSTLE_* (ReservedCredentialName)
+// and credentials.Resolve refuses it again; this is the structural half, which
+// holds when neither has run.
+//
+// The four proxy variables are deliberately absent: agentRunArgs writes them
+// into the argv itself, with their values inline, and skips any entry here that
+// collides with one. The Firecracker backend's guestEnv is the same function
+// for the same reason, with the proxy variables included because that backend
+// delivers them through the same file.
+func agentContainerEnv(credEnv, gateEnv map[string]string) map[string]string {
+	env := make(map[string]string, len(credEnv)+len(gateEnv))
+	for k, v := range credEnv {
+		env[k] = v
+	}
+	for k, v := range gateEnv {
+		env[k] = v
 	}
 	return env
+}
+
+// dockerProxyURL is the in-network address of the per-run Squid proxy.
+const dockerProxyURL = "http://squid:3128"
+
+// dockerProxyEnv is the complete proxy configuration the agent container is
+// given, in argv order. Both spellings of every name appear because HTTP
+// clients disagree about which they read.
+//
+// EVERY name the docker CLI can fill in is set here, not only the ones constle
+// has a value for, and that is the reason the list is this long. The CLI injects
+// proxy variables into every container it starts from the `proxies` block of
+// ~/.docker/config.json — httpProxy, httpsProxy, ftpProxy, noProxy and allProxy
+// — whether or not constle asked. An explicit -e wins over that injection, so
+// the four constle already set were safe; the rest were not, and the operator's
+// values arrived in the sandbox unasked.
+//
+// Verified against a real daemon. With a proxies block configured, a container
+// started the old way received the operator's `NO_PROXY`, `ALL_PROXY` and
+// `FTP_PROXY` — and those values carry a URL, so a proxy configured as
+// `http://user:password@host` delivers the operator's proxy CREDENTIALS into the
+// sandbox. Also readable afterwards through `docker inspect`.
+//
+// Three things were wrong with that, in ascending order:
+//
+//   - It handed an untrusted agent the hostnames of the operator's internal
+//     proxy and no-proxy domains — reconnaissance about the operator's network,
+//     delivered by the boundary that exists to contain the agent.
+//   - A client that prefers ALL_PROXY over HTTP_PROXY addressed a proxy the
+//     internal network has no route to, so its requests failed without ever
+//     reaching Squid — and therefore without appearing in the run's network
+//     audit, which is read from Squid's access log. Egress does not escape this
+//     way (there is no route off the network at all), but a run's traffic could
+//     go unrecorded.
+//   - Where the proxy URL carried userinfo, a secret the operator never declared
+//     reached the agent — the exact thing the credentials section exists to
+//     prevent, arriving by a door the section could not close. An operator could
+//     not have stopped it by declaring the name either: these names are reserved.
+//
+// ALL_PROXY and FTP_PROXY point at Squid rather than being blanked, so a client
+// that reads either still traverses the chokepoint instead of losing its proxy.
+// NO_PROXY is set EMPTY on purpose: on this backend nothing is exempt, because
+// nothing but Squid is reachable.
+var dockerProxyEnv = []struct{ name, value string }{
+	{"HTTP_PROXY", dockerProxyURL},
+	{"HTTPS_PROXY", dockerProxyURL},
+	{"http_proxy", dockerProxyURL},
+	{"https_proxy", dockerProxyURL},
+	{"ALL_PROXY", dockerProxyURL},
+	{"all_proxy", dockerProxyURL},
+	{"FTP_PROXY", dockerProxyURL},
+	{"ftp_proxy", dockerProxyURL},
+	{"NO_PROXY", ""},
+	{"no_proxy", ""},
+}
+
+// isDockerProxyEnvName reports whether name is one of the proxy variables the
+// backend sets itself. Derived from dockerProxyEnv so that the set agentRunArgs
+// WRITES and the set it refuses to let a credential overwrite are the same set:
+// two hand-maintained copies would drift, and the direction they would drift in
+// is a credential silently replacing the sandbox's route to the network.
+//
+// Case-insensitive, because the paired spellings above are one variable on
+// Windows and two on unix, and which of those a host happens to be must not
+// decide whether an agent's egress path can be overwritten.
+func isDockerProxyEnvName(name string) bool {
+	for _, proxy := range dockerProxyEnv {
+		if strings.EqualFold(name, proxy.name) {
+			return true
+		}
+	}
+	return false
 }
 
 // proxyRunArgs builds the `docker run` argv for the Squid proxy. It is split
@@ -644,15 +742,13 @@ func agentRunArgs(name, intNet, image string, memoryMB int, command []string, la
 		"--network", intNet,
 		fmt.Sprintf("--memory=%dm", memoryMB),
 		fmt.Sprintf("--memory-swap=%dm", memoryMB),
-		"-e", "HTTP_PROXY=http://squid:3128",
-		"-e", "HTTPS_PROXY=http://squid:3128",
-		"-e", "http_proxy=http://squid:3128",
-		"-e", "https_proxy=http://squid:3128",
+	}
+	for _, proxy := range dockerProxyEnv {
+		args = append(args, "-e", proxy.name+"="+proxy.value)
 	}
 
-	// Caller-supplied env vars — the host API keys forwarded by
-	// forwardedHostEnv and the MCP/A2A gate tokens minted for this run — are
-	// passed by NAME ONLY. `docker run -e NAME`, with no "=", makes the
+	// Caller-supplied env vars — the credentials the Agentfile declared and the
+	// MCP/A2A gate tokens minted for this run — are passed by NAME ONLY. `docker run -e NAME`, with no "=", makes the
 	// client read the value out of its own environment and hand it to the
 	// daemon over the socket.
 	//
@@ -665,9 +761,25 @@ func agentRunArgs(name, intNet, image string, memoryMB int, command []string, la
 	//
 	// startAgentContainer supplies the values through agentEnvForCommand;
 	// /proc/<pid>/environ is readable only by the process owner and root.
-	// The four proxy variables above keep their values inline on purpose —
-	// they are the fixed in-network Squid address, not a secret.
+	// The proxy variables above keep their values inline on purpose — they are
+	// the fixed in-network Squid address, not a secret.
 	for _, k := range sortedKeys(envVars) {
+		// A variable that collides with one of the proxy names above is
+		// dropped, not emitted. Two "-e" entries for one name would leave
+		// which value the container gets to docker's argument handling, and
+		// the one that must survive is the proxy address the run built: the
+		// sandbox has no route off its internal network except through Squid,
+		// so a container pointed at a different proxy reaches nothing, and one
+		// pointed at the operator's own proxy would be egressing outside the
+		// allowlist if it could reach it at all.
+		//
+		// Validate() refuses these names in a credentials section, so nothing
+		// reaches here in practice. This is what makes that a policy decision
+		// rather than the only thing standing between an Agentfile and its own
+		// sandbox's egress path.
+		if isDockerProxyEnvName(k) {
+			continue
+		}
 		args = append(args, "-e", k)
 	}
 
@@ -703,13 +815,21 @@ func agentEnvForCommand(envVars map[string]string) []string {
 		// Entries not of the "key=value" form are preserved as they are,
 		// matching what os/exec does with them.
 		if k, _, ok := strings.Cut(entry, "="); ok {
-			if _, forwarded := envVars[k]; forwarded {
+			if _, forwarded := envVars[k]; forwarded && !isDockerProxyEnvName(k) {
 				continue
 			}
 		}
 		env = append(env, entry)
 	}
 	for _, k := range sortedKeys(envVars) {
+		// Skipped for the same reason agentRunArgs skips it from the argv, and
+		// checked again here rather than assumed: this environment belongs to
+		// the docker CLIENT, which honours HTTP_PROXY when DOCKER_HOST names a
+		// remote daemon. A forwarded variable must never be able to change how
+		// constle reaches Docker.
+		if isDockerProxyEnvName(k) {
+			continue
+		}
 		env = append(env, k+"="+envVars[k])
 	}
 	return env

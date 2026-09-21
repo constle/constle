@@ -1,6 +1,6 @@
 # Constle AgentManifest Specification
 
-**Spec version:** 0.3.0
+**Spec version:** 0.4.0
 **apiVersion:** `constle.dev/v1alpha1`
 **Status:** Draft. Field names and semantics may change before v1.0.
 **Last updated:** 2026-09-21
@@ -62,7 +62,7 @@ absent or empty. A field marked **optional** may be omitted; where a default
 exists, it is documented and applied at parse time.
 
 Some fields are **conditionally required** — required only when another field
-is present. These are listed in full in §16.
+is present. These are listed in full in §17.
 
 ### 2.2 Enforcement labels
 
@@ -87,15 +87,21 @@ chokepoint the agent's traffic must physically traverse:
 
 | Chokepoint | Enforces |
 |------------|----------|
+| Sandbox environment construction (per run) | `credentials` |
 | Squid egress proxy (per run) | `sandbox.network.allowed_hosts` |
 | MCP gate proxy (per run) | `mcp.servers[].tools`, `human_gates.*`, `spending.*` metering |
 | A2A gate + host listener (per run) | `a2a.peers` authorization, envelope signing and verification |
 | Supervisor process | `limits.max_duration_seconds`, `sandbox.memory_mb` |
 
+The first row is the only one that acts before the agent exists rather than
+while it runs, and that is what makes it an enforcement point rather than a
+filter: the environment is composed, the sandbox is started with it, and there is
+no later moment at which an agent could ask for more.
+
 This is not an implementation detail — it is the reason certain intuitively
 desirable fields do not exist. Constle assumes nothing inside the sandbox is
 trustworthy. A control that depended on the agent truthfully announcing its own
-behaviour would be reliable only while it was unnecessary. See §13.3 for the
+behaviour would be reliable only while it was unnecessary. See §14.3 for the
 worked example (filesystem write gating).
 
 ---
@@ -109,6 +115,7 @@ kind: AgentManifest                # required
 identity: ...      # who the agent is, and its cryptographic identity
 sandbox: ...       # how to run and isolate it
 capabilities: ...  # declared action classes; set the capability floor
+credentials: ...   # the host environment variables the sandbox receives
 mcp: ...           # MCP servers reachable through the gate proxy
 a2a: ...           # signed agent-to-agent peers
 spending: ...      # cost caps, metered at the MCP gate
@@ -154,7 +161,7 @@ The schema version of this manifest. Must be exactly `constle.dev/v1alpha1`;
 any other value is rejected with an error naming the expected value.
 
 The `v1alpha1` suffix is a promise about stability, not a version of Constle
-itself: see §15.
+itself: see §16.
 
 ### 4.2 `kind`
 
@@ -266,7 +273,7 @@ indirection principle as `human_gates.notify[].url_secret_ref`.
 **`did:key` is the only supported method.** It is self-describing: the
 verification key is recovered from the identifier string alone, so there is no
 resolution step, no registry, and no network dependency in the trust path.
-Other methods are rejected at validate time. See §21 for why `did:web` and
+Other methods are rejected at validate time. See §22 for why `did:web` and
 `did:constle` are deliberately not supported yet.
 
 When `did` is set, three things become true:
@@ -714,7 +721,7 @@ derives the level from what the agent can actually do. See §8.1.
 action — `send_email`, `spawn_subagent`, `external_transfer`, `delete_records`
 — are reported by `constle validate` as requiring approval. **This is advice,
 not enforcement.** Declaring `send_email` here gates nothing on its own.
-Enforcement happens only through `human_gates.require_approval_for` (§11),
+Enforcement happens only through `human_gates.require_approval_for` (§14.2),
 which matches MCP tool names.
 
 ### 8.1 What `capabilities` is not
@@ -731,7 +738,226 @@ through this list.
 
 ---
 
-## 9. Section: `mcp`
+## 9. Section: `credentials`
+
+The host environment variables the sandbox receives.
+
+```yaml
+credentials:
+  - name: ANTHROPIC_API_KEY
+  - name: GROQ_API_KEY
+    secret_ref: GROQ_API_KEY_PROD
+```
+
+| | |
+|-|-|
+| Type | list of objects |
+| Required | optional |
+| Enforcement | **ENFORCED** |
+
+**This list is complete and exclusive — for host environment variables.** No
+variable reaches a sandbox from the machine constle is running on unless it is
+declared here. The runtime's own per-run variables (§9.3) reach it as well, and
+so do the container image's `ENV` and the few the container runtime supplies
+itself (`PATH`, `HOME`, `HOSTNAME`, and `TERM` when a terminal is attached);
+those are properties of the image and the runtime, not of the operator's
+environment, and this section does not govern them. What it governs completely is the operator's side of the boundary.
+
+An Agentfile with no `credentials` section receives **no host variables at
+all**. That is the whole point of the section, and it is a change in behaviour
+from spec version 0.3.0 and earlier — see §21, and §20.3 for why it is recorded
+as a breaking change.
+
+Enforcement happens at sandbox environment construction, before the agent
+process exists: the backend builds the environment from this list and starts
+the sandbox with it. There is no runtime filter inside the agent, because a
+control that ran inside the sandbox would be a control the agent could remove
+(§2.3).
+
+"Credential" names the motivating case rather than the mechanism. **The section
+also carries non-secret operator input.** A task prompt is not a secret, but it
+is a host variable, and this is the only door — so it is declared here like
+anything else. Everything declared here is handled as a secret regardless: the
+runtime never prints a value, and records the entry in the audit log by name
+only (§9.4).
+
+### 9.1 `credentials[].name`
+
+The variable's name **inside the sandbox**. Required.
+
+| | |
+|-|-|
+| Type | string |
+| Required | required |
+| Enforcement | VALIDATED |
+
+Must be a portable environment variable name: an initial ASCII letter or
+underscore, then letters, digits and underscores. Anything else is a validation
+error rather than something the runtime escapes, and the reason is the same one
+`sandbox.network.allowed_hosts` is refused rather than escaped (§7.2) — the
+value is rendered into formats that have no escaping for it:
+
+- The Docker backend passes each variable as `docker run -e NAME`, with no
+  `=`, specifically so the value is resolved from the client's own environment
+  instead of appearing in a world-readable argv. A name containing `=` turns
+  that back into an inline `-e NAME=VALUE`.
+- The Firecracker backend writes each variable into the guest's environment
+  file as `export NAME='value'`. The value is single-quote escaped; a name
+  cannot be, because a quoted name is not an assignment. A name carrying a
+  quote, a semicolon or a newline closes that statement and opens another one,
+  in a file the guest sources before the agent runs.
+
+Names must be **unique** across entries, compared case-insensitively. Two
+entries claiming one variable have no answer to which value the agent receives
+other than iteration order — and `FOO` beside `foo` is one variable on Windows
+and two on unix, so a case-sensitive comparison would make that answer depend on
+the host OS. This is the same reasoning as the reserved-name matching below.
+
+**Reserved names.** A name the runtime builds for the run itself is refused:
+
+| Refused | Why |
+|---------|-----|
+| anything beginning `CONSTLE_` | The MCP and A2A gate URLs carry this run's gate token and are the agent's only route to its gates; the Firecracker guest's network parameters describe its own address. A prefix rather than a list, so a variable added later is protected from the moment it exists. |
+| `HTTP_PROXY`, `HTTPS_PROXY` | The per-run egress proxy address — the sandbox's only route to the network. |
+| `ALL_PROXY`, `FTP_PROXY` | Also the per-run proxy address. Clients honour `ALL_PROXY` as the fallback for every scheme, so a client that read a host-supplied value would address a proxy that does not exist on the sandbox's network — losing the request, and with it the record of the attempt. |
+| `NO_PROXY` | The set of destinations exempt from that proxy: the gate address when one is bound, and nothing otherwise. A host-supplied value would exempt whatever the operator's own network happens to list. |
+
+Matching is **case-insensitive**, and that is a correctness requirement rather
+than caution. Constle runs on Windows as well as unix, and Windows environment
+variables are case-insensitive — so `http_proxy` and `HTTP_PROXY` are one
+variable there and two on unix. A case-sensitive rule would make whether an
+Agentfile can overwrite its own sandbox's egress path a property of the host OS.
+
+The rule is a prefix and an exact set, not a substring search: `PROXY_API_KEY`
+and `MY_CONSTLE_TOKEN` are ordinary third-party variables and are accepted.
+
+### 9.2 `credentials[].secret_ref`
+
+The **host** variable holding the value. Optional; defaults to `name`.
+
+| | |
+|-|-|
+| Type | string |
+| Required | optional |
+| Enforcement | **ENFORCED** |
+
+This indirection is what makes the scoping per-agent rather than per-name. Two
+agents can both read `ANTHROPIC_API_KEY` inside their sandboxes while resolving
+it from `ANTHROPIC_API_KEY_PROD` and `ANTHROPIC_API_KEY_DEV` on the host:
+
+```yaml
+credentials:
+  - name: ANTHROPIC_API_KEY
+    secret_ref: ANTHROPIC_API_KEY_DEV
+```
+
+The value never enters the Agentfile — only the name of the variable that holds
+it. Same principle as `human_gates.notify[].url_secret_ref` (§14.6) and
+`identity.did` (§5.4): secrets are referenced, never embedded.
+
+It is held to the name grammar of §9.1, because the value is looked up by that
+name, but **not** to the reserved-name list. `secret_ref` names a variable in
+the operator's own environment; forwarding the operator's own `HTTP_PROXY` into
+a sandbox under some other name is their business, and refusing spellings there
+would reject legitimate host layouts.
+
+**A declared credential the host cannot supply fails the run.** `constle run`
+refuses to start — before any sandbox resource is created — when the named host
+variable is unset, or is set to the empty string. The two are reported
+differently, because the remedy differs and because an empty value is not a
+usable credential: forwarding it would put the agent in exactly the state a
+missing one produces, with nothing recorded to say so.
+
+`constle validate` **warns** rather than failing. Validation is not execution,
+and an Agentfile is legitimately validated on a machine holding none of the
+keys — a CI runner, or a reviewer's laptop. This is the same split as
+`identity.did` (§5.4): declared-but-unusable is a warning at validate time and
+a refusal at run time.
+
+### 9.3 What is not a credential
+
+**The runtime's own variables.** These reach the agent regardless of this
+section. They are not operator secrets being scoped — they are how the sandbox is
+reachable and contained — and an Agentfile can neither add to them nor replace
+them (§9.1).
+
+| Variable | When | Backend |
+|----------|------|---------|
+| `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `FTP_PROXY` (and lowercase) | every run | both |
+| `NO_PROXY` (and lowercase) | every run; empty unless a gate is bound | both |
+| `CONSTLE_MCP_<ID>_URL` | one per declared `mcp.servers` entry | both |
+| `CONSTLE_A2A_URL` | when `a2a.peers` are declared | both |
+| `CONSTLE_GUEST_CIDR`, `CONSTLE_GATEWAY_IP` | every run | Firecracker only |
+
+Every proxy name is written on every run, including the ones the runtime has no
+value of its own for, and that is load bearing rather than tidy: a name that is
+reserved in the validator but never written leaves the environment composition
+with nothing to overwrite, so the second guard below would not exist for it.
+
+The runtime sets **every** proxy variable explicitly, including the two it has no
+value of its own for, and that is a consequence of this section rather than a
+detail of it. The Docker CLI adds proxy variables to every container it starts
+from the `proxies` block of the operator's `~/.docker/config.json`, whether or
+not constle asked. An explicit value wins over that injection, so every name the
+CLI can fill in must be written — otherwise the operator's own arrives in the
+sandbox undeclared, with no way for an operator to stop it, since these names
+cannot be declared either. Each of those values is a URL, so where one carries
+`user:password@host` the leak is the operator's proxy credentials and not merely
+their internal hostnames.
+
+They are applied **after** the declared credentials when the environment is
+composed, so the ordering itself denies the overwrite even for a manifest that
+never went through validation. Two independent guards, because a fix that existed
+only at validate time would be one refactor away from being no fix.
+
+That second guard is only as complete as the table above: it holds for a name
+because the runtime writes that name, not because the validator refuses it.
+
+**`human_gates.notify[].url_secret_ref`** (§14.6) names a variable the **host**
+process reads in order to deliver a webhook. It is resolved outside the sandbox
+and never forwarded into it, so it is not declared here.
+
+**The capability floor is unaffected.** A credential is not a capability and
+does not imply one. `sandbox.isolation` is derived from `capabilities` and from
+nothing else (§8), so declaring `ANTHROPIC_API_KEY` does not raise the floor to
+`network`. Stated explicitly because the opposite is a natural assumption, and
+relying on it would be relying on nothing.
+
+### 9.4 Audit record
+
+The `run_started` entry records `credentials_granted`: the declared names, in
+declaration order.
+
+```json
+"details": {
+  "backend": "docker",
+  "image": "python:3.11-slim",
+  "isolation_achieved": "network",
+  "credentials_granted": ["ANTHROPIC_API_KEY", "AGENT_TASK"]
+}
+```
+
+**Names only.** Never values, and never a digest of a value either — a hash of a
+low-entropy secret is broken offline, and nothing in this specification requires
+proof of *which* key was used. The host variable named by `secret_ref` is not
+recorded: it describes the operator's own environment layout, not what the agent
+received.
+
+The key is present even when the list is empty, so "this agent was granted
+nothing" is a recorded fact rather than the absence of one. An entry with no
+`credentials_granted` key at all is a run from a version that predates this
+section — which is to say, one where every key the operator had reached every
+agent.
+
+Declaration order is used rather than sorted order because it is deterministic
+for a given Agentfile, and a JSON array's order is part of the signed bytes of
+the entry (§5.4). When `identity.did` is declared, the record is therefore
+signed and hash-chained like every other entry: what an agent was granted
+becomes something a later reader can verify rather than reconstruct.
+
+---
+
+## 10. Section: `mcp`
 
 The Model Context Protocol servers this agent may call.
 
@@ -821,7 +1047,7 @@ exchange being HTTP at all: the gate would be holding open a raw bidirectional
 tunnel it cannot inspect, to a host the sandbox is forbidden to reach directly
 (§7.2), for as long as either side kept it open.
 
-### 9.1 `mcp.servers[].id`
+### 10.1 `mcp.servers[].id`
 
 | | |
 |-|-|
@@ -835,7 +1061,7 @@ the agent reads (`web-search` → `CONSTLE_MCP_WEB_SEARCH_URL`: hyphens become
 underscores, uppercased) and appears in audit events. Must be unique across
 servers; duplicates are rejected.
 
-### 9.2 `mcp.servers[].url`
+### 10.2 `mcp.servers[].url`
 
 | | |
 |-|-|
@@ -850,7 +1076,7 @@ transport, so other schemes are rejected. The URL must have a host.
 This value is **host side only**. It is never forwarded into the sandbox, and
 its host must not appear in `allowed_hosts` (§7.2).
 
-### 9.3 `mcp.servers[].tools`
+### 10.3 `mcp.servers[].tools`
 
 | | |
 |-|-|
@@ -862,13 +1088,13 @@ its host must not appear in `allowed_hosts` (§7.2).
 An allowlist of tool names the agent may call on this server. When present, a
 `tools/call` naming anything else is refused at the gate and recorded as an
 `mcp_tool_blocked` audit event. When omitted, every tool passes through —
-gated tools (§11) still gate.
+gated tools (§12) still gate.
 
 Declaring the allowlist is worth the effort: it converts "this server exposes
 40 tools and the agent probably only uses 2" from a trust assumption into an
 enforced fact.
 
-### 9.4 `mcp.servers[].pricing`
+### 10.4 `mcp.servers[].pricing`
 
 | | |
 |-|-|
@@ -877,7 +1103,7 @@ enforced fact.
 | Enforcement | **ENFORCED** |
 
 When present, the gate proxy meters **every** `tools/call` response from this
-server and charges it against the caps in `spending` (§10).
+server and charges it against the caps in `spending` (§12).
 
 **Pricing is deliberately server-wide.** A priced server cannot expose an
 "unpriced" tool: a response missing a declared usage value is a *metering
@@ -927,7 +1153,7 @@ API pricing rates input and output units differently.
 
 ---
 
-## 10. Section: `a2a`
+## 11. Section: `a2a`
 
 Signed agent-to-agent communication with explicitly declared peers.
 
@@ -961,7 +1187,7 @@ seen set.
 Full design, including the inbound listener hardening, envelope format, and
 the replay-guard store: [`spec/a2a.md`](https://github.com/constle/constle/blob/main/spec/a2a.md).
 
-### 10.1 `a2a.listen`
+### 11.1 `a2a.listen`
 
 | | |
 |-|-|
@@ -981,7 +1207,7 @@ the agent drains over a connection it initiates.
 authorized, so the listener could only ever reject — a configuration that looks
 like connectivity and provides none.
 
-### 10.2 `a2a.peers[].name`
+### 11.2 `a2a.peers[].name`
 
 | | |
 |-|-|
@@ -995,7 +1221,7 @@ This is the only way the sandbox can name a peer — it posts to
 `$CONSTLE_A2A_URL/send/<name>`, and an undeclared name is rejected at the gate
 with a 403. Nothing in the sandbox can name an endpoint.
 
-### 10.3 `a2a.peers[].did`
+### 11.3 `a2a.peers[].did`
 
 | | |
 |-|-|
@@ -1011,7 +1237,7 @@ Rejected at validate time: a malformed DID, two peers declaring the same DID
 (sender identity would be ambiguous), and a peer DID equal to this agent's own
 `identity.did`.
 
-### 10.4 `a2a.peers[].endpoint`
+### 11.4 `a2a.peers[].endpoint`
 
 | | |
 |-|-|
@@ -1026,7 +1252,7 @@ only; never forwarded into the sandbox, and its host must not appear in
 
 ---
 
-## 11. Section: `spending`
+## 12. Section: `spending`
 
 Cost guardrails, enforced against traffic metered at the MCP gate.
 
@@ -1039,10 +1265,10 @@ spending:
     warn_at_pct_of_daily: 80
 ```
 
-### 11.1 Enforcement scope — read this before relying on a cap
+### 12.1 Enforcement scope — read this before relying on a cap
 
 Limits are enforced against cost **metered at the MCP gate proxy, for servers
-that declare a `pricing` block** (§9.4). Nothing else is metered.
+that declare a `pricing` block** (§10.4). Nothing else is metered.
 
 In particular, traffic through `sandbox.network.allowed_hosts` is **not**
 metered. Constle refuses to TLS-intercept it: doing so would let the runtime
@@ -1059,14 +1285,14 @@ a limit declared without a priced MCP server measures nothing at all.
 | Priced servers present, no limits declared | Usage is metered but nothing is enforced |
 | `max_per_month_usd` declared | Not enforced by this version |
 
-### 11.2 Amount format
+### 12.2 Amount format
 
 All amounts are exact decimal **strings**, never YAML floats, for the reason
-given in §9.4. A cap of `"0"` is **rejected as ambiguous** — at enforcement
+given in §10.4. A cap of `"0"` is **rejected as ambiguous** — at enforcement
 time a zero cap would read as "unset", so the manifest must say which it means:
 omit the field to leave a limit unset.
 
-### 11.3 `spending.max_per_run_usd`
+### 12.3 `spending.max_per_run_usd`
 
 | | |
 |-|-|
@@ -1083,7 +1309,7 @@ post-hoc — a response's cost is only knowable once the response has arrived �
 the charge that crosses the cap is still incurred and still recorded. The
 ledger records reality; enforcement stops what happens next.
 
-### 11.4 `spending.max_per_day_usd`
+### 12.4 `spending.max_per_day_usd`
 
 | | |
 |-|-|
@@ -1107,7 +1333,7 @@ Two behaviours follow from durability:
   since the kill can only land after a charge is metered.
 - An unreadable ledger is a hard error, never treated as `$0` spent.
 
-### 11.5 `spending.max_per_month_usd`
+### 12.5 `spending.max_per_month_usd`
 
 | | |
 |-|-|
@@ -1119,7 +1345,7 @@ Two behaviours follow from durability:
 monthly ledger exists. Declaring it produces an explicit warning rather than
 silent false assurance.
 
-### 11.6 `spending.alerts.warn_at_pct_of_daily`
+### 12.6 `spending.alerts.warn_at_pct_of_daily`
 
 | | |
 |-|-|
@@ -1138,7 +1364,7 @@ error: there would be no cap to warn about.
 
 ---
 
-## 12. Section: `limits`
+## 13. Section: `limits`
 
 Hard runtime constraints.
 
@@ -1147,7 +1373,7 @@ limits:
   max_duration_seconds: 300
 ```
 
-### 12.1 `limits.max_duration_seconds`
+### 13.1 `limits.max_duration_seconds`
 
 | | |
 |-|-|
@@ -1164,7 +1390,7 @@ This is a supervisor-side timer, not a request the agent can decline.
 
 ---
 
-## 13. Section: `human_gates`
+## 14. Section: `human_gates`
 
 When the agent must stop and ask a human.
 
@@ -1184,7 +1410,7 @@ Human gates are the primary defense against an agent being talked into a
 consequential action — by a prompt injection, a poisoned document, or its own
 misjudgement.
 
-### 13.1 `human_gates.enabled`
+### 14.1 `human_gates.enabled`
 
 | | |
 |-|-|
@@ -1202,7 +1428,7 @@ Because the default is `false`, a `require_approval_for` list written without
 entries as NOT enforced and warn, naming this switch — the entries are declared
 but disarmed, and a declared protection must never look real when it isn't.
 
-### 13.2 `human_gates.require_approval_for`
+### 14.2 `human_gates.require_approval_for`
 
 | | |
 |-|-|
@@ -1235,7 +1461,7 @@ name of every call.
 Note the consequence: **with no `mcp.servers` declared, nothing is gated**, and
 Constle says so.
 
-### 13.3 Why there is no `{action, paths, condition}` form
+### 14.3 Why there is no `{action, paths, condition}` form
 
 Gating a filesystem write — "require approval for writes under
 `/workspace/output`" — cannot be expressed here, and the reason is
@@ -1259,7 +1485,7 @@ not exist. Until it does, a `paths`/`condition` field could only be implemented
 by trusting the sandbox, so it is **absent by design rather than unimplemented
 by accident**.
 
-### 13.4 `human_gates.approval_timeout_seconds`
+### 14.4 `human_gates.approval_timeout_seconds`
 
 | | |
 |-|-|
@@ -1276,7 +1502,7 @@ answer, so the gate says so once and simply waits for the deadline, letting
 `on_timeout` decide. It does not block forever on a read that can never
 resolve, and it does not silently treat "nobody is watching" as approval.
 
-### 13.5 `human_gates.on_timeout`
+### 14.5 `human_gates.on_timeout`
 
 | | |
 |-|-|
@@ -1304,7 +1530,7 @@ There is deliberately no `retry`. Use `abort`: an agent that proceeds without
 approval after a timeout has a gate that reduces to a delay — and under
 `proceed`, a broken decision channel reduces to the same thing.
 
-### 13.6 `human_gates.notify`
+### 14.6 `human_gates.notify`
 
 | | |
 |-|-|
@@ -1335,12 +1561,12 @@ answer a gate. With no `approver_pubkey` declared, or with none of the notify
 URLs resolving, the webhook is a signal only, and the local prompt plus
 `on_timeout` are the whole enforcement. In the second case Constle warns at run
 time rather than refusing to start, so a gate can be armed with its remote
-decision channel silently absent — `on_timeout` (§13.5) is what decides such a
+decision channel silently absent — `on_timeout` (§14.5) is what decides such a
 gate.
 
 ---
 
-## 14. Section: `compliance`
+## 15. Section: `compliance`
 
 Regulatory and audit metadata.
 
@@ -1355,7 +1581,7 @@ compliance:
     denied_regions: []
 ```
 
-### 14.1 `compliance.audit_log_level`
+### 15.1 `compliance.audit_log_level`
 
 | | |
 |-|-|
@@ -1369,7 +1595,7 @@ compliance:
 logging on it — audit output is identical at every level today, and setting
 `none` does not disable the audit log.
 
-### 14.2 `compliance.frameworks`
+### 15.2 `compliance.frameworks`
 
 | | |
 |-|-|
@@ -1383,7 +1609,7 @@ validates the names nor changes behaviour based on them.
 
 Common values: `EU_AI_ACT`, `SOC2_TYPE2`, `ISO27001`, `HIPAA`, `PCI_DSS`.
 
-### 14.3 `compliance.geo_restrictions`
+### 15.3 `compliance.geo_restrictions`
 
 | | |
 |-|-|
@@ -1397,7 +1623,7 @@ cannot refuse to run on this basis.** These lists constrain nothing today.
 
 ---
 
-## 15. Section: `metadata`
+## 16. Section: `metadata`
 
 Descriptive fields, never read by the runtime when making execution decisions.
 All **INFORMATIONAL**.
@@ -1422,7 +1648,7 @@ metadata:
 
 ---
 
-## 16. Cross-field validation rules
+## 17. Cross-field validation rules
 
 These rules involve more than one field, and all of them are **errors**, not
 warnings. Each closes a path where a declared control could be silently
@@ -1444,6 +1670,10 @@ inert or bypassed.
 | An `mcp.servers[].pricing` block must declare at least one meter | Would read as priced while metering nothing |
 | `human_gates.notify[].channel` must be `webhook`, with a `url_secret_ref` | A declared notification path must never look real when it isn't |
 | An unrecognised capability is rejected | A typo must not silently lower the capability floor |
+| `credentials[].name` must be a portable environment variable name | Rendered into `docker run -e NAME` and into an `export NAME='value'` line the guest sources: a `=` restores an inline value in a world-readable argv, a quote or newline opens a second shell statement |
+| `credentials[].name` must not be `CONSTLE_*`, `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `FTP_PROXY` or `NO_PROXY` (any case) | Would let the Agentfile replace its own sandbox's egress path or gate URL |
+| `credentials[].name` must be unique, compared case-insensitively | Two entries for one variable leave the value to iteration order; a case variant is one variable on Windows |
+| `credentials[].secret_ref` must be a portable environment variable name | The value is looked up by it |
 | An unrecognised key is rejected (§3) | A typo must not silently drop the control the key declares |
 | A second YAML document is rejected (§3) | Everything after the first document is ignored, so it would declare nothing |
 | A declared `sandbox.isolation` may not be weaker than its capabilities require | Writing the line must not make the boundary weaker than omitting it |
@@ -1451,12 +1681,13 @@ inert or bypassed.
 Warnings — surfaced, but not fatal — cover the cases where a declaration is
 well-formed but the runtime cannot act on it: unenforceable gate entries, gate
 entries declared beneath `enabled: false`, unmetered spending limits,
-`max_per_month_usd`, and an `identity.did` whose private key is not available
-on this machine.
+`max_per_month_usd`, an `identity.did` whose private key is not available on this
+machine, and a `credentials` entry whose host variable is not set here — which
+`constle run` then refuses outright (§9.2).
 
 ---
 
-## 17. Enforcement summary
+## 18. Enforcement summary
 
 | Field | Enforcement | Notes |
 |-------|-------------|-------|
@@ -1474,6 +1705,8 @@ on this machine.
 | `sandbox.network.egress` | DECLARED | Parsed and defaulted; **no code path reads it** |
 | `sandbox.network.allowed_hosts` | **ENFORCED** | Per-run Squid allowlist; the real egress control |
 | `capabilities` | **ENFORCED** (capability floor) / DECLARED (gate advice) | Unknown values rejected |
+| `credentials[].name` | **ENFORCED** | The complete set of host variables the sandbox receives; nothing undeclared reaches it |
+| `credentials[].secret_ref` | **ENFORCED** | Host variable resolved into `name`; run fails closed when it is unset or empty |
 | `mcp.servers[].id` | VALIDATED | Unique; names `CONSTLE_MCP_<ID>_URL` |
 | `mcp.servers[].url` | **ENFORCED** | Host side only; never enters the sandbox; forwarding is scoped to this endpoint |
 | `mcp.servers[].tools` | **ENFORCED** | Non-listed tools blocked at the gate |
@@ -1499,9 +1732,9 @@ on this machine.
 
 ---
 
-## 18. Examples
+## 19. Examples
 
-### 18.1 Minimal
+### 19.1 Minimal
 
 The smallest valid Agentfile that does something useful:
 
@@ -1524,7 +1757,7 @@ Runs `python /workspace/agent.py` in a Python 3.11 container, blocks all
 outbound traffic except to `api.openai.com`, applies no time limit, and
 writes an unsigned audit log.
 
-### 18.2 Full
+### 19.2 Full
 
 A production-shaped manifest exercising every enforced control:
 
@@ -1552,6 +1785,11 @@ capabilities:
   - write_file
   - external_api
   - send_email
+
+credentials:
+  - name: ANTHROPIC_API_KEY
+    secret_ref: ANTHROPIC_API_KEY_FINANCE
+  - name: AGENT_TASK
 
 mcp:
   servers:
@@ -1614,20 +1852,20 @@ by any declared server, `constle validate` would warn that they gate nothing.
 
 ---
 
-## 19. Versioning and compatibility
+## 20. Versioning and compatibility
 
-### 19.1 Two version numbers
+### 20.1 Two version numbers
 
 | Number | What it versions | Current |
 |--------|-----------------|---------|
-| **Spec version** | This document — its prose, structure, and accuracy | `0.3.0` |
+| **Spec version** | This document — its prose, structure, and accuracy | `0.4.0` |
 | **`apiVersion`** | The wire format the runtime accepts | `constle.dev/v1alpha1` |
 
 The spec version changes whenever this document changes materially, including
 when a field's enforcement status changes without any change to the format. The
 `apiVersion` changes only when the format itself changes incompatibly.
 
-### 19.2 apiVersion progression
+### 20.2 apiVersion progression
 
 | apiVersion | Status | Meaning |
 |------------|--------|---------|
@@ -1639,7 +1877,7 @@ The runtime will support the previous `apiVersion` for at least one major
 release after it is deprecated; a `v1beta1` runtime will run `v1alpha1`
 manifests and record a deprecation warning.
 
-### 19.3 What is a breaking change
+### 20.3 What is a breaking change
 
 A previously valid manifest being rejected, or behaving differently without
 modification:
@@ -1650,7 +1888,7 @@ modification:
 - removing a valid enum value;
 - changing a default in a way that affects security behaviour.
 
-### 19.4 What is not
+### 20.4 What is not
 
 - adding a new optional field;
 - adding a new valid enum value;
@@ -1673,11 +1911,96 @@ called out in the changelog.
 
 ---
 
-## 20. Changelog
+## 21. Changelog
+
+### 0.4.0 — 2026-09-21
+
+**Added — `credentials`, and the host environment is no longer ambient (§9):**
+
+- The runtime forwarded a hardcoded set of host variables — `ANTHROPIC_API_KEY`,
+  `GROQ_API_KEY` and `AGENT_TASK` — into every sandbox whenever they were set on
+  the host. An agent that needed one of the operator's keys received all of them.
+  Which keys an agent held was a property of the operator's shell, identical for
+  every agent on the machine, and nothing in the Agentfile said a word about it.
+- An agent now receives exactly the variables it declares under `credentials`,
+  resolved from the host by name or through `secret_ref`. The section is the
+  complete and exclusive list, enforced where the backend composes the sandbox's
+  environment — before the agent process exists, so there is no later moment at
+  which it could ask for more.
+- **An Agentfile with no `credentials` section receives no host variables at
+  all.** This is a **breaking change** under §20.3 — a previously valid manifest
+  behaves differently without modification, and a default that affects security
+  behaviour changed — and it is not covered by any §20.4 exemption: no field was
+  promoted from DECLARED to ENFORCED, because no field existed. It is recorded
+  here rather than treated as a bug fix. `apiVersion` is unchanged: `v1alpha1` is
+  documented as unstable (§20.2), and the format itself gained an optional
+  section rather than changing.
+- Migration is one block per Agentfile, naming the variables the agent already
+  read. `constle validate` and `constle run` print a `credentials` row on every
+  manifest, including the empty case, stating that nothing is forwarded — so the
+  change is visible in the summary rather than only in a failure from inside the
+  container.
+- A declared credential whose host variable is unset, or set to the empty string,
+  **fails `constle run`** before any sandbox resource is created, and warns at
+  `constle validate`. Same split as `identity.did` (§5.4). Previously a missing
+  key was indistinguishable from an unset one: the backend's own `docker run -e
+  NAME` spelling sets nothing and exits 0 when the variable is absent.
+- Non-secret operator input is declared here too — a task prompt is not a secret,
+  but it is a host variable, and this is the only door (§9). The alternative, a
+  second section for non-secret values, would be a second door needing its own
+  scoping story.
+- `credentials` does not affect the capability floor, and §9.3 says so outright:
+  a credential is not a capability and implies none.
+
+**Hardened — two paths that only became reachable once the names came from the
+Agentfile (§9.1, §9.3):**
+
+- Variable names are held to the portable environment-variable grammar. The
+  Firecracker backend writes each one into an `export NAME='value'` line in a
+  file the guest sources as root — the value is quoted, a name cannot be — and
+  the Docker backend passes `-e NAME` with no `=` specifically to keep values out
+  of a world-readable argv. A name carrying a quote, a newline or an `=` breaks
+  out of one or the other. Refused rather than escaped, for the same reason
+  `sandbox.network.allowed_hosts` is (§7.2).
+- The runtime sets every proxy variable explicitly, including `NO_PROXY` and
+  `ALL_PROXY`, which it previously left alone. The Docker CLI injects proxy
+  variables into every container from the operator's `~/.docker/config.json`, so
+  leaving `NO_PROXY`, `ALL_PROXY` and `FTP_PROXY` unset delivered the operator's
+  internal proxy host and internal domains into the sandbox undeclared — and,
+  since each is a URL, the operator's proxy password with them where one was
+  configured. For a client that prefers `ALL_PROXY` it also meant requests
+  addressed to a proxy with no route, failing without ever appearing in the run's
+  Squid-derived network audit. The Firecracker backend now writes the same names
+  for a second reason: a name reserved in the validator but never written leaves
+  the composition ordering with nothing to overwrite, so the
+  validation-independent guard did not cover `NO_PROXY` on a run with no gate
+  bound, nor `ALL_PROXY` or `FTP_PROXY` at all. Both found by independent review
+  of this change rather than by the change itself.
+- Names the runtime builds for the run itself are refused — case-insensitively,
+  because Windows environment variables are, so a case-sensitive rule would make
+  the refusal depend on the host OS. Uniqueness between two declared names is
+  compared the same way, for the same reason. The declared credentials are also
+  applied **before** the runtime's own variables when the environment is composed,
+  so the ordering denies the overwrite independently of validation. The
+  Firecracker backend had merged the host variables over its own proxy and
+  guest-network block, which was harmless only while the forwarded names were
+  hardcoded.
+
+**Changed — section numbering:**
+
+- `credentials` is documented in Agentfile order, between `capabilities` and
+  `mcp`, so sections 9 through 21 are renumbered to 10 through 22. Every
+  cross-reference in this document was updated with them. No content moved.
+- Two cross-references that were already wrong before the renumbering are
+  corrected with it: §9 pointed at `spending` as §10, and §8 pointed at
+  `human_gates.require_approval_for` as §11 — the spending and human-gates
+  sections. Both had been off since the sections around them were last reordered,
+  and shifting them without fixing them would have moved a pointer known to be
+  broken.
 
 ### 0.3.0 — 2026-09-21
 
-**Changed — an unrecognised key is now rejected (§3, §16):**
+**Changed — an unrecognised key is now rejected (§3, §17):**
 
 - The runtime decoded Agentfiles leniently: a key this specification does not
   define was discarded without a word. Because every control here is opt-in,
@@ -1698,12 +2021,12 @@ called out in the changelog.
   exactly the silence this change exists to end, and a file whose tail was
   malformed was still answered with "is valid". A leading `---` and a trailing
   `...` are markers on the one document and stay valid.
-- This is a **breaking change** under §19.3 — a previously valid manifest is
-  now rejected — and it is not covered by any §19.4 exemption. It is recorded
+- This is a **breaking change** under §20.3 — a previously valid manifest is
+  now rejected — and it is not covered by any §20.4 exemption. It is recorded
   here rather than treated as a bug fix. `apiVersion` is unchanged: `v1alpha1`
-  is documented as unstable (§19.2), and the format itself did not change.
+  is documented as unstable (§20.2), and the format itself did not change.
 
-**Fixed — human gates are no longer reported as enforced while disabled (§13.1, §16):**
+**Fixed — human gates are no longer reported as enforced while disabled (§14.1, §17):**
 
 - `constle validate` classified `require_approval_for` entries purely by
   whether they matched a declared MCP tool, without consulting the master
@@ -1717,7 +2040,7 @@ called out in the changelog.
 
 ### 0.2.0 — 2026-09-13
 
-Two changes to `sandbox.isolation`, both of the kind §19.4 classifies as a bug
+Two changes to `sandbox.isolation`, both of the kind §20.4 classifies as a bug
 fix rather than a breaking change, and both rejecting manifests a previous
 runtime accepted. The first shipped without a changelog entry; it is recorded
 here alongside the second rather than left undocumented.
@@ -1737,7 +2060,7 @@ here alongside the second rather than left undocumented.
 - The floor binds **declared** capabilities only. Omitting a capability still
   lowers it; nothing derives the level from what the agent can actually do
   (§8, §8.1).
-- §19.4 gained the compatibility bullet this change required, since
+- §20.4 gained the compatibility bullet this change required, since
   `sandbox.isolation` was already ENFORCED and so the existing
   DECLARED→ENFORCED exemption did not cover it.
 
@@ -1759,33 +2082,33 @@ field-by-field against the runtime rather than against intent.
 **Added — sections that did not previously exist in this document:**
 
 - `mcp`: gate-proxied MCP servers, tool allowlists, and the `pricing` /
-  `meters` metering model (§9).
+  `meters` metering model (§10).
 - `a2a`: signed agent-to-agent peers, the host-side listener, and the no
-  discovery scope decision (§10).
+  discovery scope decision (§11).
 - `identity.did`: `did:key` identity, signed and hash-chained audit logs, and
   the fail-closed run behaviour (§5.4).
-- `spending.alerts.warn_at_pct_of_daily` (§11.6).
-- `human_gates.approval_timeout_seconds` and `human_gates.notify` (§13.4,
-  §13.6).
-- Cross-field validation rules, collected in one table (§16).
+- `spending.alerts.warn_at_pct_of_daily` (§12.6).
+- `human_gates.approval_timeout_seconds` and `human_gates.notify` (§14.4,
+  §14.6).
+- Cross-field validation rules, collected in one table (§17).
 - The enforcement-point model — why every control sits outside the sandbox
-  (§2.3), and the worked consequence for filesystem gating (§13.3).
+  (§2.3), and the worked consequence for filesystem gating (§14.3).
 
 **Corrected — the previous revision described the runtime inaccurately:**
 
 - `spending.max_per_run_usd` and `max_per_day_usd` were documented as DECLARED.
   Both are **ENFORCED**, metered at the MCP gate against priced servers, with a
   durable per-DID daily ledger. The scope limits of that metering are now
-  stated explicitly (§11.1).
+  stated explicitly (§12.1).
 - `human_gates.*` were documented as DECLARED and "planned for v1.0". Gates are
   **ENFORCED** on MCP tool calls.
 - `human_gates.require_approval_for` was documented as taking capability
   categories. It takes **exact MCP tool names**; the mapping contract is now
-  specified (§13.2).
+  specified (§14.2).
 - `sandbox.network.egress` was documented as ENFORCED. It is **DECLARED** — no
   code path reads it, and `egress: open` does not open the network (§7.1).
 - `compliance.audit_log_level` was documented as ENFORCED with a per-level
-  event table. It is **DECLARED**; logging does not vary by level (§14.1).
+  event table. It is **DECLARED**; logging does not vary by level (§15.1).
 - `compliance.frameworks` and `geo_restrictions` were documented as DECLARED;
   they are **INFORMATIONAL**.
 - `capabilities` was documented as enforcement "planned for v0.5". Its actual
@@ -1799,14 +2122,14 @@ field-by-field against the runtime rather than against intent.
 
 **Structure:**
 
-- Added spec-level version numbering, distinct from `apiVersion` (§19.1).
+- Added spec-level version numbering, distinct from `apiVersion` (§20.1).
 - Added this changelog.
 - Stated the relationship between this document and the executable
   `agent-manifest.yaml` reference file, and which is normative (§1.1).
 
 ---
 
-## 21. Roadmap — not valid manifest syntax
+## 22. Roadmap — not valid manifest syntax
 
 The following are planned but **do not exist in the runtime**. They are
 described here in prose, deliberately outside the field reference, so that no
@@ -1822,7 +2145,7 @@ before it ships, because a DID method whose resolution can be intercepted is
 worse than no DID at all. Only `did:key` is supported today.
 
 **`human_gates` — path- and condition-scoped approval for filesystem writes.**
-Blocked on the host-side file watcher described in §13.3. The field shape is
+Blocked on the host-side file watcher described in §14.3. The field shape is
 not the hard part; the external chokepoint is.
 
 **`spending` — monthly ledger enforcement for `max_per_month_usd`.**

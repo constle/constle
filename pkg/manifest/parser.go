@@ -179,6 +179,10 @@ func (m *AgentManifest) Validate() error {
 		return err
 	}
 
+	if err := m.validateCredentials(); err != nil {
+		return err
+	}
+
 	if err := m.validateNetwork(); err != nil {
 		return err
 	}
@@ -616,7 +620,7 @@ func (m *AgentManifest) validateHumanGates() error {
 // match nothing (unenforced — surfaced as a warning by the CLI).
 //
 // The master switch comes first: when human_gates.enabled is false, the gate
-// proxy arms nothing (spec/agent-manifest.md §13.1), so EVERY entry is
+// proxy arms nothing (spec/agent-manifest.md §14.1), so EVERY entry is
 // unenforced however well it matches a declared tool. Consulting the tool
 // mapping without consulting HumanGates.GatesArmed first is what let the CLI
 // report a gate as "paused at the MCP gate proxy for approval" while the

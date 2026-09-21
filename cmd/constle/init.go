@@ -106,6 +106,38 @@ capabilities:
   - write_file   # write results back to a mounted directory
 
 # ---------------------------------------------------------------------------
+# credentials — the host variables this agent receives
+# ---------------------------------------------------------------------------
+# This is the complete list of what crosses from your environment. The sandbox
+# gets exactly what is declared here, plus the addresses constle builds for the
+# run (the proxy, and the CONSTLE_* gate URLs) and whatever the image itself
+# sets. Nothing else you have exported reaches an agent — declare nothing and
+# the agent receives nothing.
+#
+# name       the variable's name INSIDE the sandbox.
+# secret_ref the HOST variable holding the value. Optional; defaults to name.
+#            Use it to give two agents the same variable with different values:
+#            name: ANTHROPIC_API_KEY + secret_ref: ANTHROPIC_API_KEY_DEV.
+#
+# The value is never written into this file — only the name of the variable
+# that holds it, the same indirection as human_gates.notify[].url_secret_ref.
+# A declared variable that is not set on this host is a hard error at
+# "constle run" (and a warning at "constle validate", which may legitimately
+# run on a machine that has no keys).
+#
+# Non-secret operator input belongs here too — a task prompt is not a
+# credential, but it is a host variable, and this is the only door. Everything
+# declared here is handled as a secret: never printed, and recorded in the
+# audit log by name only.
+#
+# Names constle builds itself are refused: anything starting with CONSTLE_, and
+# HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / FTP_PROXY / NO_PROXY.
+#
+# credentials:
+#   - name: ANTHROPIC_API_KEY
+#   - name: AGENT_TASK
+
+# ---------------------------------------------------------------------------
 # mcp — Model Context Protocol servers the agent may call
 # ---------------------------------------------------------------------------
 # Every declared server is reachable ONLY through constle's MCP gate proxy:

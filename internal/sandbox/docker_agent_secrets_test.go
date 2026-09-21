@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/constle/constle/internal/agentenv"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -26,6 +27,11 @@ const (
 // realAgentEnv assembles the forwarded environment exactly as
 // DockerBackend.Start does, so an assertion over it covers the real variable
 // names and the real URL shapes.
+//
+// The three host variables are DECLARED here, because that is now the only way
+// one reaches a sandbox. They used to arrive from a hardcoded list inside the
+// backend, which is what made every key the operator had part of every agent's
+// environment; the manifest below is the per-agent replacement for that list.
 func realAgentEnv(t *testing.T) map[string]string {
 	t.Helper()
 	t.Setenv("ANTHROPIC_API_KEY", hostAPIKey)
@@ -34,8 +40,21 @@ func realAgentEnv(t *testing.T) map[string]string {
 
 	m := &manifest.AgentManifest{}
 	m.MCP.Servers = []manifest.MCPServer{{ID: "email-svc"}}
+	m.Credentials = []manifest.Credential{
+		{Name: "ANTHROPIC_API_KEY"},
+		{Name: "GROQ_API_KEY"},
+		{Name: "AGENT_TASK"},
+	}
 
-	env := forwardedHostEnv()
+	credEnv, err := agentenv.Resolve(m)
+	if err != nil {
+		t.Fatalf("credentials.Resolve: %v", err)
+	}
+
+	env := map[string]string{}
+	for k, v := range credEnv {
+		env[k] = v
+	}
 	for k, v := range mcpGateEnv(m, "172.17.0.1", 7800, mcpGateToken) {
 		env[k] = v
 	}

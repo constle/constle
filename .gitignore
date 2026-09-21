@@ -7,6 +7,14 @@
 *.p12
 *.pfx
 secrets/
+# Matches any directory of that name, at any depth. That is the point — an
+# operator's credential directory must never be committable — but it also
+# silently swallowed a Go package at internal/credentials/, and a swallowed
+# source directory is invisible: the working tree builds and every test passes
+# while the commit does not contain the package at all. Source that belongs to
+# this rule's subject matter is named around it (internal/agentenv), rather than
+# reclaimed with a negation that would weaken the rule for everything added to
+# that directory later. scripts.TestNoSourceFileIsGitIgnored is the backstop.
 credentials/
 
 # OS

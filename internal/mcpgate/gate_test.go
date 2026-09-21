@@ -2640,7 +2640,7 @@ func TestProxyErrorsCannotDriveTheTerminal(t *testing.T) {
 // F17/F24/F77 broke: the gate proxy and the CLI must never disagree about
 // whether a declared gate is real.
 //
-// human_gates.enabled: false disarms the proxy (spec/agent-manifest.md §13.1),
+// human_gates.enabled: false disarms the proxy (spec/agent-manifest.md §14.1),
 // and it always did — the proxy was correct. What was wrong was that
 // EnforcedGateEntries classified purely on the tool mapping, so
 // `constle validate` reported "send_email … paused at the MCP gate proxy for

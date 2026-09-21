@@ -299,6 +299,7 @@ func TestManifestSectionsCoverTheSchema(t *testing.T) {
 		"a2a.peers[]",
 		"compliance",
 		"compliance.geo_restrictions",
+		"credentials[]",
 		"human_gates",
 		"human_gates.notify[]",
 		"identity",

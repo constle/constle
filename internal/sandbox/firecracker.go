@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/constle/constle/internal/agentenv"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -93,6 +94,15 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		// Same fail-closed rule for A2A: declared peers without the signing
 		// gate must never fall back to unsigned direct access.
 		return nil, fmt.Errorf("manifest declares a2a peers but no A2A gate is attached to the backend")
+	}
+
+	// Resolve the declared credentials before the first resource is created,
+	// for the same reason DockerBackend.Start does. Host state here is heavier
+	// — a TAP device, nftables rules, a Squid process, the jailer chroot — so a
+	// late refusal would have more to unwind, not less.
+	credEnv, err := agentenv.Resolve(m)
+	if err != nil {
+		return nil, err
 	}
 
 	// Remove leftovers of runs that ended without a clean Stop() (host crash,
@@ -195,7 +205,7 @@ func (f *FirecrackerBackend) Start(m *manifest.AgentManifest) (*RunContext, erro
 		gateEnv["no_proxy"] = gatewayIP
 	}
 
-	workspacePath, err := buildWorkspaceImage(runDir, m, gatewayIP, guestIP, gateEnv)
+	workspacePath, err := buildWorkspaceImage(runDir, m, gatewayIP, guestIP, credEnv, gateEnv)
 	if err != nil {
 		cleanupNet()
 		return nil, fmt.Errorf("cannot build workspace image: %w", err)
@@ -397,39 +407,26 @@ func fcWorkspacePath(runID string) string {
 
 // buildWorkspaceImage creates the per-run ext4 drive carrying the run's
 // environment and command into the guest. `mkfs.ext4 -d` packs a staging
-// directory without requiring a loop mount. gateEnv carries the
-// CONSTLE_MCP_<ID>_URL and CONSTLE_A2A_URL gate addresses (empty when no
-// gates are bound).
-func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, guestIP string, gateEnv map[string]string) (string, error) {
+// directory without requiring a loop mount.
+//
+// credEnv carries the credentials the Agentfile declared (empty when it
+// declared none); gateEnv carries the CONSTLE_MCP_<ID>_URL and CONSTLE_A2A_URL
+// gate addresses, and the NO_PROXY exemption for them (empty when no gates are
+// bound).
+func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, guestIP string, credEnv, gateEnv map[string]string) (string, error) {
 	staging := filepath.Join(runDir, "ws")
 	if err := os.MkdirAll(staging, 0700); err != nil {
 		return "", err
 	}
 	defer func() { _ = os.RemoveAll(staging) }()
 
-	proxyURL := fmt.Sprintf("http://%s:%d", gatewayIP, fcSquidPort)
-	env := map[string]string{
-		"HTTP_PROXY":         proxyURL,
-		"HTTPS_PROXY":        proxyURL,
-		"http_proxy":         proxyURL,
-		"https_proxy":        proxyURL,
-		"CONSTLE_GUEST_CIDR": guestIP + "/30",
-		"CONSTLE_GATEWAY_IP": gatewayIP,
-	}
-	for k, v := range forwardedHostEnv() {
-		env[k] = v
-	}
-	for k, v := range gateEnv {
-		env[k] = v
-	}
-
-	var envFile strings.Builder
-	for k, v := range env {
-		fmt.Fprintf(&envFile, "export %s='%s'\n", k, strings.ReplaceAll(v, "'", `'\''`))
+	envFile, err := renderGuestEnvFile(guestEnv(gatewayIP, guestIP, credEnv, gateEnv))
+	if err != nil {
+		return "", err
 	}
 	// 0600: the env file may carry API keys. The image itself stays inside
 	// the root-owned chroot and is deleted by Stop.
-	if err := os.WriteFile(filepath.Join(staging, "env"), []byte(envFile.String()), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(staging, "env"), []byte(envFile), 0600); err != nil {
 		return "", err
 	}
 
@@ -478,6 +475,95 @@ func buildWorkspaceImage(runDir string, m *manifest.AgentManifest, gatewayIP, gu
 		return "", cmdError("mkfs.ext4", err, out)
 	}
 	return workspacePath, nil
+}
+
+// guestEnv composes the environment the microVM receives, in the one order
+// that is safe: declared credentials first, then the variables this run built.
+//
+// Everything after the credentials is infrastructure the guest needs in order
+// to be reachable and contained — the per-run Squid address, its own network
+// parameters, and the gate URLs, which carry this run's gate token — and a
+// manifest must not be able to replace any of it.
+//
+// The host variables used to be merged OVER the proxy and guest-network block,
+// which was harmless only because the forwarded names were a hardcoded list of
+// three. The moment the names come from the Agentfile, that order let
+// `credentials: [{name: HTTP_PROXY}]` hand the guest a proxy address of the
+// operator's choosing, and `{name: CONSTLE_GUEST_CIDR}` misstate its own
+// network to it.
+//
+// The gate URLs were never exposed that way — gateEnv was applied last then as
+// it is now — and that is the point of stating the whole order here rather than
+// only fixing the half that was wrong: both properties now come from one
+// visible sequence instead of one being deliberate and the other incidental.
+//
+// manifest.Validate refuses every name in this class (ReservedCredentialName)
+// and credentials.Resolve refuses it again; this order is what holds when
+// neither has run.
+//
+// Split out from buildWorkspaceImage so that invariant can be asserted by a
+// unit test with no mkfs.ext4, no debugfs and no root — the same reason
+// proxyRunArgs is split out of startProxyContainer.
+func guestEnv(gatewayIP, guestIP string, credEnv, gateEnv map[string]string) map[string]string {
+	env := make(map[string]string, len(credEnv)+len(gateEnv)+6)
+	for k, v := range credEnv {
+		env[k] = v
+	}
+	// Every reserved proxy name is set, including the ones this backend has no
+	// use of its own for. The names are reserved precisely so a manifest cannot
+	// supply them; a name that is reserved but never written is reserved in the
+	// validator only, and the ordering below would leave a credential of that
+	// name standing — which is what happened to NO_PROXY on a run with no gate
+	// bound, and to ALL_PROXY and FTP_PROXY on every run. Found by independent
+	// review of this change.
+	//
+	// NO_PROXY is empty here and overwritten by gateEnv when a gate is bound;
+	// that is the one exemption this backend has, and it is the gate address.
+	proxyURL := fmt.Sprintf("http://%s:%d", gatewayIP, fcSquidPort)
+	for k, v := range map[string]string{
+		"HTTP_PROXY":         proxyURL,
+		"HTTPS_PROXY":        proxyURL,
+		"http_proxy":         proxyURL,
+		"https_proxy":        proxyURL,
+		"ALL_PROXY":          proxyURL,
+		"all_proxy":          proxyURL,
+		"FTP_PROXY":          proxyURL,
+		"ftp_proxy":          proxyURL,
+		"NO_PROXY":           "",
+		"no_proxy":           "",
+		"CONSTLE_GUEST_CIDR": guestIP + "/30",
+		"CONSTLE_GATEWAY_IP": gatewayIP,
+	} {
+		env[k] = v
+	}
+	for k, v := range gateEnv {
+		env[k] = v
+	}
+	return env
+}
+
+// renderGuestEnvFile renders the guest's /env, which the guest sources as root
+// before the agent runs.
+//
+// The value is single-quote escaped; the NAME cannot be, because a quoted name
+// is not an assignment. So the name is CHECKED rather than escaped: a name
+// carrying a quote, a semicolon or a newline would close the export statement
+// and open another one, in a file that is about to be executed. Rendering
+// refuses what it cannot represent instead of trusting what it was handed —
+// the same second line buildSquidConfig keeps by re-checking every allowlist
+// entry it writes, and it holds for a manifest that never went through
+// Validate.
+//
+// Sorted, so the same environment renders to the same bytes every time.
+func renderGuestEnvFile(env map[string]string) (string, error) {
+	var out strings.Builder
+	for _, k := range sortedKeys(env) {
+		if err := manifest.ValidateCredentialName(k); err != nil {
+			return "", fmt.Errorf("refusing to build the guest environment: variable name %q: %w", k, err)
+		}
+		fmt.Fprintf(&out, "export %s='%s'\n", k, strings.ReplaceAll(env[k], "'", `'\''`))
+	}
+	return out.String(), nil
 }
 
 // prepareChroot lays out the jailer chroot with the kernel (hard-linked),
