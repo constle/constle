@@ -5,49 +5,219 @@ on:
     tags:
       - "v*"
 
+# Deny by default.
+#
+# A permissions block written here applies to every job, which is how this
+# workflow used to hand `contents: write`, `id-token: write` and
+# `attestations: write` to every step in it - including five third-party
+# actions. `id-token: write` is the sharpest of the three: it mints the OIDC
+# token Fulcio trades for a certificate that says "this is constle's release
+# workflow", which is the exact identity scripts/install pins. Anything holding
+# it can sign arbitrary bytes as this project.
+#
+# So the baseline is read-only and each job re-grants only what it needs. A job
+# added later starts with nothing rather than inheriting everything.
 permissions:
-  contents: write      # create the GitHub Release and upload assets
-  id-token: write      # mint the OIDC token cosign trades for a Fulcio cert
-  attestations: write  # write the build-provenance attestation to the repo
+  contents: read
+
+# Two pushes of the same tag must not publish the same release twice. Not
+# cancel-in-progress: a run interrupted between "upload assets" and "sign" is
+# exactly the half-published release this workflow exists to prevent.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  goreleaser:
+  # ---------------------------------------------------------------------------
+  # Build, sign and publish.
+  #
+  # This job is the one that holds the signing identity. Everything that does
+  # not need it lives in another job below.
+  # ---------------------------------------------------------------------------
+  release:
     name: GoReleaser
+    # A fork that pushes a v* tag would otherwise mint an OIDC token and fail
+    # noisily somewhere further in. Nothing here is useful outside this repo.
+    if: github.repository == 'constle/constle'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the GitHub Release and upload assets
+      id-token: write  # mint the OIDC token cosign trades for a Fulcio cert
     steps:
-      - uses: actions/checkout@v4
+      # Every action below is pinned to a full commit SHA, not a tag. `@v4` is
+      # a branch-like ref the action's owner can repoint at will, so a tag pin
+      # inside a job that holds id-token: write is a standing invitation: whoever
+      # moves the tag signs as this project on the next release. The trailing
+      # comment is the human-readable version; the SHA is what runs.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
 
       # Puts the `cosign` binary on PATH. GoReleaser's signs block shells out to
       # it, so this must run before GoReleaser, not after.
+      #
+      # cosign-release is set explicitly. Left unset, the installed cosign
+      # version is whatever this action's default happens to be on the day of
+      # the release - a third floating version inside the job that signs.
+      # v2.6.1 is that default as of the pinned SHA, so this pins today's
+      # behaviour rather than changing it; moving to cosign v3 is a separate
+      # decision with its own verification.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         with:
-          version: latest
+          cosign-release: 'v2.6.1'
+
+      # `version: latest` resolved the GoReleaser CLI at run time, independently
+      # of the action pin above - the tool that compiles the binaries and drives
+      # cosign was chosen by whatever had been published that morning. v2.18.2
+      # is what `latest` resolved to when this was pinned.
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          version: 'v2.18.2'
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build provenance is separate from, and complementary to, the cosign
-      # signature. cosign proves "this checksums.txt came out of this workflow";
-      # the attestation is a signed SLSA statement about how each archive was
-      # built, verifiable with `gh attestation verify <file> --repo constle/constle`.
-      #
-      # GoReleaser leaves the archives in dist/, so we point at them by glob.
-      # Both patterns are needed: tar.gz for linux/darwin, zip for windows.
+      # Handed to the attest job, which runs without contents: write.
+      # if-no-files-found: error because an empty upload here would turn into an
+      # attest job that cheerfully attests nothing.
+      - name: Upload the built archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Build provenance.
+  #
+  # Separate from, and complementary to, the cosign signature. cosign proves
+  # "this checksums.txt came out of this workflow"; the attestation is a signed
+  # SLSA statement about how each archive was built, verifiable with
+  # `gh attestation verify <file> --repo constle/constle`.
+  #
+  # It is its own job so that attestations: write is not held by the job that
+  # runs GoReleaser. A compromised release toolchain can still produce bad
+  # archives, but it can no longer mint attestations about arbitrary subjects.
+  # ---------------------------------------------------------------------------
+  attest:
+    name: Attest build provenance
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the built archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dist
+          path: dist
+
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+
+  # ---------------------------------------------------------------------------
+  # Verify what was actually published.
+  #
+  # This job exists because a green checkmark on this workflow was not evidence
+  # that the release it produced could be verified. Release v0.5.0 was published
+  # by a successful run of this workflow with no checksums.txt.sig and no
+  # checksums.txt.pem at all - the tag pointed at a commit whose .goreleaser.yaml
+  # had no signs block - and nothing noticed, because nothing checked.
+  #
+  # So the workflow now checks its own output the way a user does: re-download
+  # the published assets over the public API and run the same two commands
+  # scripts/install runs, with the same pinned identity. It holds contents: read
+  # only, so it cannot repair a release, only refuse to call it good.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify the published release
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        with:
+          cosign-release: 'v2.6.1'
+
+      # These two literals are the pin, and they are duplicated - byte for byte -
+      # in scripts/install, scripts/install.ps1 and README.md. A test in
+      # scripts/workflow_test.go asserts they still agree. Verifying with a
+      # different identity than the installers use would prove nothing about
+      # whether an install will succeed.
+      - name: Verify the signature over checksums.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+
+          COSIGN_IDENTITY_REGEXP='^https://github\.com/constle/constle/\.github/workflows/release\.yaml@refs/tags/v'
+          COSIGN_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+
+          # Release assets are not always queryable the instant GoReleaser
+          # returns. Retry rather than race; a genuinely missing signature still
+          # fails, just a minute later.
+          #
+          # The loop turns on the files being present, not on gh's exit status:
+          # `gh release download` with several --pattern flags succeeds as long
+          # as ANY one of them matched, so exactly the case worth catching here -
+          # checksums.txt published without its .sig - looks like success.
+          for attempt in 1 2 3 4 5 6; do
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'checksums.txt' \
+              --pattern 'checksums.txt.sig' \
+              --pattern 'checksums.txt.pem' \
+              --dir . --clobber || true
+
+            if [ -s checksums.txt ] && [ -s checksums.txt.sig ] && [ -s checksums.txt.pem ]; then
+              break
+            fi
+            if [ "$attempt" = 6 ]; then
+              echo "::error::release $TAG does not publish checksums.txt together with its .sig and .pem." \
+                   "Every installer that requires a verified signature will refuse this release."
+              ls -l checksums.txt* 2>&1 || true
+              exit 1
+            fi
+            sleep 10
+          done
+
+          cosign verify-blob \
+            --certificate checksums.txt.pem \
+            --signature checksums.txt.sig \
+            --certificate-identity-regexp "$COSIGN_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+            checksums.txt
+
+          echo "signature verified against the identity scripts/install pins"
+
+      # Link 2 of the same chain the installer walks: the archives on the
+      # release are the ones checksums.txt names. Catches a truncated or partial
+      # upload, which a signature over checksums.txt alone would not.
+      - name: Verify every published archive against checksums.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tar.gz' --pattern '*.zip' --dir . --clobber
+          sha256sum --check --strict checksums.txt

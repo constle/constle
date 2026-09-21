@@ -92,7 +92,7 @@ func TestBuildSquidConfigFirecrackerVariant(t *testing.T) {
 		"http_port 172.30.1.1:3128",
 		"access_log /var/lib/constle/runs/testrun01/access.log",
 		"pid_filename none",
-		"acl allowed_hosts dstdomain api.groq.com",
+		"acl allowed_hosts dstdomain -n api.groq.com",
 		"http_access deny all",
 		"http_access deny ip_only !allowed_hosts",
 	} {

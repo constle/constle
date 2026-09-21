@@ -543,7 +543,9 @@ allowed_hosts:
 
 Entries are hostnames. An entry beginning with `.` matches that domain and all
 its subdomains; otherwise the match is exact. Ports, schemes, and paths are not
-part of the matching.
+part of the matching — an entry names a host, and the ports that host is
+reachable on are fixed by the proxy, not by the entry (see **Destinations and
+ports** below).
 
 Each entry must be a plain hostname: dot-separated labels of lowercase ASCII
 letters, digits, and hyphens (no leading or trailing hyphen, at most 63
@@ -561,7 +563,9 @@ Squid still matched would otherwise slip past them.
 An IPv4 address written in dotted-quad form satisfies this grammar and is
 accepted. Squid then matches it literally, so listing an address permits
 connections to it; the raw-IP rule described under enforcement refuses only
-addresses that are not listed.
+addresses that are not listed. Listing one does not exempt it from the
+destination rule below: a private or link-local address is refused whether it
+was written into the allowlist or arrived as the answer to a DNS query.
 
 The provider hosts used as examples in this document (`api.groq.com`, `api.openai.com`, `api.anthropic.com`, etc.) are illustrative, not endorsements or defaults — substitute whatever hosts the agent's actual tools and model calls need.
 
@@ -578,6 +582,26 @@ drops privileges to). Constle resolves such details from the host at runtime
 rather than assuming any one distribution; `scripts/setup-firecracker` checks
 for the required host tools up front. The Docker backend is unaffected — its
 proxy runs inside a pinned container image.
+
+**Destinations and ports.** An allowlisted name settles which host, not where
+that host turns out to be or what may be carried to it.
+
+Matching is literal, and with reverse lookups disabled: a destination address
+matches only an entry spelling that same address, never by being resolved back
+to a name — a PTR record naming an allowlisted host does not admit the
+address, and that record is written by the address's owner. Separately, the
+address a name resolves to is checked, and a destination in the loopback,
+link-local (which is where cloud instance metadata lives), private, CGNAT or
+unspecified ranges is refused — in both address families, and whatever the DNS answer
+said. That check has to be made on the resolved address: no validation of the
+entry itself can know where a name will point at run time, and the per-run
+proxy reaches the host's own network.
+
+Ports are fixed: a request may name port 80 or 443, and a `CONNECT` tunnel may
+name 443 alone. Without that, an allowlisted hostname is a raw TCP tunnel to
+any port it listens on — SSH, a database, an internal admin service — since the tunnel's
+contents are opaque to the proxy by construction. A host that must be reached
+on another port is out of scope for the allowlist as it stands.
 
 Blocked attempts are recorded as `network_blocked` audit events; permitted ones
 as `network_allowed`.
@@ -726,6 +750,41 @@ depth, `params.arguments` included, rather than guessing which was meant. The
 two strings the gate routes on, `method` and `params.name`, are refused on the
 same principle when they differ from the spelling the gate matches only by
 case, by surrounding whitespace, or by a control character.
+
+**One endpoint, no traversal.** A client may append a sub-path after the server
+id, and the gate forwards it under the declared endpoint: with a declared
+`url` of `https://mcp.example.com/v1/mcp`, a request to
+`$CONSTLE_MCP_<ID>_URL/messages` reaches `https://mcp.example.com/v1/mcp/messages`
+and nothing else. The sub-path can only descend.
+
+The gate judges the sub-path after one decode, which is also what the origin
+gets back off the wire, and refuses — with `400` and an `mcp_request_blocked`
+event — any segment that a second reading of the same bytes would turn into
+structure: a `.` or `..` segment however it was encoded, an interior empty
+segment, a percent sign that survives the first decode (the mark of an origin
+being asked to decode twice, as in `%252e%252e%252f`), a path parameter
+(`..;/`, which servers that strip `;...` before normalising read as `..`), and
+a backslash (a separator to an origin on a platform that treats it as one).
+Ordinary encoding is untouched: `report%2Ejson` decodes to `report.json` and
+is forwarded.
+
+Nothing is normalised, because normalising picks one of the readings and the
+gate cannot know which one the origin will pick. The declared `url` is held to
+the same rule: an endpoint path that is itself ambiguous is refused when the
+gate is built, since a base that does not mean one thing cannot bound anything.
+
+This keeps the tool allowlist meaningful when several MCP servers share one
+origin. A traversal out of the declared endpoint would otherwise reach a
+neighbouring server's endpoint, which the gate would forward under *this*
+server's allowlist, human gates and metering.
+
+**No protocol upgrades.** Streamable HTTP defines none, so a request carrying
+an `Upgrade` header or the `upgrade` token in `Connection` is refused with
+`400` and an `mcp_request_blocked` event, and a `101 Switching Protocols` from
+an upstream fails the response with `502`. An accepted upgrade would stop the
+exchange being HTTP at all: the gate would be holding open a raw bidirectional
+tunnel it cannot inspect, to a host the sandbox is forbidden to reach directly
+(§7.2), for as long as either side kept it open.
 
 ### 9.1 `mcp.servers[].id`
 
@@ -1352,7 +1411,7 @@ private key is not available on this machine.
 | `sandbox.network.allowed_hosts` | **ENFORCED** | Per-run Squid allowlist; the real egress control |
 | `capabilities` | **ENFORCED** (capability floor) / DECLARED (gate advice) | Unknown values rejected |
 | `mcp.servers[].id` | VALIDATED | Unique; names `CONSTLE_MCP_<ID>_URL` |
-| `mcp.servers[].url` | **ENFORCED** | Host side only; never enters the sandbox |
+| `mcp.servers[].url` | **ENFORCED** | Host side only; never enters the sandbox; forwarding is scoped to this endpoint |
 | `mcp.servers[].tools` | **ENFORCED** | Non-listed tools blocked at the gate |
 | `mcp.servers[].pricing` | **ENFORCED** | Meters every `tools/call` response; fails closed on missing usage |
 | `a2a.listen` | **ENFORCED** | Host-side listener; verifies before relaying inward |
