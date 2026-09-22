@@ -536,3 +536,90 @@ func TestVerifyDecisionsCrossChecksRequireTheirFields(t *testing.T) {
 		t.Errorf("an intact decision stopped verifying: %s", failureText(rep))
 	}
 }
+
+// TestVerifyDecisionsBoundsTheVerdictLine reproduces the focused review's
+// finding: EvidenceFieldMax is enforced by NewResponseRecord when a record
+// is WRITTEN, and a log under examination arrives already written — by
+// whoever wrote it. A 1 MiB field in an attacker-authored log produced a
+// verdict line of the same size.
+func TestVerifyDecisionsBoundsTheVerdictLine(t *testing.T) {
+	a := newTestApprover(t)
+	huge := "sha256:" + strings.Repeat("a", 1<<20)
+
+	// The entry and its recorded request name different subjects, which is
+	// the path that interpolates both of them into one line.
+	rec := decided(a, "hg_1", "approved", testDigest)
+	rec.Request.SubjectDigest = huge
+	e := gateEntry(t, audit.EventGateApproved, testDigest, rec)
+
+	rep := mustVerify(t, []audit.Entry{e}, a.did)
+	if rep.OK() {
+		t.Fatal("mismatched subject digests passed verification")
+	}
+	line := rep.Failures[0].String()
+	if len(line) > problemDetailMax+512 {
+		t.Errorf("verdict line is %d bytes for a %d-byte field — not bounded", len(line), len(huge))
+	}
+	if !strings.Contains(line, "bytes in all") {
+		t.Errorf("truncation was not reported, so a clipped value reads as a short one: %q", line)
+	}
+}
+
+// TestVerifyDecisionsBoundsEveryDetailConstituent walks the other values
+// that reach a detail line off an entry, so the bound is not resting on one
+// code path having been found.
+func TestVerifyDecisionsBoundsEveryDetailConstituent(t *testing.T) {
+	a := newTestApprover(t)
+	huge := strings.Repeat("Z", 1<<20)
+
+	for _, tc := range []struct {
+		name  string
+		build func() audit.Entry
+	}{
+		{"approver_pubkey", func() audit.Entry {
+			rec := decided(a, "hg_1", "approved", testDigest)
+			rec.ApproverPubkey = huge
+			return gateEntry(t, audit.EventGateApproved, testDigest, rec)
+		}},
+		{"tool name", func() audit.Entry {
+			rec := decided(a, "hg_1", "approved", testDigest)
+			rec.Request.ToolName = huge
+			return gateEntry(t, audit.EventGateApproved, testDigest, rec)
+		}},
+		{"event", func() audit.Entry {
+			rec := decided(a, "hg_1", "approved", testDigest)
+			e := gateEntry(t, audit.EventGateApproved, testDigest, rec)
+			e.Event = audit.EventType(huge)
+			return e
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rep := mustVerify(t, []audit.Entry{tc.build()}, a.did)
+			if rep.OK() {
+				t.Fatal("the oversized entry passed verification")
+			}
+			if line := rep.Failures[0].String(); len(line) > problemDetailMax+512 {
+				t.Errorf("verdict line is %d bytes — not bounded", len(line))
+			}
+		})
+	}
+}
+
+// TestProblemDetailBoundSurvivesAnExternalCaller: String is exported, so a
+// DecisionProblem can be built by a caller that never went through
+// VerifyDecisions and never met boundedArgs.
+func TestProblemDetailBoundSurvivesAnExternalCaller(t *testing.T) {
+	p := DecisionProblem{Entry: 1, Event: audit.EventGateApproved, Detail: strings.Repeat("q", 1<<20)}
+	if line := p.String(); len(line) > problemDetailMax+512 {
+		t.Errorf("verdict line is %d bytes — the backstop bound did not apply", len(line))
+	}
+}
+
+// TestProblemDetailKeepsConstleOwnProse: the bound must not clip the
+// sentences constle writes, or the fix trades one defect for another.
+func TestProblemDetailKeepsConstleOwnProse(t *testing.T) {
+	p := DecisionProblem{Entry: 1, Event: audit.EventGateApproved, Detail: unprovenApproval}
+	if line := p.String(); strings.Contains(line, "bytes in all") {
+		t.Errorf("the longest legitimate detail was truncated: %q", line)
+	}
+}

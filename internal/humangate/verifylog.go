@@ -38,12 +38,21 @@ func (p DecisionProblem) String() string {
 	if id == "" {
 		id = "(no request_id)"
 	}
-	// Detail is composed here or by a stdlib error over an already-bounded
-	// field, so it is escaped without a length bound of its own. Escaped
-	// rather than trusted, because "constle wrote it" is a claim about the
-	// format string, not about what got interpolated into it.
+	// Detail's own constituents are bounded where they are interpolated (see
+	// boundedArgs), which is the precise fix: it keeps constle's prose
+	// intact and clips only the log's contribution to it. This second bound
+	// is the backstop for the case that reasoning does not cover — String is
+	// exported, so a DecisionProblem can be built by a caller that never went
+	// through VerifyDecisions, with a Detail of any length.
+	//
+	// Escaped rather than trusted, because "constle wrote it" is a claim
+	// about the format string, not about what got interpolated into it. And
+	// bounded AFTER escaping, because escaping expands: one NUL becomes the
+	// six bytes of \u0000, so a bound taken first would not bound what is
+	// printed.
 	return fmt.Sprintf("entry %d: %s %s — %s",
-		p.Entry, safeProblemField(string(p.Event)), id, termsafe.Line(p.Detail))
+		p.Entry, safeProblemField(string(p.Event)), id,
+		clampDisplay(termsafe.Line(p.Detail), problemDetailMax))
 }
 
 // safeProblemField renders one field of a problem line that arrived out of
@@ -72,14 +81,26 @@ func (p DecisionProblem) String() string {
 // because it is already this package's answer to how long one of these may
 // legitimately be.
 func safeProblemField(s string) string {
-	s = termsafe.Line(s)
-	if len(s) <= EvidenceFieldMax {
+	return clampDisplay(termsafe.Line(s), EvidenceFieldMax)
+}
+
+// problemDetailMax bounds a composed detail line. It is larger than
+// EvidenceFieldMax because a detail is mostly constle's own sentence: the
+// longest of them runs past 230 bytes before any value is substituted, and
+// two already-bounded values with their truncation suffixes add roughly 560
+// more. 1024 clears that with room and still refuses to print a megabyte.
+const problemDetailMax = 1024
+
+// clampDisplay bounds an already-escaped string for display, cutting on a
+// rune boundary: the escaped string is printable, but a byte slice can still
+// split a multi-byte rune and produce the invalid UTF-8 the escaping exists
+// to keep out. The full length is reported, so a truncated value is never
+// mistaken for a short one.
+func clampDisplay(s string, max int) string {
+	if len(s) <= max {
 		return s
 	}
-	// Cut on a rune boundary: the escaped string is printable, but a byte
-	// slice can still split a multi-byte rune and produce the invalid UTF-8
-	// this function exists to keep out.
-	cut := EvidenceFieldMax
+	cut := max
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
@@ -127,7 +148,10 @@ func VerifyDecisions(entries []audit.Entry, pinnedPubkey string) (*DecisionRepor
 	rep := &DecisionReport{}
 	for i, e := range entries {
 		problem := func(detail string, args ...any) DecisionProblem {
-			return DecisionProblem{Entry: i + 1, Event: e.Event, Detail: fmt.Sprintf(detail, args...)}
+			return DecisionProblem{
+				Entry: i + 1, Event: e.Event,
+				Detail: fmt.Sprintf(detail, boundedArgs(args)...),
+			}
 		}
 
 		rec, err := RecordedDecisionFrom(e.Details)
@@ -149,7 +173,7 @@ func VerifyDecisions(entries []audit.Entry, pinnedPubkey string) (*DecisionRepor
 		p := problem("")
 		p.RequestID = rec.Request.RequestID
 		fail := func(detail string, args ...any) {
-			p.Detail = fmt.Sprintf(detail, args...)
+			p.Detail = fmt.Sprintf(detail, boundedArgs(args)...)
 			rep.Failures = append(rep.Failures, p)
 		}
 
@@ -332,4 +356,34 @@ func terminalReason(event audit.EventType) (Reason, bool) {
 		return ReasonDigestMismatch, true
 	}
 	return "", false
+}
+
+// boundedArgs escapes and bounds every value a detail line interpolates.
+//
+// The values are read out of the log under examination, and the write-side
+// cap does NOT apply to them: EvidenceFieldMax is enforced by
+// NewResponseRecord when a record is written, while a log arrives already
+// written — by whoever wrote it. RecordedDecisionFrom deliberately does not
+// clamp on the way in, because the same fields are compared for equality and
+// truncating them there could make two different values compare alike. So
+// the bound belongs here, at the display boundary, and not at the parse one.
+//
+// audit.EventType has its own case because it is a named string type, which
+// a `case string` does not match — and it is one of the values that reaches
+// a detail straight off an entry.
+func boundedArgs(args []any) []any {
+	out := make([]any, len(args))
+	for i, a := range args {
+		switch v := a.(type) {
+		case string:
+			out[i] = safeProblemField(v)
+		case audit.EventType:
+			out[i] = safeProblemField(string(v))
+		case error:
+			out[i] = safeProblemField(v.Error())
+		default:
+			out[i] = a
+		}
+	}
+	return out
 }
