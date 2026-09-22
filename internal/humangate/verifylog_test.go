@@ -527,6 +527,14 @@ func TestVerifyDecisionsCrossChecksRequireTheirFields(t *testing.T) {
 			if rep.Verified != 0 {
 				t.Errorf("Verified = %d, want 0", rep.Verified)
 			}
+			// Assert the presence rule is what rejected it. Without this,
+			// the record-side cases pass for the wrong reason — a deleted
+			// digest also breaks the signature comparison downstream, so
+			// the subtest would still go green with the presence rule gone.
+			if got := failureText(rep); !strings.Contains(got, "nothing") &&
+				!strings.Contains(got, "cannot be tied") {
+				t.Errorf("rejected for some other reason than the missing field: %s", got)
+			}
 		})
 	}
 
@@ -621,5 +629,24 @@ func TestProblemDetailKeepsConstleOwnProse(t *testing.T) {
 	p := DecisionProblem{Entry: 1, Event: audit.EventGateApproved, Detail: unprovenApproval}
 	if line := p.String(); strings.Contains(line, "bytes in all") {
 		t.Errorf("the longest legitimate detail was truncated: %q", line)
+	}
+}
+
+// TestVerifyDecisionsBoundsTheDetailItself isolates boundedArgs from the
+// 1024-byte backstop in String(). With only the backstop, a Detail composed
+// from a megabyte-long log field is still a megabyte long in memory and is
+// merely clipped on the way to the screen — every consumer that reads the
+// field directly still carries it.
+func TestVerifyDecisionsBoundsTheDetailItself(t *testing.T) {
+	a := newTestApprover(t)
+	rec := decided(a, "hg_1", "approved", testDigest)
+	rec.Request.SubjectDigest = "sha256:" + strings.Repeat("a", 1<<20)
+
+	rep := mustVerify(t, []audit.Entry{gateEntry(t, audit.EventGateApproved, testDigest, rec)}, a.did)
+	if rep.OK() {
+		t.Fatal("mismatched subject digests passed verification")
+	}
+	if n := len(rep.Failures[0].Detail); n > problemDetailMax {
+		t.Errorf("Detail is %d bytes before rendering — the constituents were not bounded", n)
 	}
 }

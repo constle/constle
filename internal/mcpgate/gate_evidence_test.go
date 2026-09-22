@@ -3,6 +3,7 @@ package mcpgate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -308,4 +309,41 @@ func (a evidenceOnlyApprover) Decide(ctx context.Context, req Request) Decision 
 
 func (a evidenceOnlyApprover) DecideWithReason(context.Context, Request) Outcome {
 	return Outcome{Decision: DecisionNone, Evidence: a.evidence}
+}
+
+// TestEmptyToolNameIsRefused closes the producer side of the review finding
+// that an empty tool name reaches the audit record.
+//
+// The offline verifier requires an entry's tool name and its recorded
+// request's to be present and equal, and treats an empty one as absent —
+// which is what stops a deleted field passing for a missing one. A gate that
+// could arm on "" would therefore write correctly signed records that can
+// never be verified. The manifest refuses to declare the empty entry and the
+// gate refuses to route the empty call, so neither half is reachable.
+//
+// Tested at parseJSONRPC rather than through the gate: a call whose tool
+// name is empty is also rejected by the server's tool allowlist, so an
+// end-to-end assertion passes whether or not this check exists. Isolating it
+// here is what makes the test evidence rather than decoration.
+func TestEmptyToolNameIsRefused(t *testing.T) {
+	_, err := parseJSONRPC([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"","arguments":{}}}`))
+	if err == nil {
+		t.Fatal("parseJSONRPC accepted a tools/call with an empty tool name")
+	}
+	if !errors.Is(err, errAmbiguousBody) {
+		t.Errorf("error = %v, want it to join the ambiguous-body refusals", err)
+	}
+
+	// A named call on the same shape still parses, or the check is too broad.
+	if _, err := parseJSONRPC([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_email","arguments":{}}}`)); err != nil {
+		t.Errorf("parseJSONRPC rejected a named tools/call: %v", err)
+	}
+
+	// A method that is not tools/call carries no tool name and must be
+	// unaffected — the check belongs to the routed call, not to every body.
+	if _, err := parseJSONRPC([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)); err != nil {
+		t.Errorf("parseJSONRPC rejected a non-tools/call body: %v", err)
+	}
 }

@@ -1344,3 +1344,39 @@ func TestInferIsolationMatchesCapabilityFloor(t *testing.T) {
 		}
 	}
 }
+
+// TestHumanGatesRejectsEmptyToolEntry: an empty entry arms a gate on a name
+// nothing can be held to. The gate would match a tools/call whose
+// params.name is also empty and write an audit record with the tool name
+// empty on both sides — correctly signed, and unverifiable offline, because
+// a verifier that accepted an empty name as a match would also accept a
+// deleted one. Found by review of the offline verifier's presence rules.
+func TestHumanGatesRejectsEmptyToolEntry(t *testing.T) {
+	const pubkey = "did:key:z6MkgZ9rP6b8ugnXJwtJzQc3yheTPPU7ZBLgdYuVZGEs3eH6"
+	for _, entry := range []string{`""`, `" "`, `"\t"`} {
+		yaml := "apiVersion: constle.dev/v1alpha1\nkind: AgentManifest\n" +
+			"identity:\n  name: gate-test\n" +
+			"human_gates:\n  enabled: true\n  require_approval_for: [" + entry + "]\n" +
+			"  approver_pubkey: \"" + pubkey + "\"\n"
+		m, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Fatalf("Parse() error: %v", err)
+		}
+		if err := m.Validate(); err == nil {
+			t.Errorf("Validate() accepted require_approval_for: [%s]", entry)
+		}
+	}
+
+	// A real tool name still validates, or the check is too broad.
+	yaml := "apiVersion: constle.dev/v1alpha1\nkind: AgentManifest\n" +
+		"identity:\n  name: gate-test\n" +
+		"human_gates:\n  enabled: true\n  require_approval_for: [\"fs.write\"]\n" +
+		"  approver_pubkey: \"" + pubkey + "\"\n"
+	m, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error: %v", err)
+	}
+	if err := m.Validate(); err != nil {
+		t.Errorf("Validate() rejected a named tool: %v", err)
+	}
+}

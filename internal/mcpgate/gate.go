@@ -1313,6 +1313,19 @@ func checkUnambiguousNames(msg *jsonRPCMessage) error {
 		}
 		return nil
 	}
+	if msg.Params.Name == "" {
+		// A tools/call with no tool name has nothing the gate can decide
+		// about. It is refused here rather than carried, because an empty
+		// name is a name the audit trail cannot hold a decision to: an
+		// offline verifier requires an entry's tool and its recorded
+		// request's to be present and equal, and treats an empty one as
+		// absent — so a gate armed on "" would write records that are
+		// correctly signed and cannot be verified. Refusing at the producer
+		// keeps that requirement fail-closed instead of loosening it into
+		// "absent and empty are the same thing", which is how a deleted
+		// field passes for a missing one.
+		return fmt.Errorf("%w: params.name is empty", errAmbiguousBody)
+	}
 	return checkRoutingName("params.name", msg.Params.Name)
 }
 

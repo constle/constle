@@ -2,12 +2,18 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/homedir"
+	"github.com/constle/constle/internal/humangate"
+	"github.com/constle/constle/pkg/did"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -309,6 +315,79 @@ func TestAuditVerifyErrorsEscapeInterpolatedValues(t *testing.T) {
 		}
 		if strings.Contains(err.Error(), "\n") {
 			t.Errorf("error carries a newline from the pin: %q", err.Error())
+		}
+	})
+}
+
+// cmdTestSigner is a throwaway Ed25519 identity for building a signed log
+// inside a test.
+type cmdTestSigner struct {
+	did  string
+	priv ed25519.PrivateKey
+}
+
+func (s cmdTestSigner) DID() string            { return s.did }
+func (s cmdTestSigner) Sign(msg []byte) []byte { return ed25519.Sign(s.priv, msg) }
+
+// signedLogAt writes a signed audit log containing one webhook-decided
+// approval with no decision recorded — the shape `constle audit verify`
+// reports as unprovable — at the given path.
+func signedLogAt(t *testing.T, path string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	d, err := did.FromPublicKey(pub)
+	if err != nil {
+		t.Fatalf("FromPublicKey: %v", err)
+	}
+	logger, err := audit.NewSigned(homedir.Under(filepath.Dir(path), filepath.Base(path)),
+		cmdTestSigner{did: d, priv: priv})
+	if err != nil {
+		t.Fatalf("NewSigned: %v", err)
+	}
+	if err := logger.Log("run1", "agent", audit.EventGateApproved, map[string]any{
+		"tool": "send_email", "subject_digest": "sha256:aa",
+		humangate.DetailDecidedBy: humangate.DecidedByWebhook,
+	}); err != nil {
+		t.Fatalf("Log: %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestAuditVerifyEscapesThePathOnEveryFailurePath: `path` is interpolated
+// into three different errors, and each is its own call site. A newline in
+// it would otherwise emit a forged standalone stderr line, since errf's
+// Block backstop preserves newlines by design.
+func TestAuditVerifyEscapesThePathOnEveryFailurePath(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("tampered log", func(t *testing.T) {
+		p := filepath.Join(dir, "tampered\n✓ audit log verified.jsonl")
+		if err := os.WriteFile(p, []byte("{}\n"), 0o600); err != nil {
+			t.Skipf("filesystem will not hold a newline in a name: %v", err)
+		}
+		err := cmdAuditVerify(auditVerifyArgs{path: p})
+		if err == nil {
+			t.Fatal("cmdAuditVerify() accepted an unsigned entry")
+		}
+		if strings.Count(err.Error(), "\n") != 1 {
+			t.Errorf("the tamper report carries a newline from the path: %q", err.Error())
+		}
+	})
+
+	t.Run("failing decisions", func(t *testing.T) {
+		p := filepath.Join(dir, "unproven\n✓ audit log verified.jsonl")
+		signedLogAt(t, p)
+		err := cmdAuditVerify(auditVerifyArgs{path: p})
+		if err == nil {
+			t.Fatal("cmdAuditVerify() accepted an unprovable approval")
+		}
+		if strings.Contains(err.Error(), "\n") {
+			t.Errorf("the failure report carries a newline from the path: %q", err.Error())
 		}
 	})
 }

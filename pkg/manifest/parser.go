@@ -667,6 +667,18 @@ func (m *AgentManifest) validateHumanGates() error {
 		if err := did.Validate(g.ApproverPubkey); err != nil {
 			return fmt.Errorf("human_gates.approver_pubkey is not a valid did:key Ed25519 string: %w", err)
 		}
+		// An empty entry arms a gate on a tool name nothing can be held to.
+		// The gate would match a tools/call whose params.name is also empty
+		// and write an audit record whose tool name is empty on both sides —
+		// correctly signed, and unverifiable offline, because a verifier
+		// that accepted an empty name as a match would also accept a deleted
+		// one. Rejected here so the gate never arms on it.
+		for i, tool := range g.RequireApprovalFor {
+			if strings.TrimSpace(tool) == "" {
+				return fmt.Errorf(
+					"human_gates.require_approval_for[%d] is empty — name the tool the gate applies to", i)
+			}
+		}
 	}
 
 	return nil
