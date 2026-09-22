@@ -143,13 +143,13 @@ func main() {
 
 	case "audit":
 		if len(args) < 2 || args[1] != "verify" {
-			die("usage: constle audit verify [--did=<did:key:…>] <logfile>")
+			die("%s", auditVerifyUsage)
 		}
-		logPath, expectedDID, err := parseAuditVerifyArgs(args[2:])
+		verifyArgs, err := parseAuditVerifyArgs(args[2:])
 		if err != nil {
 			die("%v", err)
 		}
-		if err := cmdAuditVerify(logPath, expectedDID); err != nil {
+		if err := cmdAuditVerify(verifyArgs); err != nil {
 			die("%v", err)
 		}
 
@@ -1175,8 +1175,12 @@ usage:
     --owner=<email>             bind the identity to an owner
   constle identity show <name>  show an agent's DID and key location
   constle webhook-keygen <name>  generate a human-gates webhook approver keypair (did:key)
-  constle audit verify <logfile>  verify a signed audit log (signatures + hash chain)
+  constle audit verify <logfile>  verify a signed audit log (signatures + hash chain),
+                                and re-verify the human-gate decisions it records
+    --agentfile=<path>          take both pins below from an Agentfile
     --did=<did:key:…>           pin the identity the log must be signed with
+    --approver-pubkey=<did:key:…>  pin the human_gates.approver_pubkey that the
+                                log's recorded gate decisions must verify against
   constle ps                    list running and recent agents
   constle stop <run_id>         stop a running agent by run ID
   constle version               show version

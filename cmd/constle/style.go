@@ -200,7 +200,7 @@ func printStyledHelpBody() {
 		{"identity create <name>", "create a cryptographic identity (did:key)"},
 		{"identity show <name>", "show an agent's DID and key location"},
 		{"webhook-keygen <name>", "generate a human-gates approver keypair (did:key)"},
-		{"audit verify <logfile>", "verify a signed audit log"},
+		{"audit verify <logfile>", "verify a signed audit log and its gate decisions"},
 		{"ps", "list running and recent agents"},
 		{"stop <run_id>", "stop a running agent by run ID"},
 		{"version", "show version"},

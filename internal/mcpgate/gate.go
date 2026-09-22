@@ -142,6 +142,20 @@ type Outcome struct {
 	// caused by a signature that failed to verify, rather than an ordinary
 	// human "no".
 	Event audit.EventType
+
+	// Evidence, when non-nil, is the signed decision this Outcome came from,
+	// which runGate writes to the audit log so the decision can be
+	// re-verified offline against the approver's key
+	// (spec/human-gates-webhook.md §9). An Approver that produces no signed
+	// statement — TerminalApprover, whose answer is a keystroke — leaves it
+	// nil, and the entry keeps exactly the details it always had.
+	//
+	// It is evidence ABOUT a decision, never an input TO one, on the same
+	// rule the subject_digest already follows in runGate: nothing here may
+	// change whether the call proceeds. Decision alone decides that, and
+	// Evidence that could not be built or written must not turn an approval
+	// into a denial.
+	Evidence *humangate.RecordedDecision
 }
 
 // ReasoningApprover is implemented by an Approver that can explain a denial
@@ -930,12 +944,24 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		OnTimeout:      g.gates.OnTimeout,
 	}
 
+	// evidence is the signed decision, once an approver has produced one.
+	// It is declared here so gateDetails can pick it up: still nil when
+	// gate_triggered is written (no request_id exists before the approver
+	// mints one), populated by the time any terminal event is.
+	var evidence *humangate.RecordedDecision
+
 	// gateDetails seeds the details map every terminal event of this gate
-	// shares, so none of them can drift out of naming the same subject.
+	// shares, so none of them can drift out of naming the same subject —
+	// including the §9 decision evidence, which every terminal event of a
+	// webhook-decided gate therefore carries by construction rather than by
+	// each call site remembering to attach it.
 	gateDetails := func(extra map[string]any) map[string]any {
 		d := map[string]any{"server": up.id, "tool": tool}
 		if subjectDigest != "" {
 			d["subject_digest"] = subjectDigest
+		}
+		for k, v := range evidence.Details() {
+			d[k] = v
 		}
 		for k, v := range extra {
 			d[k] = v
@@ -962,11 +988,11 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 	defer cancel()
 
 	decision := DecisionNone
-	decidedBy := "terminal"
+	decidedBy := humangate.DecidedByTerminal
 	var eventOverride audit.EventType
 	if ra, ok := g.approver.(ReasoningApprover); ok {
 		outcome := ra.DecideWithReason(ctx, req)
-		decision, eventOverride = outcome.Decision, outcome.Event
+		decision, eventOverride, evidence = outcome.Decision, outcome.Event, outcome.Evidence
 		if outcome.DecidedBy != "" {
 			decidedBy = outcome.DecidedBy
 		}
@@ -983,7 +1009,8 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		if eventOverride != "" {
 			event = eventOverride
 		}
-		g.log(event, gateDetails(map[string]any{"decided_by": decidedBy, "wait_ms": waitMS}))
+		g.log(event, gateDetails(map[string]any{
+			humangate.DetailDecidedBy: decidedBy, "wait_ms": waitMS}))
 		forward()
 
 	case DecisionDenied:
@@ -991,7 +1018,8 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		if eventOverride != "" {
 			event = eventOverride
 		}
-		g.log(event, gateDetails(map[string]any{"decided_by": decidedBy, "wait_ms": waitMS}))
+		g.log(event, gateDetails(map[string]any{
+			humangate.DetailDecidedBy: decidedBy, "wait_ms": waitMS}))
 		writeJSONRPCError(w, msg.ID, fmt.Sprintf(
 			"constle: human gate DENIED tool call %q on server %q", tool, up.id))
 
@@ -1284,6 +1312,19 @@ func checkUnambiguousNames(msg *jsonRPCMessage) error {
 				errAmbiguousBody, clampJSONValue(msg.Method), methodToolsCall)
 		}
 		return nil
+	}
+	if msg.Params.Name == "" {
+		// A tools/call with no tool name has nothing the gate can decide
+		// about. It is refused here rather than carried, because an empty
+		// name is a name the audit trail cannot hold a decision to: an
+		// offline verifier requires an entry's tool and its recorded
+		// request's to be present and equal, and treats an empty one as
+		// absent — so a gate armed on "" would write records that are
+		// correctly signed and cannot be verified. Refusing at the producer
+		// keeps that requirement fail-closed instead of loosening it into
+		// "absent and empty are the same thing", which is how a deleted
+		// field passes for a missing one.
+		return fmt.Errorf("%w: params.name is empty", errAmbiguousBody)
 	}
 	return checkRoutingName("params.name", msg.Params.Name)
 }
