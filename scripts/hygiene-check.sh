@@ -1,8 +1,6 @@
 #!/bin/sh
 # hygiene-check.sh — scan git history and the working tree for content that
-# must never reach the public repository: AI-attribution trailers, plus the
-# maintainer-private identifiers and non-ASCII byte ranges loaded from a
-# private pattern file.
+# must not reach the public repository.
 #
 # Usage:
 #   scripts/hygiene-check.sh --all            # every commit on every ref
@@ -12,47 +10,51 @@
 #                                             # reads the ref lines on stdin
 #   scripts/hygiene-check.sh --install-hook   # install the pre-push hook
 #
-# Exit codes: 0 clean, 1 hits found, 2 usage or configuration error.
+# --require-private is accepted, for hooks that pass it, and changes nothing:
+# the pattern file is always required.
 #
-# PATTERN SOURCES — and why they are split:
+# Exit codes: 0 clean, 1 hits found, 2 usage or configuration error —
+# including a missing or empty pattern file, and a file whose embedded
+# metadata needed reading and could not be read.
 #
-#   1. Generic patterns (below, checked in): AI-attribution phrases, and
-#      nothing else. They describe a tool's output, not a person or a place,
-#      which is the whole reason they can sit in a public file.
+# PATTERN FILE:
 #
-#      The bar for this list is not "does it name someone" but "does it
-#      narrow who someone is". A pattern is a description of what is being
-#      hidden, so a check that names nobody can still give away more than the
-#      content it is looking for. Anything that fails that second test belongs
-#      in the private file, however harmless it reads.
+#   No pattern is checked in. They are read from a file kept outside the
+#   repository:
+#       $CONSTLE_HYGIENE_PATTERNS  (if set), else
+#       ~/.config/constle/hygiene-patterns
+#   One case-insensitive extended regex per line, # comments allowed. Without
+#   the file, or with a file that yields no patterns, the script refuses to
+#   scan: a scan with nothing to look for would report clean.
 #
-#   2. Private patterns (NOT checked in): the maintainer's personal
-#      identifiers — name variants, hostname strings — and any non-ASCII byte
-#      ranges to watch for; anything that would itself be a leak if this
-#      script shipped it. One case-insensitive extended regex per line,
-#      # comments allowed, loaded from:
-#          $CONSTLE_HYGIENE_PATTERNS  (if set), else
-#          ~/.config/constle/hygiene-patterns
+#   A line may carry an optional scope prefix:
+#       <regex>        checked everywhere: text, the raw bytes of a binary
+#                      file, and embedded metadata
+#       text:<regex>   checked in text content and embedded metadata, not in
+#                      the raw bytes of a binary file
+#       meta:<regex>   checked in embedded metadata only
+#   text: exists for byte-range patterns. A range over raw bytes matches
+#   compressed binary content by coincidence — a two-byte range covers
+#   roughly 0.1% of random byte pairs, which is thousands of hits per megabyte
+#   of compressed data — so on a binary such a pattern reports nothing but
+#   noise, and a scan that is permanently red is a scan nobody reads.
 #
-#      A line may carry an optional scope prefix:
-#          text:<regex>   checked in text content only
-#          <regex>        checked in every file, text or binary
-#      Scope exists for byte-range patterns. A range over raw bytes matches
-#      compressed binary content by coincidence — a two-byte range covers
-#      roughly 0.1% of random byte pairs, which is thousands of hits per
-#      megabyte of compressed data — so on a binary such a pattern reports
-#      nothing but noise, and a scan that is permanently red is a scan nobody
-#      reads. Phrase patterns take no prefix and are checked everywhere.
-#      A missing private file is a loud warning, not silence: history has
-#      shown the gap is always the pattern nobody was checking (a bare first
-#      name that every earlier ad-hoc grep spelled with a suffix). Pass
-#      --require-private to turn that warning into a failure (recommended in
-#      the pre-push hook, enforced by default when the file's directory
-#      exists but the file does not).
+#   CI reads the same file from a repository secret: see the hygiene job in
+#   .github/workflows/ci.yaml.
 #
-#   CI note: public CI cannot carry the private file, so a CI step runs the
-#   generic checks only. The pre-push hook on the maintainer's machine is
-#   where the private patterns bite — install it with --install-hook.
+# EMBEDDED METADATA:
+#
+#   Every binary file a scan reaches, and every file with a media or document
+#   extension whether git calls it binary or not, is also read with exiftool,
+#   and the fields it decodes are checked against every pattern. A byte scan
+#   sees such a field only when the format stores it uncompressed.
+#
+#   exiftool is REQUIRED whenever there is such a file to read. Without it the
+#   scan still runs every other check, then exits 2. A range or tree with no
+#   binary or media file in it does not need exiftool at all. Install it with
+#       apt-get install libimage-exiftool-perl     (Debian, Ubuntu)
+#       brew install exiftool                      (macOS)
+#   or point $CONSTLE_HYGIENE_EXIFTOOL at the executable.
 #
 # INSTALLING THE PRE-PUSH HOOK:
 #   scripts/hygiene-check.sh --install-hook
@@ -62,8 +64,8 @@
 
 set -u
 
-# Every byte this script handles is a byte, never a character. The private
-# pattern file holds raw byte ranges, which are not valid text in any UTF-8
+# Every byte this script handles is a byte, never a character. The pattern
+# file can hold raw byte ranges, which are not valid text in any UTF-8
 # locale, and a tool that is allowed to notice that will refuse the input:
 # BSD sed answers "RE error: illegal byte sequence" and stops, GNU tools
 # quietly switch to their binary path. Both outcomes drop patterns.
@@ -76,26 +78,8 @@ set -u
 # someone who does not know this paragraph exists.
 export LC_ALL=C
 
-# --------------------------------------------------------------------------
-# Generic, publishable patterns — see PATTERN SOURCES above for what is
-# allowed to live here. Case-insensitive extended regexes, one per entry.
-# Scoped to attribution PHRASES, not bare product words: this repo
-# legitimately contains ANTHROPIC_API_KEY, api.anthropic.com, and model
-# names, so matching bare "claude|anthropic" would drown real leaks in
-# false positives.
-# --------------------------------------------------------------------------
-# The bracketed single characters ([-], [ ]) are regex-equivalent to the
-# plain character but keep each pattern from matching its own source line
-# when a commit touching this script is scanned.
-GENERIC_PATTERNS='claude[-]session:
-co[-]authored[-]by:.*(claude|anthropic|copilot|gpt|gemini|cursor)
-generated[ ](with|by).*(claude|copilot|gpt|gemini|cursor|ai)
-claude[.]ai/code
-noreply@anthropic[.]com
-🤖[ ]generated'
-
 PRIVATE_FILE="${CONSTLE_HYGIENE_PATTERNS:-$HOME/.config/constle/hygiene-patterns}"
-REQUIRE_PRIVATE=0
+EXIFTOOL="${CONSTLE_HYGIENE_EXIFTOOL:-exiftool}"
 STATUS=0
 
 warn() { printf '%s\n' "hygiene-check: $*" >&2; }
@@ -108,7 +92,7 @@ warn() { printf '%s\n' "hygiene-check: $*" >&2; }
 #                                the two-line string "0\n0", which is not a
 #                                number and takes the arithmetic below down
 #                                with it. Empty is the normal case for a
-#                                private file with no text: entries.
+#                                scope with no entries in the pattern file.
 #   wc -l < FILE                 BSD wc pads its output with leading spaces,
 #                                so the result is " 3" on macOS and "3" on
 #                                Linux.
@@ -123,75 +107,74 @@ count_lines() {
     printf '%s' "$n"
 }
 
-# combined_pattern_file writes the active patterns to two temp files for
-# grep -f, one per line:
+# combined_pattern_file splits the pattern file by scope into three temp
+# files for grep -f, one pattern per line:
 #
-#   $1  every-file patterns  — generic entries plus unprefixed private ones
-#   $2  text-only patterns   — private entries carrying the text: prefix
+#   $1  every-file patterns  — unprefixed entries
+#   $2  text-only patterns   — entries carrying the text: prefix
+#   $3  metadata-only        — entries carrying the meta: prefix
 #
 # A blank line in a grep -f file matches EVERY line, so blank lines are
 # stripped on the way in and each file is only used when it is non-empty.
 combined_pattern_file() {
     tmp="$1"
     text_tmp="$2"
-    printf '%s\n' "$GENERIC_PATTERNS" > "$tmp"
+    meta_tmp="$3"
+    : > "$tmp"
     : > "$text_tmp"
-    if [ -f "$PRIVATE_FILE" ]; then
-        # -a is load-bearing here, and its absence FAILS SILENTLY. A
-        # byte-range entry puts improperly-encoded bytes in the private file,
-        # which can make a tool classify the file ITSELF as binary and stop
-        # reproducing its lines: the entry is dropped on the way in, along
-        # with an unpredictable number of its neighbours, and nothing says so.
-        # A dropped entry is a check that stops running — the failure this
-        # script exists to prevent. -a forces the text path; the exported
-        # LC_ALL=C at the top of the file stops the locale reaching the same
-        # conclusion on its own grounds. The count guard below is the backstop
-        # for both, and for whatever the next tool decides to do.
-        # `|| true` would swallow the difference between "no lines matched"
-        # (grep exit 1, normal) and "could not read the file" (grep exit 2 —
-        # unreadable, a directory, a broken symlink). Swallowing the second is
-        # how an existing-but-unreadable private file degrades into a
-        # generic-only scan that prints a clean tree: --require-private is
-        # satisfied by the file EXISTING, and nothing downstream notices that
-        # it contributed nothing.
-        grep -a -vE '^[[:space:]]*(#|$)' "$PRIVATE_FILE" > "$TMPDIR_HC/private"
-        rc=$?
-        if [ "$rc" -gt 1 ]; then
-            warn "private pattern file $PRIVATE_FILE could not be read (grep exit $rc) — refusing to scan without it"
-            exit 2
-        fi
-        sed -n 's/^text://p' "$TMPDIR_HC/private" | grep -a -v '^$' >> "$text_tmp" || true
-        grep -a -v '^text:' "$TMPDIR_HC/private" | grep -a -v '^$' >> "$tmp" || true
-
-        # Every private pattern line must land in exactly one of the two
-        # files. A count that does not add up means a pattern was dropped on
-        # the way in, and a dropped pattern is a check that silently stops
-        # running — the failure this whole script exists to prevent. Fail
-        # loudly rather than scan with a short list.
-        want=$(count_lines "$TMPDIR_HC/private")
-        got_all=$(count_lines "$tmp")
-        got_text=$(count_lines "$text_tmp")
-        printf '%s\n' "$GENERIC_PATTERNS" > "$TMPDIR_HC/generic"
-        generic=$(count_lines "$TMPDIR_HC/generic")
-        if [ "$((got_all - generic + got_text))" -ne "$want" ]; then
-            warn "private pattern file $PRIVATE_FILE: $want pattern line(s) present but $((got_all - generic + got_text)) loaded — refusing to scan with an incomplete pattern set"
-            exit 2
-        fi
-
-        # A private file that yields no patterns at all leaves the private
-        # half of the scan not running. That is a legitimate state for a file
-        # of nothing but comments, and not one to discover afterwards from a
-        # clean report, so under --require-private it is a refusal like any
-        # other missing signal.
-        if [ "$want" -eq 0 ] && [ "$REQUIRE_PRIVATE" = 1 ]; then
-            warn "private pattern file $PRIVATE_FILE contains no patterns — refusing to scan with the private half switched off"
-            exit 2
-        fi
-    elif [ "$REQUIRE_PRIVATE" = 1 ]; then
-        warn "private pattern file $PRIVATE_FILE not found and --require-private is set"
+    : > "$meta_tmp"
+    if [ ! -f "$PRIVATE_FILE" ]; then
+        warn "pattern file $PRIVATE_FILE not found — refusing to scan without it"
         exit 2
-    else
-        warn "WARNING: private pattern file $PRIVATE_FILE not found — running generic checks only"
+    fi
+
+    # -a is load-bearing here, and its absence FAILS SILENTLY. A byte-range
+    # entry puts improperly-encoded bytes in the pattern file, which can make
+    # a tool classify the file ITSELF as binary and stop reproducing its
+    # lines: the entry is dropped on the way in, along with an unpredictable
+    # number of its neighbours, and nothing says so. A dropped entry is a
+    # check that stops running — the failure this script exists to prevent.
+    # -a forces the text path; the exported LC_ALL=C at the top of the file
+    # stops the locale reaching the same conclusion on its own grounds. The
+    # count guard below is the backstop for both, and for whatever the next
+    # tool decides to do.
+    # `|| true` would swallow the difference between "no lines matched"
+    # (grep exit 1, normal) and "could not read the file" (grep exit 2 —
+    # unreadable, a directory, a broken symlink). Swallowing the second is how
+    # an existing-but-unreadable pattern file degrades into a scan that looks
+    # for nothing and prints a clean tree: the check above is satisfied by the
+    # file EXISTING, and nothing downstream notices that it contributed
+    # nothing.
+    grep -a -vE '^[[:space:]]*(#|$)' "$PRIVATE_FILE" > "$TMPDIR_HC/private"
+    rc=$?
+    if [ "$rc" -gt 1 ]; then
+        warn "pattern file $PRIVATE_FILE could not be read (grep exit $rc) — refusing to scan without it"
+        exit 2
+    fi
+    sed -n 's/^text://p' "$TMPDIR_HC/private" | grep -a -v '^$' >> "$text_tmp" || true
+    sed -n 's/^meta://p' "$TMPDIR_HC/private" | grep -a -v '^$' >> "$meta_tmp" || true
+    grep -a -vE '^(text|meta):' "$TMPDIR_HC/private" | grep -a -v '^$' >> "$tmp" || true
+
+    # Every pattern line must land in exactly one of the three files. A count
+    # that does not add up means a pattern was dropped on the way in, and a
+    # dropped pattern is a check that silently stops running — the failure
+    # this whole script exists to prevent. Fail loudly rather than scan with
+    # a short list.
+    want=$(count_lines "$TMPDIR_HC/private")
+    got_all=$(count_lines "$tmp")
+    got_text=$(count_lines "$text_tmp")
+    got_meta=$(count_lines "$meta_tmp")
+    if [ "$((got_all + got_text + got_meta))" -ne "$want" ]; then
+        warn "pattern file $PRIVATE_FILE: $want pattern line(s) present but $((got_all + got_text + got_meta)) loaded — refusing to scan with an incomplete pattern set"
+        exit 2
+    fi
+
+    # A file of nothing but comments leaves nothing to scan for, and a scan
+    # for nothing reports clean. That is not a state to discover afterwards
+    # from a clean report.
+    if [ "$want" -eq 0 ]; then
+        warn "pattern file $PRIVATE_FILE contains no patterns — refusing to scan with nothing to scan for"
+        exit 2
     fi
 }
 
@@ -206,20 +189,36 @@ is_binary() {
     [ "$raw" -ne "$stripped" ]
 }
 
+# has_media_extension PATH reports whether PATH's extension names a format
+# that carries embedded metadata. Binary files have their metadata read
+# whatever they are called; this list is for the formats that can pass for
+# text — PDF, SVG, PostScript, XMP sidecars — which git and is_binary both
+# call text, and for any image that happens to hold no NUL in its first
+# 8000 bytes.
+has_media_extension() {
+    ext=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]')
+    case "$ext" in
+        *.png | *.apng | *.jpg | *.jpeg | *.gif | *.webp | *.bmp | *.tif | *.tiff | \
+        *.heic | *.heif | *.avif | *.ico | *.svg | *.psd | *.pdf | *.ps | *.eps | \
+        *.ai | *.xmp | *.mp4 | *.m4v | *.mov | *.webm | *.mkv | *.avi | *.mp3 | \
+        *.m4a | *.wav | *.ogg | *.flac)
+            return 0 ;;
+    esac
+    return 1
+}
+
 # scan_stream NAME reads content on stdin and reports hits under label NAME.
 # Returns 0 when clean.
 #
-# KNOWN LIMITATION — text-scoped patterns and binary metadata. The every-file
-# patterns below reach inside a binary: grep scans the whole byte stream, so a
-# phrase sitting in an image's embedded metadata block, or in bytes trailing
-# the image data, is found and reported. The text-scoped patterns do NOT reach
-# there, because they are skipped on binary content wholesale. Real text does
-# live in binary metadata — EXIF and XMP fields, container comment blocks,
-# appended trailers — and a text-scoped pattern will not match it there. The
-# scan is deliberately not extended to cover it: a byte-range pattern cannot
-# tell metadata apart from compressed payload, so covering the first would
-# re-admit the coincidental matches from the second, which is what the scope
-# prefix exists to avoid. Binary metadata therefore remains a hand check.
+# BINARY CONTENT. The every-file patterns reach inside a binary: grep scans
+# the whole byte stream, so a phrase sitting uncompressed in an image's
+# metadata block, or in bytes trailing the image data, is found here. The
+# text-scoped patterns are skipped on binary content wholesale: a byte-range
+# pattern cannot tell a metadata block from compressed payload, and payload
+# matches it by coincidence. Neither reaches text a format stores compressed
+# or encoded. Embedded metadata is therefore scan_metadata's job, not this
+# function's: exiftool hands it the fields decoded and without the payload,
+# so every pattern, text-scoped ones included, can be applied to them.
 scan_stream() {
     label="$1"
     content="$2"     # path to a file holding the content to scan
@@ -227,11 +226,15 @@ scan_stream() {
 
     # 2>&1: GNU grep reports a binary-file match ("binary file X matches")
     # on stderr with nothing on stdout, so a binary file with a hit would
-    # read as clean unless stderr is captured too.
-    hits=$(grep -inE -f "$PATTERN_FILE" "$content" 2>&1 | head -20) || true
-    if [ -n "$hits" ]; then
-        printf '✗ %s: identity/attribution pattern hits:\n%s\n' "$label" "$hits"
-        clean=1
+    # read as clean unless stderr is captured too. The -s test: a pattern
+    # file may hold no unprefixed entries, and grep implementations do not
+    # agree on what an empty -f file matches.
+    if [ -s "$PATTERN_FILE" ]; then
+        hits=$(grep -inE -f "$PATTERN_FILE" "$content" 2>&1 | head -20) || true
+        if [ -n "$hits" ]; then
+            printf '✗ %s: pattern hits:\n%s\n' "$label" "$hits"
+            clean=1
+        fi
     fi
 
     [ -s "$TEXT_PATTERN_FILE" ] || return $clean
@@ -250,9 +253,96 @@ scan_stream() {
     return $clean
 }
 
+# unscanned LABEL REASON records a file whose embedded metadata could not be
+# read. The run carries on — every other check still reports — and then
+# exits 2 instead of clean: see the end of this file.
+unscanned() {
+    printf '✗ %s: embedded metadata NOT scanned — %s\n' "$1" "$2"
+    printf '%s\n' "$1" >> "$TMPDIR_HC/unscanned"
+}
+
+# scan_metadata NAME FILE reads FILE's embedded metadata with exiftool and
+# checks the decoded fields against every loaded pattern, whatever its
+# scope, reporting hits under label NAME. Returns 0 when clean or
+# when the file could not be read — the second is recorded by unscanned and
+# fails the run at exit, so it is never mistaken for the first.
+scan_metadata() {
+    mlabel="$1"
+    mfile="$2"
+
+    if ! command -v "$EXIFTOOL" >/dev/null 2>&1; then
+        unscanned "$mlabel" "$EXIFTOOL not found"
+        return 0
+    fi
+
+    # -a -u: duplicate and unknown tags too. -G1 -s: print each field with
+    # the group it sits in, so a hit says where it was. -m: read past minor
+    # format errors instead of stopping at them. --System:all drops the
+    # file-system fields (name, directory, dates, permissions): they describe
+    # this scan's own copy of the file, including a temp directory path that
+    # is no part of the content. stderr is kept out of the scan for the same
+    # reason — exiftool's complaints quote the path.
+    "$EXIFTOOL" -a -u -G1 -s -m --System:all "$mfile" \
+        > "$TMPDIR_HC/meta" 2> "$TMPDIR_HC/meta-err" < /dev/null
+
+    # exiftool prints ExifToolVersion for every file it opens, including one
+    # it does not recognise ("Unknown file type" arrives as a field beside
+    # it; that file's bytes are still covered by scan_stream). Its absence
+    # means the file was never read. The exit status cannot tell these apart:
+    # an unrecognised format and a file exiftool failed to open both exit 1.
+    if ! grep -q 'ExifToolVersion' "$TMPDIR_HC/meta"; then
+        unscanned "$mlabel" "$EXIFTOOL did not read it: $(head -3 "$TMPDIR_HC/meta-err" | tr '\n' ' ')"
+        return 0
+    fi
+
+    mhits=$(grep -inE -f "$META_PATTERN_FILE" "$TMPDIR_HC/meta" 2>&1 | head -20) || true
+    if [ -n "$mhits" ]; then
+        printf '✗ %s: pattern hits in embedded metadata:\n%s\n' "$mlabel" "$mhits"
+        return 1
+    fi
+    return 0
+}
+
+# scan_commit_metadata COMMIT runs scan_metadata on each file COMMIT adds or
+# modifies that git calls binary (numstat prints - for both counts) or that
+# has_media_extension names, reading each one out of COMMIT's own tree. A
+# merge is compared against each of its parents (-m), so a file is read
+# whichever side brought it in. Returns 1 on a hit.
+scan_commit_metadata() {
+    mcommit="$1"
+    mbad=0
+    if ! git diff-tree -r -m --root --no-commit-id --no-renames --diff-filter=d \
+            --numstat -z "$mcommit" > "$TMPDIR_HC/numstat" 2>/dev/null; then
+        unscanned "commit $mcommit" "could not list the files it changes"
+        return 0
+    fi
+    # -z so a path is never C-quoted; the NULs become newlines only for read.
+    tr '\000' '\n' < "$TMPDIR_HC/numstat" > "$TMPDIR_HC/changed"
+    tab=$(printf '\t')
+    while IFS="$tab" read -r madded _mdeleted mpath; do
+        [ -n "$mpath" ] || continue
+        [ "$madded" = - ] || has_media_extension "$mpath" || continue
+        # exiftool guesses the format from the extension before the content,
+        # so the copy keeps it.
+        case "${mpath##*/}" in
+            *.*) mext=".$(printf '%s' "${mpath##*.}" | tr -cd 'A-Za-z0-9')" ;;
+            *)   mext="" ;;
+        esac
+        mblob="$TMPDIR_HC/blob$mext"
+        if ! git cat-file blob "$mcommit:$mpath" > "$mblob" 2>/dev/null < /dev/null; then
+            unscanned "commit $mcommit: $mpath" "could not read it from the commit"
+            continue
+        fi
+        scan_metadata "commit $mcommit: $mpath" "$mblob" || mbad=1
+        rm -f "$mblob"
+    done < "$TMPDIR_HC/changed"
+    return $mbad
+}
+
 # scan_commits scans each commit (metadata: author, committer, full message;
-# content: full patch) named on stdin, one hash per line. It usually runs on
-# the downstream side of a pipe — a subshell — so a hit is recorded through a
+# content: full patch; the embedded metadata of every binary or media file it
+# adds or changes) named on stdin, one hash per line. It usually runs on the
+# downstream side of a pipe — a subshell — so a hit is recorded through a
 # marker file in $TMPDIR_HC, not a variable, which the parent checks at exit.
 scan_commits() {
     total=0 bad=0
@@ -260,7 +350,10 @@ scan_commits() {
         [ -n "$c" ] || continue
         total=$((total + 1))
         git show --format='AUTHOR:%an <%ae>%nCOMMITTER:%cn <%ce>%nMSG:%B' "$c" > "$TMPDIR_HC/commit" 2>/dev/null || continue
-        if ! scan_stream "commit $c" "$TMPDIR_HC/commit"; then
+        hit=0
+        scan_stream "commit $c" "$TMPDIR_HC/commit" || hit=1
+        scan_commit_metadata "$c" || hit=1
+        if [ "$hit" = 1 ]; then
             bad=$((bad + 1))
             : > "$TMPDIR_HC/dirty"
         fi
@@ -274,8 +367,14 @@ scan_tree() {
         if ! scan_stream "file $f" "$f"; then
             : > "$TMPDIR_HC/dirty"
         fi
+        # ./ so a tracked name that starts with - is not read as an option.
+        if is_binary "$f" || has_media_extension "$f"; then
+            scan_metadata "file $f" "./$f" || : > "$TMPDIR_HC/dirty"
+        fi
     done
-    [ -e "$TMPDIR_HC/dirty" ] || printf 'working tree clean\n'
+    # Clean means every check ran. A file whose metadata went unread is not
+    # clean, whatever the other checks found.
+    [ -e "$TMPDIR_HC/dirty" ] || [ -e "$TMPDIR_HC/unscanned" ] || printf 'working tree clean\n'
 }
 
 install_hook() {
@@ -305,6 +404,9 @@ EOF
     if [ ! -f "$PRIVATE_FILE" ]; then
         warn "note: private pattern file $PRIVATE_FILE does not exist yet — create it (one regex per line) or the hook will fail closed"
     fi
+    if ! command -v "$EXIFTOOL" >/dev/null 2>&1; then
+        warn "note: $EXIFTOOL not found — the hook will refuse any push that adds or changes a binary, image or document file until it is installed"
+    fi
     exit 0
 }
 
@@ -319,14 +421,14 @@ for arg in "$@"; do
         --tree)            MODE=tree ;;
         --pre-push)        MODE=prepush ;;
         --install-hook)    MODE=install ;;
-        --require-private) REQUIRE_PRIVATE=1 ;;
+        --require-private) ;;   # see Usage: the pattern file is always required
         --range)           MODE=range ;;
         *)
             if [ "$MODE" = range ] && [ -z "$RANGE" ]; then RANGE="$arg"
             else warn "unknown argument: $arg"; exit 2; fi ;;
     esac
 done
-[ -n "$MODE" ] || { warn "usage: $0 --all | --range A..B | --tree | --pre-push | --install-hook [--require-private]"; exit 2; }
+[ -n "$MODE" ] || { warn "usage: $0 --all | --range A..B | --tree | --pre-push | --install-hook"; exit 2; }
 
 [ "$MODE" = install ] && install_hook
 
@@ -334,7 +436,14 @@ TMPDIR_HC=$(mktemp -d)
 trap 'rm -rf "$TMPDIR_HC"' EXIT
 PATTERN_FILE="$TMPDIR_HC/patterns"
 TEXT_PATTERN_FILE="$TMPDIR_HC/patterns-text"
-combined_pattern_file "$PATTERN_FILE" "$TEXT_PATTERN_FILE"
+META_ONLY_PATTERN_FILE="$TMPDIR_HC/patterns-meta-only"
+combined_pattern_file "$PATTERN_FILE" "$TEXT_PATTERN_FILE" "$META_ONLY_PATTERN_FILE"
+
+# Embedded metadata is decoded text, so it gets every pattern, whatever its
+# scope. None of the three files holds a blank line (see
+# combined_pattern_file), and together they hold at least one pattern.
+META_PATTERN_FILE="$TMPDIR_HC/patterns-meta"
+cat "$PATTERN_FILE" "$TEXT_PATTERN_FILE" "$META_ONLY_PATTERN_FILE" > "$META_PATTERN_FILE"
 
 case "$MODE" in
     all)
@@ -366,6 +475,13 @@ esac
 # Hits are recorded via a marker file because scan_commits typically runs in
 # a pipeline subshell where variable assignments cannot reach this shell.
 [ -e "$TMPDIR_HC/dirty" ] && STATUS=1
+
+# A file whose embedded metadata went unread outranks a hit: the scan is
+# incomplete, so nothing it printed can be read as the whole answer.
+if [ -e "$TMPDIR_HC/unscanned" ]; then
+    warn "$(count_lines "$TMPDIR_HC/unscanned") file(s) needed an embedded-metadata scan that did not run — refusing to report clean. Install exiftool (apt-get install libimage-exiftool-perl / brew install exiftool) or set CONSTLE_HYGIENE_EXIFTOOL."
+    STATUS=2
+fi
 
 if [ "$STATUS" != 0 ]; then
     printf '\nhygiene-check FAILED — do not push until the hits above are resolved\n' >&2
