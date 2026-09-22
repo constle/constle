@@ -316,7 +316,6 @@ func newFakeGitHub(t *testing.T, fx *fixtures) *fakeGitHub {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/constle/constle/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		g.record(r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		// The space after the colon is required: scripts/install parses this
 		// with sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'.
@@ -325,7 +324,6 @@ func newFakeGitHub(t *testing.T, fx *fixtures) *fakeGitHub {
 
 	prefix := "/constle/constle/releases/download/"
 	mux.HandleFunc(prefix, func(w http.ResponseWriter, r *http.Request) {
-		g.record(r.URL.Path)
 		rest := strings.TrimPrefix(r.URL.Path, prefix)
 		parts := strings.SplitN(rest, "/", 2)
 		if len(parts) != 2 || parts[0] != g.tag {
@@ -340,7 +338,16 @@ func newFakeGitHub(t *testing.T, fx *fixtures) *fakeGitHub {
 		_, _ = w.Write(body)
 	})
 
-	g.Server = httptest.NewServer(mux)
+	// Recorded here rather than inside each handler, so that hitLog() answers
+	// "was this server contacted at all" and not "was one of the two routes
+	// above contacted". A request for an unrouted path - "/" being the
+	// obvious one - reaches this server, gets a 404 from the mux, and used to
+	// leave no trace, which would let a no-contact assertion pass against an
+	// installer that had in fact reached out.
+	g.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.record(r.URL.Path)
+		mux.ServeHTTP(w, r)
+	}))
 	t.Cleanup(g.Close)
 	return g
 }
@@ -1434,6 +1441,57 @@ func TestNonHTTPSBaseURLIsRefused(t *testing.T) {
 		"ftp://evil.example",
 		// The near-miss a naive "starts with http://127.0.0.1" check accepts.
 		"http://127.0.0.1.evil.example:80",
+
+		// CATCHES: comparing a prefix of the URL rather than its authority.
+		// curl's host in each of these is evil.example — the loopback
+		// spelling is only the userinfo — so a prefix test reads them as
+		// local and then fetches the archive, and the checksums.txt that
+		// agrees with it, in cleartext from an arbitrary host. All three
+		// loopback spellings were reachable this way, not just the IPv4 one,
+		// so all three are listed rather than one standing in for the rest.
+		"http://127.0.0.1:80@evil.example/x",
+		"http://localhost:1@evil.example/x",
+		"http://[::1]:1@evil.example/x",
+		// The same trick with no port digits at all, which a repair that
+		// checks "digits after the colon" but forgets the empty case still
+		// accepts.
+		"http://127.0.0.1:@evil.example/x",
+		// Not a downgrade — this one stays on TLS — but the same address
+		// confusion, and refused for the same reason under both schemes.
+		"https://github.com@evil.example",
+
+		// CATCHES: the two installers disagreeing about which SPELLINGS of a
+		// URL their rule covers. PowerShell's match operators are
+		// case-insensitive by default and its \d matches Unicode decimal
+		// digits, so each of these was accepted there and refused by
+		// scripts/install. None of them is dangerous by itself; a shared
+		// test that silently exercises two different rules is.
+		"HTTP://localhost/",
+		"http://LOCALHOST/",
+		"HTTPS://example.com/",
+		"http://localhost:１２３/",
+
+		// CATCHES: a control character surviving into the authority. sh reads
+		// the authority through a command substitution, which strips trailing
+		// newlines, so this reduced to a clean "localhost" and was admitted;
+		// .NET regex treats the newline as a line boundary and refused it.
+		// Same string, two answers, and the shared test below only ever saw
+		// one of them.
+		"http://localhost\n\n/path",
+		"http://127.0.0.1\t:8080/",
+		// A trailing newline is the case the sh side is structurally worst
+		// at: command substitution eats it, so the byte that should have
+		// caused the refusal disappears on the way to being checked.
+		"http://localhost/x\n",
+		// CATCHES: deciding "is this a control character" with a POSIX
+		// character class instead of an explicit range. U+2028 is matched by
+		// [[:cntrl:]] under bash and missed under dash in the same locale,
+		// and Ubuntu's /bin/sh is dash while macOS's is bash — so the class
+		// makes one installer behave two ways depending on the runner.
+		"http://localhost/\u2028",
+		// A space is not a control character but has no business in a URL
+		// either, and the two installers have to agree about it.
+		"http://loc alhost/",
 	}
 
 	for _, runner := range []struct {
@@ -1464,11 +1522,52 @@ func TestNonHTTPSBaseURLIsRefused(t *testing.T) {
 	}
 }
 
+// CATCHES: a refusal that is printed but not obeyed. TestNonHTTPSBaseURLIsRefused
+// asserts the installer says no; it cannot assert that the host hiding behind
+// the "@" went untouched, because its hit log belongs to an unrelated server.
+// An installer that printed the refusal and then fetched anyway would pass
+// there and fail here.
+//
+// Both halves of the URL are 127.0.0.1 because a test may only bind loopback.
+// What differs is the port: the userinfo names one nothing listens on, and the
+// real authority is a complete, self-consistent fake release that would install
+// if it were ever reached. Against the prefix test this replaces, it was.
+func TestUserinfoHostIsNeverContacted(t *testing.T) {
+	t.Parallel()
+
+	for _, runner := range []struct {
+		name string
+		run  func(*testing.T, *fakeGitHub, *runOpts) result
+	}{{"sh", runSh}, {"ps1", runPs1}} {
+		t.Run(runner.name, func(t *testing.T) {
+			t.Parallel()
+
+			attacker := newFakeGitHub(t, buildFixtures(t))
+			disguised := "http://127.0.0.1:1@" + strings.TrimPrefix(attacker.URL, "http://")
+
+			res := runner.run(t, attacker, &runOpts{
+				env: map[string]string{
+					envBaseURL: disguised,
+					envAPIURL:  disguised,
+					envVersion: testTag,
+				},
+			})
+
+			assertRefused(t, res, "loopback")
+			assertNotExtracted(t, res)
+			if hits := attacker.hitLog(); len(hits) != 0 {
+				t.Errorf("the host behind the '@' was contacted: %v", hits)
+			}
+		})
+	}
+}
+
 // CATCHES: the --proto / --proto-redir pinning being dropped or mis-quoted in
 // scripts/install. Every other case in this file uses a loopback http base,
-// where fetch() deliberately omits those flags, so without this case they are
-// exercised by nothing and a quoting typo would break every real install with
-// the suite still green.
+// which takes the other branch of fetch() — a branch that pins a different
+// protocol and follows no redirects at all — so without this case the https
+// flags are exercised by nothing, and a quoting typo would break every real
+// install with the suite still green.
 func TestHTTPSDownloadRefusesARedirectToPlainHTTP(t *testing.T) {
 	t.Parallel()
 	skipIfWindows(t)
