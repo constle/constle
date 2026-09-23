@@ -88,11 +88,23 @@ func (b *upstreamBodies) last() string {
 // [send_email, list_inbox], gating send_email.
 func newHarness(t *testing.T, approver Approver, onTimeout string) *gateHarness {
 	t.Helper()
+	return newHarnessWithUpstreamHandler(t, approver, onTimeout, nil)
+}
+
+// newHarnessWithUpstreamHandler is newHarness with a custom upstream behavior.
+// The counting wrapper and custom handler are both installed before the
+// httptest server starts; tests must not replace Server.Config.Handler later.
+func newHarnessWithUpstreamHandler(t *testing.T, approver Approver, onTimeout string, handler http.Handler) *gateHarness {
+	t.Helper()
 
 	calls := &atomic.Int64{}
 	bodies := &upstreamBodies{}
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
+		if handler != nil {
+			handler.ServeHTTP(w, r)
+			return
+		}
 		bodies.record(r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"sent"}]}}`)
