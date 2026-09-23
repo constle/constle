@@ -193,7 +193,9 @@ curl -fsSL https://constle.dev/install | sh        # Linux, macOS
 iwr -useb https://constle.dev/install.ps1 | iex    # Windows PowerShell
 ```
 
-The installer fetches `checksums.txt` for the release it is installing and refuses to unpack an archive whose SHA-256 does not match. When `cosign` is on your PATH it checks the release workflow's signature over `checksums.txt` first, pinned to the identity in [Verifying a release](#verifying-a-release), and aborts if that fails; without `cosign` it says so on the terminal and enforces the checksum alone. Downloading an archive by hand from the [releases page](https://github.com/constle/constle/releases) skips all of this — see [Verifying a release](#verifying-a-release) before you trust one.
+Both installers need [`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/) on your PATH. They verify the release workflow's signature over `checksums.txt`, pinned to the identity in [Verifying a release](#verifying-a-release), and only then check that the archive's SHA-256 matches the line `checksums.txt` has for it. If either check cannot be made, nothing is installed.
+
+That is deliberate: `checksums.txt` is served from the same release as the archive, so on its own it shows your download was not corrupted — not that it came from this project. `CONSTLE_ALLOW_UNSIGNED=1` installs anyway when there was no signature to check, says so in yellow, and still enforces the checksum; a signature that is checked and fails is fatal with no way around it. Downloading an archive by hand from the [releases page](https://github.com/constle/constle/releases) skips all of this — see [Verifying a release](#verifying-a-release) before you trust one.
 
 **2. Check the example manifest without running anything:**
 
@@ -488,7 +490,7 @@ sha256sum --check --ignore-missing checksums.txt
 
 Provenance attestation: `gh attestation verify constle_<version>_linux_amd64.tar.gz --repo constle/constle`.
 
-The one-line installer at `constle.dev/install` does the checksum half of this on every run, and the `cosign` half too when `cosign` is on your PATH; it says so on the terminal when it cannot. `CONSTLE_REQUIRE_SIGNATURE=1` makes the signature mandatory — no release publishes one yet, so today that setting refuses every install.
+The one-line installers at `constle.dev/install` run both of these checks on every install and refuse when either cannot be made, which is why `cosign` has to be on your PATH. `CONSTLE_ALLOW_UNSIGNED=1` is the one way past a signature that could not be checked at all — it never weakens the checksum, and never forgives a signature that was checked and failed. The release workflow runs the same two commands against what it just published, so a release that these would reject never gets a green build.
 <!-- --8<-- [end:verify] -->
 
 ---

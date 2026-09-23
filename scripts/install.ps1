@@ -15,7 +15,7 @@
 #   4. Work out the download URL
 #   5. Download the .zip archive to a temporary directory
 #   6. Verify it against the release's checksums.txt, and verify cosign's
-#      signature over that file when cosign is available
+#      signature over that file; both have to pass
 #   7. Extract the binary
 #   8. Install to %LOCALAPPDATA%\Programs\constle (no admin needed)
 #   9. Add the install directory to the user's PATH if it's not already there
@@ -23,10 +23,16 @@
 # Environment variables:
 #   CONSTLE_INSTALL_DIR         where to put the binary
 #                               (default %LOCALAPPDATA%\Programs\constle)
-#   CONSTLE_REQUIRE_SIGNATURE   set to 1 to refuse to install unless the cosign
-#                               signature over checksums.txt was verified
+#   CONSTLE_ALLOW_UNSIGNED      set to 1 to install a release whose signature
+#                               could not be checked at all. It never weakens
+#                               the checksum, and never forgives a signature
+#                               that was checked and failed.
 #   CONSTLE_INSTALL_BASE_URL    release download host (default https://github.com)
 #   CONSTLE_INSTALL_API_URL     release metadata host (default https://api.github.com)
+#
+# CONSTLE_REQUIRE_SIGNATURE is still recognised, but requiring the signature is
+# now the default, so setting it changes nothing - and setting it to 0 does not
+# bring the old lenient behaviour back.
 #
 # The last two exist so that this script can be pointed at a mirror, and so
 # that its regression test can serve a fake release from a local HTTP server.
@@ -65,16 +71,35 @@ $BinaryName = "constle.exe"
 $BaseUrl    = if ($env:CONSTLE_INSTALL_BASE_URL) { $env:CONSTLE_INSTALL_BASE_URL } else { "https://github.com" }
 $ApiBaseUrl = if ($env:CONSTLE_INSTALL_API_URL)  { $env:CONSTLE_INSTALL_API_URL }  else { "https://api.github.com" }
 
-# Whether a missing cosign signature is fatal. Unset (the default) means a
-# missing signature downgrades to a printed warning; a signature that is
-# present and FAILS to verify is always fatal, whatever this is set to.
-# Anything that is not empty, 0, false or no counts as set. Someone who writes
-# CONSTLE_REQUIRE_SIGNATURE: true in a CI file is asking for the strict
-# behaviour, and handing them the lenient one - with output identical to an
-# unconfigured run - is the worst of the available answers. ('true' -eq '1' is
+# Whether a signature that could not be checked AT ALL is survivable. The
+# default is no, and that is the whole point of this script.
+#
+# checksums.txt travels with the archive: same release, same host, same
+# connection. Against anyone who can write to that release - a stolen token, a
+# compromised workflow - the checksum agrees with the archive because the same
+# hand wrote both. The signature is the only link here that such an attacker
+# cannot forge, so an install that skipped it got a corruption check and no
+# security check at all.
+#
+# CONSTLE_ALLOW_UNSIGNED=1 says "I know, do it anyway", and reaches exactly the
+# two cases where there was nothing to check. A signature that IS present and
+# fails is fatal regardless, and the checksum is never optional.
+#
+# Anything that is not empty, 0, false or no counts as set. ('true' -eq '1' is
 # False in PowerShell, so the obvious spelling of this test is a silent no-op.)
-$RequireSignature = [bool]$env:CONSTLE_REQUIRE_SIGNATURE -and
-                    ($env:CONSTLE_REQUIRE_SIGNATURE.ToLowerInvariant() -notin @('0', 'false', 'no'))
+$AllowUnsigned = [bool]$env:CONSTLE_ALLOW_UNSIGNED -and
+                 ($env:CONSTLE_ALLOW_UNSIGNED.ToLowerInvariant() -notin @('0', 'false', 'no'))
+
+# CONSTLE_REQUIRE_SIGNATURE was the opt-IN to this behaviour, back when the
+# default was lenient. It stays recognised so an existing CI file is not met
+# with silence, but it can only be redundant now - and the one spelling that
+# would weaken anything, setting it to 0, is reported and ignored rather than
+# honoured. The report is deferred until Write-Warn exists, further down.
+$LegacyRequire = if ($env:CONSTLE_REQUIRE_SIGNATURE) {
+    $env:CONSTLE_REQUIRE_SIGNATURE.ToLowerInvariant()
+} else {
+    ''
+}
 
 # The identity the release signature must carry. Keyless signing has no fixed
 # public key - anyone can get a valid certificate from Fulcio and sign
@@ -106,6 +131,11 @@ if ($env:CONSTLE_INSTALL_DIR) {
 # ---------------------------------------------------------------------------
 function Write-Step { param($msg) Write-Host "  " -NoNewline; Write-Host "-> " -NoNewline -ForegroundColor Blue;  Write-Host $msg }
 function Write-Ok   { param($msg) Write-Host "  " -NoNewline; Write-Host "[ok] " -NoNewline -ForegroundColor Green; Write-Host $msg }
+# Yellow, and on the error stream. A weaker install is not a progress update;
+# giving it the same blue arrow as "downloading..." is how it went unread for a
+# release. Write-Warning is deliberately not used: it prefixes "WARNING: " and
+# obeys $WarningPreference, which a caller's profile can set to silent.
+function Write-Warn { param($msg) Write-Host "  " -NoNewline; Write-Host "! " -NoNewline -ForegroundColor Yellow; Write-Host $msg }
 function Write-Fail { param($msg) $global:ProgressPreference = $PrevProgressPreference; Write-Host "`nerror: $msg`n" -ForegroundColor Red; exit 1 }
 
 Write-Host ""
@@ -126,15 +156,73 @@ Write-Host ""
 # exist before anything can call it.
 # ---------------------------------------------------------------------------
 foreach ($Pair in @(@('CONSTLE_INSTALL_BASE_URL', $BaseUrl), @('CONSTLE_INSTALL_API_URL', $ApiBaseUrl))) {
-    if ($Pair[1] -notmatch '^https://' -and
-        $Pair[1] -notmatch '^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(/|$)') {
+    # Three gates, in the same order and with the same meaning as the ones in
+    # scripts/install: the scheme, then userinfo, then - for http only - the
+    # authority. The two installers answer to one shared regression test, so a
+    # rule spelled differently here is a rule that only ever gets tested once.
+    #
+    # Every comparison is case-SENSITIVE (-cmatch / -cnotmatch). PowerShell's
+    # default operators are case-insensitive, so the plain forms accept
+    # "HTTP://localhost/" and "http://LOCALHOST/" where the sh glob refuses
+    # them. Neither spelling is dangerous on its own; the divergence is.
+    # Anything outside printable ASCII first. Neither installer can treat such
+    # a byte sanely: the sh side reads its authority through a command
+    # substitution, which strips trailing newlines, and .NET regex treats a
+    # newline as a line boundary, so the same string means different things on
+    # each side. A URL cannot legitimately contain one, so both refuse it.
+    #
+    # The range is the same explicit \x21-\x7E that scripts/install feeds to
+    # tr - spelled out in both rather than left to a character class, because
+    # a class like [[:cntrl:]] or \p{C} is resolved by the shell, the runtime
+    # and the locale, and the two installers then disagree about the same
+    # string. Space is excluded deliberately: a URL has no use for one.
+    if ($Pair[1] -match '[^\x21-\x7E]') {
+        Write-Fail "$($Pair[0]) contains spaces, control characters or non-ASCII bytes.`nIt must be an https:// URL (or a loopback http:// address). Nothing has been installed."
+    }
+
+    if ($Pair[1] -cnotmatch '^https?://') {
+        Write-Fail "$($Pair[0]) must be an https:// URL (or a loopback http:// address).`nRefusing to download over an unauthenticated transport. Nothing has been installed."
+    }
+
+    # The authority is what follows "://" up to the first "/", "?" or "#".
+    # Userinfo is refused under both schemes, because everything before an "@"
+    # is a username: the host a reader sees in the URL is then not the host
+    # this script connects to. Over https that is not a downgrade, but it is
+    # the same address confusion, and a release mirror has no reason to carry
+    # credentials in its URL.
+    $Authority = (($Pair[1] -replace '^[A-Za-z][A-Za-z0-9+.\-]*://', '') -replace '[/?#].*$', '')
+    if ($Authority -like '*@*') {
+        $RealHost  = $Authority -replace '^.*@', ''
+        $ClaimedAs = $Authority -replace '@.*$', ''
+        Write-Fail "$($Pair[0]) fetches from $RealHost, not $ClaimedAs - everything before the '@' is a username, not an address.`nIt must be an https:// URL (or a loopback http:// address). Nothing has been installed."
+    }
+
+    # Plain HTTP reaches this machine and nowhere else. The test is against the
+    # AUTHORITY and is anchored at both ends, so a loopback spelling that is
+    # merely the beginning of a longer host does not satisfy it.
+    #
+    # [0-9] rather than \d: .NET's \d matches every Unicode decimal digit, so a
+    # port written in full-width digits passed this gate and was caught later,
+    # inside System.Uri. A rule that holds at the boundary is worth more than
+    # one that happens to be caught downstream.
+    if ($Pair[1] -cmatch '^http://' -and
+        $Authority -cnotmatch '^(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$') {
         Write-Fail "$($Pair[0]) must be an https:// URL (or a loopback http:// address).`nRefusing to download over an unauthenticated transport. Nothing has been installed."
     }
 }
 
 # An overridden install must never read like a github.com install.
 if ($BaseUrl -ne "https://github.com" -or $ApiBaseUrl -ne "https://api.github.com") {
-    Write-Host "  ! release artifacts will be fetched from $BaseUrl, not github.com"
+    Write-Warn "release artifacts will be fetched from $BaseUrl, not github.com"
+}
+
+# The deferred report for CONSTLE_REQUIRE_SIGNATURE; see the note above.
+if ($LegacyRequire -in @('0', 'false', 'no')) {
+    Write-Warn "CONSTLE_REQUIRE_SIGNATURE=$env:CONSTLE_REQUIRE_SIGNATURE is ignored."
+    Write-Warn "    A verified signature is required by default and this cannot switch it off."
+    Write-Warn "    CONSTLE_ALLOW_UNSIGNED=1 is the only way to install without one."
+} elseif ($LegacyRequire) {
+    Write-Step "CONSTLE_REQUIRE_SIGNATURE is redundant; a verified signature is the default"
 }
 
 # ---------------------------------------------------------------------------
@@ -265,12 +353,12 @@ try {
 #
 # What happens when a link is missing rather than broken:
 #
-#   cosign not installed       -> say so, continue with the checksum only
-#   release has no signature   -> say so, continue with the checksum only
+#   cosign not installed       -> stop, unless CONSTLE_ALLOW_UNSIGNED is set
+#   release has no signature   -> stop, unless CONSTLE_ALLOW_UNSIGNED is set
 #   signature present, FAILS   -> stop, always, with no way to override
 #
-# The first two are the reason CONSTLE_REQUIRE_SIGNATURE exists: set it to 1
-# and they become failures too. The third is never negotiable, because an
+# The first two are the only cases CONSTLE_ALLOW_UNSIGNED reaches, and it is
+# the only thing that reaches them. The third is never negotiable, because an
 # override there would turn every blocked network into a silent downgrade.
 # ---------------------------------------------------------------------------
 Write-Step "downloading checksums.txt..."
@@ -301,8 +389,15 @@ $SignatureState = $null
 # return more than one match.
 $Cosign = Get-Command cosign -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 
+#
+# $SignatureHint travels with $SignatureState because the two reasons need
+# different advice: installing cosign fixes the first and does nothing at all
+# for the second. A refusal that offers the wrong remedy gets worked around.
+$SignatureHint = $null
+
 if (-not $Cosign) {
     $SignatureState = "cosign is not installed"
+    $SignatureHint  = "Install cosign, then run this again:`n    https://docs.sigstore.dev/cosign/system_config/installation/"
 } else {
     $HaveSignature = $true
     try {
@@ -311,6 +406,7 @@ if (-not $Cosign) {
     } catch {
         $HaveSignature = $false
         $SignatureState = "release $Version was published without a signature"
+        $SignatureHint  = "There is no signature on this release to check, so no local tool will help.`n    https://github.com/$Repo/releases/tag/$Version"
     }
 
     if ($HaveSignature) {
@@ -361,15 +457,18 @@ if (-not $Cosign) {
     }
 }
 
-# A signature that could not be checked is a weaker install, not a safe one,
-# so it is stated on the terminal rather than passed over in silence - and
-# CONSTLE_REQUIRE_SIGNATURE=1 turns it into a refusal.
+# A signature that could not be checked is a weaker install, not a safe one.
+# Everything below this line is then a corruption check and nothing more, so by
+# default this is where the install stops. It stops before the archive is
+# unpacked, which is the only ordering that means anything.
 if ($SignatureState) {
-    if ($RequireSignature) {
+    if (-not $AllowUnsigned) {
         Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Fail "CONSTLE_REQUIRE_SIGNATURE is set, but the signature could not be checked:`n  $SignatureState.`nNothing has been installed."
+        Write-Fail "cannot verify that release $Version came from $Repo`: $SignatureState.`n`nchecksums.txt is served from the same release as the archive, so on its own it`nshows the download was not corrupted - not that it came from this project.`nNothing has been installed.`n`n  $SignatureHint`n`n  Or, accepting an install this script cannot vouch for:`n    `$env:CONSTLE_ALLOW_UNSIGNED = '1'"
     }
-    Write-Step "signature not checked ($SignatureState); verifying the checksum only"
+    Write-Warn "CONSTLE_ALLOW_UNSIGNED is set, and $SignatureState."
+    Write-Warn "    Continuing with the checksum alone. That shows this download is not"
+    Write-Warn "    corrupted; it does NOT show it came from $Repo."
 }
 
 # ---- Link 2: is this archive the one checksums.txt names? ----------------
@@ -522,11 +621,11 @@ Remove-Item -LiteralPath $TmpDir -Recurse -Force -ErrorAction SilentlyContinue
 # Done!
 # ---------------------------------------------------------------------------
 Write-Host ""
-# Say which guarantee was actually obtained. For every release published so far
-# and for anyone without cosign, this reduces to a corruption check, and the
-# last line before the binary is on PATH is the wrong place to be vague.
+# Say which guarantee was actually obtained. With CONSTLE_ALLOW_UNSIGNED this
+# reduces to a corruption check, and the last line before the binary is on PATH
+# is the wrong place to be vague about that.
 if ($SignatureState) {
-    Write-Ok "constle $Version installed to $InstallDir (checksum verified; signature NOT checked)"
+    Write-Ok "constle $Version installed to $InstallDir (checksum verified; signature NOT checked - CONSTLE_ALLOW_UNSIGNED)"
 } else {
     Write-Ok "constle $Version installed to $InstallDir (checksum and signature verified)"
 }
