@@ -40,12 +40,7 @@ func TestUpgradeCannotCarryPostHandshakeBytes(t *testing.T) {
 	}
 	outcome := make(chan upstreamOutcome, 1)
 
-	h := newHarness(t, &fixedApprover{decision: DecisionApproved}, "abort")
-	h.upstream.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// The harness's own handler counts calls; this replacement must too,
-		// or the "never called" assertion below could not fail.
-		h.calls.Add(1)
-
+	h := newHarnessWithUpstreamHandler(t, &fixedApprover{decision: DecisionApproved}, "abort", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, rw, err := http.NewResponseController(w).Hijack()
 		if err != nil {
 			outcome <- upstreamOutcome{err: fmt.Errorf("upstream hijack: %w", err)}
@@ -73,7 +68,7 @@ func TestUpgradeCannotCarryPostHandshakeBytes(t *testing.T) {
 			return
 		}
 		outcome <- upstreamOutcome{payload: string(got)}
-	})
+	}))
 
 	req, err := http.NewRequest(http.MethodGet, h.baseURL, nil)
 	if err != nil {
@@ -113,16 +108,24 @@ func TestUpgradeCannotCarryPostHandshakeBytes(t *testing.T) {
 			t.Errorf("upstream observed %+v despite the 400 refusal", o)
 		default:
 		}
-		blocked := eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)
-		if len(blocked) != 1 {
-			t.Fatalf("%d mcp_request_blocked events, want 1", len(blocked))
+		entries := auditEvents(t, h)
+		if len(entries) != 1 {
+			t.Fatalf("%d audit events, want exactly 1", len(entries))
 		}
-		// The literal rather than reasonProtocolUpgrade, on purpose: that
-		// constant arrived with the fix in 383664f, and this file has to
-		// compile on 383664f^ to show the escape there. The string is the
-		// one gate.go pins, and a change to it fails here as it should.
-		if reason, _ := blocked[0].Details["reason"].(string); reason != "the MCP transport defines no protocol upgrade" {
-			t.Errorf("reason=%q, want the protocol-upgrade refusal", reason)
+		blocked := entries[0]
+		if blocked.Event != audit.EventMCPRequestBlocked {
+			t.Fatalf("audit event=%q, want %q", blocked.Event, audit.EventMCPRequestBlocked)
+		}
+		// Keep this hard-coded string deliberately instead of referring to
+		// reasonProtocolUpgrade. This test is also overlaid on 383664f^ to prove
+		// the regression, and that revision predates the constant, so referring
+		// to it would not compile there. Because this expected value is independent
+		// of the production constant, changing the production reason makes the
+		// current test fail; update the literal only for an intentional audit
+		// contract change.
+		const wantReason = "the MCP transport defines no protocol upgrade"
+		if reason, _ := blocked.Details["reason"].(string); reason != wantReason {
+			t.Errorf("reason=%q, want %q", reason, wantReason)
 		}
 		return
 	case http.StatusSwitchingProtocols:
