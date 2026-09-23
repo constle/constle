@@ -2208,30 +2208,85 @@ func TestUnlistedCharactersNeverReachTheUpstream(t *testing.T) {
 	}
 }
 
-// TestPathAllowlistIsExactlyUnreserved pins the set itself, one byte at a
-// time, so that widening it is a decision made here rather than a side effect
-// of some other change. Each byte sits inside a segment that is not a dot
-// segment; the three bytes a named rule already refuses keep that rule's
-// reason, and every other byte outside the set gets the allowlist's.
-func TestPathAllowlistIsExactlyUnreserved(t *testing.T) {
+// TestPathAllowlistsAreExact pins both sets, one byte at a time, so that
+// widening either is a decision made here rather than a side effect of some
+// other change. The sub-path's set is the unreserved set and nothing more; the
+// declared endpoint's adds '@' and ':' and nothing more. Each byte sits inside
+// a segment that is not a dot segment; the three bytes a named rule already
+// refuses keep that rule's reason, and every other byte outside the set gets
+// the allowlist's.
+func TestPathAllowlistsAreExact(t *testing.T) {
 	const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
 	named := map[byte]string{'%': reasonPercentEncoding, ';': reasonPathParameter, '\\': reasonBackslash}
 
-	for i := 0; i < 256; i++ {
-		b := byte(i)
-		if b == '/' {
-			continue // the separator between segments, never inside one
-		}
-		want := ""
-		if strings.IndexByte(unreserved, b) < 0 {
-			want = reasonUnlistedCharacter
-			if reason, ok := named[b]; ok {
-				want = reason
+	for _, tc := range []struct {
+		name     string
+		check    func(string) string
+		allowed  string
+		unlisted string
+	}{
+		{"sub-path", ambiguousPathReason, unreserved, reasonUnlistedCharacter},
+		{"endpoint", ambiguousEndpointReason, unreserved + "@:", reasonUnlistedEndpointCharacter},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < 256; i++ {
+				b := byte(i)
+				if b == '/' {
+					continue // the separator between segments, never inside one
+				}
+				want := ""
+				if strings.IndexByte(tc.allowed, b) < 0 {
+					want = tc.unlisted
+					if reason, ok := named[b]; ok {
+						want = reason
+					}
+				}
+				if got := tc.check("x" + string([]byte{b}) + "x"); got != want {
+					t.Errorf("byte %#02x: reason=%q, want %q", b, got, want)
+				}
 			}
+		})
+	}
+}
+
+// TestEndpointBytesDoNotWidenTheSubPath: the declared endpoint may hold '@'
+// and ':' because the operator wrote it; the sub-path may not, because the
+// sender writes it. A gate built on "/@org/name/mcp" serves that endpoint and
+// what lies under it, and still refuses a sub-path carrying either byte, in
+// either spelling — the check that admitted them in the endpoint must not be
+// the one that judges the request.
+func TestEndpointBytesDoNotWidenTheSubPath(t *testing.T) {
+	const endpoint = "/@org/name:v2/mcp"
+
+	t.Run("endpoint is served", func(t *testing.T) {
+		h, probe := newPathHarness(t, endpoint)
+		status, body, _ := doRequest(t, http.MethodGet, h.baseURL+"/messages", "")
+		if status != http.StatusOK {
+			t.Fatalf("status=%d body=%q, want 200", status, body)
 		}
-		if got := ambiguousPathReason("x" + string([]byte{b}) + "x"); got != want {
-			t.Errorf("byte %#02x: reason=%q, want %q", b, got, want)
+		if got := probe.all(); len(got) != 1 || got[0] != endpoint+"/messages" {
+			t.Errorf("upstream saw %q, want [%s/messages]", got, endpoint)
 		}
+	})
+
+	for _, suffix := range []string{"/@evil", "/%40evil", "/a:b", "/a%3Ab", "/messages/@org"} {
+		t.Run(suffix, func(t *testing.T) {
+			h, _ := newPathHarness(t, endpoint)
+			status, body, _ := doRequest(t, http.MethodGet, h.baseURL+suffix, "")
+			if status != http.StatusBadRequest {
+				t.Errorf("GET %s: status=%d body=%q, want 400", suffix, status, body)
+			}
+			if got := h.calls.Load(); got != 0 {
+				t.Errorf("GET %s reached the upstream %d times, want 0", suffix, got)
+			}
+			blocked := eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)
+			if len(blocked) != 1 {
+				t.Fatalf("GET %s: %d mcp_request_blocked events, want 1", suffix, len(blocked))
+			}
+			if reason, _ := blocked[0].Details["reason"].(string); reason != reasonUnlistedCharacter {
+				t.Errorf("GET %s: reason=%q, want %q", suffix, reason, reasonUnlistedCharacter)
+			}
+		})
 	}
 }
 
@@ -2247,11 +2302,14 @@ func TestLegitimateSubPathStillReachesTheUpstream(t *testing.T) {
 		{"/v1/mcp", "/", "/v1/mcp"},
 		{"/v1/mcp", "/session/", "/v1/mcp/session/"},
 		{"", "/messages", "/messages"},
-		// Ordinary percent-encoding decodes to a name with no structure in
-		// it, and is forwarded. Only a percent sign that survives the decode
-		// — the mark of an upstream asked to decode twice — is refused.
+		// Percent-encoding of an unreserved character decodes to that
+		// character and is forwarded bare, which RFC 3986 §6.2.2.2 makes the
+		// same URI. Encoding anything else still decodes to a byte outside
+		// the allowlist — "a%20b" to a space — and is refused with it.
 		{"/v1/mcp", "/report%2Ejson", "/v1/mcp/report.json"},
-		{"/v1/mcp", "/a%20b", "/v1/mcp/a%20b"},
+		{"/v1/mcp", "/%41-%7e", "/v1/mcp/A-~"},
+		// The whole allowlist, in one segment.
+		{"/v1/mcp", "/AZaz09-._~", "/v1/mcp/AZaz09-._~"},
 	} {
 		t.Run(tc.endpoint+"|"+tc.suffix, func(t *testing.T) {
 			h, probe := newPathHarness(t, tc.endpoint)
@@ -2567,6 +2625,13 @@ func TestDeclaredEndpointCannotBeAmbiguous(t *testing.T) {
 		// an origin that applies NFKC serves both of these as "/".
 		"https://origin.example/safe/%EF%BC%8E%EF%BC%8E",
 		"https://origin.example/safe/%E2%80%A5",
+		// The endpoint's set is wider than the sub-path's by '@' and ':'
+		// only: every other byte outside the unreserved set is still refused.
+		"https://origin.example/a%20b/mcp",
+		"https://origin.example/mcp+x",
+		"https://origin.example/v1!/mcp",
+		// '@' is admitted, but never where "//" would put it in an authority.
+		"https://origin.example//@evil.example/mcp",
 	} {
 		m := &manifest.AgentManifest{
 			Identity: manifest.Identity{Name: "endpoint-agent"},
@@ -2584,6 +2649,9 @@ func TestDeclaredEndpointCannotBeAmbiguous(t *testing.T) {
 		"https://origin.example/mcp",
 		"https://origin.example/v1/mcp",
 		"https://origin.example/v1/mcp/",
+		// Hosted MCP servers put '@' and ':' in the paths they serve.
+		"https://server.example/@org/name/mcp",
+		"https://origin.example/v1/servers/name:v2/mcp",
 	} {
 		m := &manifest.AgentManifest{
 			Identity: manifest.Identity{Name: "endpoint-agent"},

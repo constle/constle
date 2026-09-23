@@ -1,6 +1,6 @@
 # Constle AgentManifest Specification
 
-**Spec version:** 0.4.0
+**Spec version:** 0.5.0
 **apiVersion:** `constle.dev/v1alpha1`
 **Status:** Draft. Field names and semantics may change before v1.0.
 **Last updated:** 2026-09-21
@@ -1026,13 +1026,28 @@ segment, a percent sign that survives the first decode (the mark of an origin
 being asked to decode twice, as in `%252e%252e%252f`), a path parameter
 (`..;/`, which servers that strip `;...` before normalising read as `..`), and
 a backslash (a separator to an origin on a platform that treats it as one).
-Ordinary encoding is untouched: `report%2Ejson` decodes to `report.json` and
-is forwarded.
+
+Those are the readings that are known, and the list cannot be complete: NFKC
+normalisation folds `．` into `.` and `‥` into `..`, a Windows best-fit code
+page maps `∕` to `/` and `¥` to `\`, and a server that re-parses the decoded
+path ends it at `?` or `#`. So every byte of the decoded sub-path must also be
+an RFC 3986 unreserved character — `A`–`Z`, `a`–`z`, `0`–`9`, `-`, `.`, `_`,
+`~` — and anything else, including any non-ASCII character and a space, is
+refused the same way. Encoding an unreserved character is untouched:
+`report%2Ejson` decodes to `report.json` and is forwarded.
 
 Nothing is normalised, because normalising picks one of the readings and the
 gate cannot know which one the origin will pick. The declared `url` is held to
-the same rule: an endpoint path that is itself ambiguous is refused when the
-gate is built, since a base that does not mean one thing cannot bound anything.
+the same rules — an endpoint path that is itself ambiguous is refused when the
+gate is built, since a base that does not mean one thing cannot bound anything
+— with one difference: its path may also contain `@` and `:`, which hosted MCP
+servers use in the paths they serve (`/@org/name/mcp`). The difference runs one
+way. The endpoint is a constant the operator wrote; the sub-path is chosen by
+whoever sends the request and gets nothing beyond the unreserved set, so no
+request can place either character anywhere the Agentfile did not. Neither
+character is inert to every origin — a Windows file server may read a path that
+starts `/C:` as a drive — and that reading is the operator's to avoid, in a
+string only the operator writes.
 
 This keeps the tool allowlist meaningful when several MCP servers share one
 origin. A traversal out of the declared endpoint would otherwise reach a
@@ -1072,6 +1087,12 @@ servers; duplicates are rejected.
 
 The real endpoint of the MCP server. Streamable HTTP is the only supported MCP
 transport, so other schemes are rejected. The URL must have a host.
+
+Its path is held to the rules under *One endpoint, no traversal* in §10: after
+one decode it may contain no `.` or `..` segment, no empty segment except a
+trailing one, and no byte outside `A`–`Z`, `a`–`z`, `0`–`9`, `-`, `.`, `_`, `~`,
+`@` and `:`. A path that breaks one fails `constle run` when the gate is built,
+before any sandbox is started; `constle validate` does not check it.
 
 This value is **host side only**. It is never forwarded into the sandbox, and
 its host must not appear in `allowed_hosts` (§7.2).
@@ -1874,7 +1895,7 @@ by any declared server, `constle validate` would warn that they gate nothing.
 
 | Number | What it versions | Current |
 |--------|-----------------|---------|
-| **Spec version** | This document — its prose, structure, and accuracy | `0.4.0` |
+| **Spec version** | This document — its prose, structure, and accuracy | `0.5.0` |
 | **`apiVersion`** | The wire format the runtime accepts | `constle.dev/v1alpha1` |
 
 The spec version changes whenever this document changes materially, including
@@ -1928,6 +1949,58 @@ called out in the changelog.
 ---
 
 ## 21. Changelog
+
+### 0.5.0 — 2026-09-23
+
+**Changed — the MCP gate forwards a sub-path only in unreserved characters
+(§10):**
+
+- The gate refused a sub-path segment that was a dot segment, or that held `%`,
+  `;` or `\` after one decode, and forwarded everything else re-encoded. An
+  origin that reads those bytes a second way turned some of them into exactly
+  that structure: NFKC normalisation folds `．` (U+FF0E) into `.`, `‥` (U+2025)
+  into `..` and `／` into `/`; a Windows best-fit code page maps `∕` (U+2215) to
+  `/` on code page 1252 and `¥` to `\` on 932; a server that re-parses the
+  decoded path ends it at `?` or `#`, and drops a tab as WHATWG URL parsers do.
+  Against an origin that normalises with NFKC, a request for
+  `$CONSTLE_MCP_<ID>_URL/%EF%BC%8E%EF%BC%8E/admin` on an endpoint of `/v1/mcp`
+  was served as `/v1/admin` — outside the declared endpoint, under this server's
+  tool allowlist, human gates and metering.
+- Every byte of the decoded sub-path must now be an RFC 3986 unreserved
+  character: `A`–`Z`, `a`–`z`, `0`–`9`, `-`, `.`, `_`, `~`. Anything else is
+  refused with `400` and an `mcp_request_blocked` event whose reason names the
+  set. The refusals that already existed keep their own reasons. Percent-encoding
+  an unreserved character is unaffected: `report%2Ejson` is still forwarded as
+  `report.json`.
+- The rule is an allowlist rather than a longer list of refusals because the
+  second readings cannot be enumerated: every normalisation form and every code
+  page is one more table.
+
+**Changed — the declared endpoint is held to a byte set of its own (§10.2):**
+
+- An `mcp.servers[].url` whose path is itself ambiguous was already refused. Its
+  path must now also consist, after one decode, of the unreserved characters
+  plus `@` and `:`. Those two are admitted for the endpoint alone: hosted MCP
+  servers serve paths such as `/@org/name/mcp`, and the endpoint is a constant
+  the operator wrote. The sub-path, which the sender writes, does not get them.
+- The refusal happens where the other endpoint refusals already did: when
+  `constle run` builds the gate, before any sandbox is started. `constle
+  validate` does not report it.
+
+**Breaking under §20.3:**
+
+- Both changes can refuse what worked before without modification. A request
+  whose sub-path carried a space, a non-ASCII character or any other byte
+  outside the set now gets `400` where it reached the upstream, and an
+  Agentfile whose `mcp.servers[].url` path carries a byte outside the
+  endpoint's set now fails `constle run`. This is recorded as a **breaking
+  change** rather than argued into §20.4, although the sub-path half closes a
+  gap in a guarantee `mcp.servers[].url` already made as an ENFORCED field —
+  forwarding scoped to the declared endpoint. `apiVersion` is unchanged:
+  `v1alpha1` is documented as unstable (§20.2), and the format did not change.
+- Migration: a fixed sub-path that needs `@` or `:` can move into the declared
+  `url`, where both are admitted. A sub-path that varies per request cannot, and
+  there is no setting that widens the sub-path's set.
 
 ### 0.4.0 — 2026-09-21
 

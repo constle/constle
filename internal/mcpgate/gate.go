@@ -256,8 +256,10 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 		// serves "/admin": the gate's promise would hold for the string and
 		// fail for the resource. Refused here rather than in the parser
 		// because this is where the base is taken, so no caller can reach the
-		// rewrite with a base that was never checked.
-		if reason := ambiguousPathReason(strings.TrimPrefix(target.Path, "/")); reason != "" {
+		// rewrite with a base that was never checked. The endpoint's check
+		// admits '@' and ':' where the sub-path's does not; see
+		// ambiguousEndpointReason for why that is safe only here.
+		if reason := ambiguousEndpointReason(strings.TrimPrefix(target.Path, "/")); reason != "" {
 			return nil, fmt.Errorf(
 				"mcp server %q: url path %q cannot be an endpoint — %s; "+
 					"declare the endpoint the server actually serves",
@@ -419,8 +421,10 @@ func (g *Gate) Close() error {
 // about. The target must address the declared endpoint or a path under it, and
 // a sub-path that some second reading of the same bytes would turn into
 // structure — a dot segment, an interior empty segment, a percent sign that
-// survives one decode, a path parameter, a backslash — is refused rather than
-// normalised, because normalising it would silently pick one of the readings.
+// survives one decode, a path parameter, a backslash, or any byte outside the
+// RFC 3986 unreserved set, where the NFKC and best-fit readings live — is
+// refused rather than normalised, because normalising it would silently pick
+// one of the readings.
 // And a request asking to stop speaking HTTP (Connection: Upgrade) is refused,
 // with an upstream's 101 refused in turn, so no tunnel is ever spliced through
 // the gate. The guarantee is over every byte a request can move, not only over
@@ -488,9 +492,10 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The sub-path is forwarded, so it decides which resource on the origin
 	// this request reaches. A segment either side would resolve — "..", an
 	// interior empty segment, or a separator or dot hidden behind
-	// percent-encoding — lets a client address a path other than the declared
-	// endpoint: another MCP server mounted beside this one, whose tool
-	// allowlist was never consulted, or anything else the origin serves.
+	// percent-encoding or behind a Unicode form the origin folds into one —
+	// lets a client address a path other than the declared endpoint: another
+	// MCP server mounted beside this one, whose tool allowlist was never
+	// consulted, or anything else the origin serves.
 	//
 	// The check runs on the decoded sub-path, which is what r.URL.Path holds:
 	// "%2e%2e%2f" has already become "../" by the time it arrives here, and
@@ -592,10 +597,60 @@ const (
 //   - A backslash is not a separator in a URL, but an origin on a platform
 //     that treats it as one resolves "..\..\x" exactly like "../../x".
 //
+// Those name the readings that are known, and they cannot be the whole rule,
+// because the readings are open-ended: NFKC folds '．' into '.' and '‥' into
+// "..", a Windows best-fit code page maps '∕' to '/' and '¥' to '\', a decoder
+// that re-parses the decoded path ends it at '?' or '#' and drops a tab, and
+// every further normalisation form or code page is one more table. So every
+// byte must also be RFC 3986 unreserved — A-Z a-z 0-9 - . _ ~ — the only
+// characters that mean the same whether or not they arrived percent-encoded
+// (RFC 3986 §6.2.2.2), and that all four Unicode normalisation forms and
+// every Windows ANSI code page leave as they are. The named rules run first
+// so that the audit log says which known reading a refusal was; the allowlist
+// is what makes the list of readings irrelevant.
+//
 // Segments are compared whole, so "..foo", "foo..bar" and a name that merely
 // contains a dot stay legal; only a segment that *is* a dot segment does not.
 func ambiguousPathReason(remainder string) string {
-	segments := strings.Split(remainder, "/")
+	return pathReason(remainder, unreserved, reasonUnlistedCharacter)
+}
+
+// reasonUnlistedEndpointCharacter is ambiguousEndpointReason's counterpart of
+// reasonUnlistedCharacter. It names the endpoint's wider set, and it never
+// reaches the audit log: an endpoint is refused when the gate is built, before
+// there is a request to log.
+const reasonUnlistedEndpointCharacter = "character outside A-Z a-z 0-9 - . _ ~ @ : in the endpoint path"
+
+// ambiguousEndpointReason is ambiguousPathReason for the declared endpoint
+// path, held to the same rules over a wider set of bytes: '@' and ':' are
+// admitted as well, because hosted MCP servers serve paths such as
+// "/@org/name/mcp".
+//
+// The two sets differ on purpose. The endpoint is a constant the operator
+// wrote into the Agentfile, checked once when the gate is built; the sub-path
+// is chosen by the sender of every request, so it is the part an attacker
+// controls, and it gets nothing beyond the unreserved set. Joining cannot mix
+// the two: the sub-path follows a separator and can hold neither byte, so no
+// request places '@' or ':' anywhere the operator did not.
+//
+// Neither byte is inert to every reader. '@' is structure only inside an
+// authority, and the refusal of a leading empty segment keeps "//" — and with
+// it any authority — off the front of the path. ':' after a single letter at
+// the start of the path names a drive to a Windows file server that joins
+// paths the way Python's ntpath does, so a declared "/C:/x" means something
+// other than it says to such an origin. That reading is confined to a string
+// the operator wrote.
+func ambiguousEndpointReason(endpoint string) string {
+	return pathReason(endpoint, endpointByte, reasonUnlistedEndpointCharacter)
+}
+
+// pathReason applies the rules ambiguousPathReason describes, with allowed as
+// the byte allowlist and unlisted as the reason a byte outside it is refused
+// with. Callers are the two functions above, and no other: the allowlist is
+// the whole difference between a sub-path and an endpoint, so it is fixed by
+// which of them is called rather than passed in at the call site.
+func pathReason(p string, allowed func(byte) bool, unlisted string) string {
+	segments := strings.Split(p, "/")
 	for i, segment := range segments {
 		switch {
 		case segment == "." || segment == "..":
@@ -608,9 +663,41 @@ func ambiguousPathReason(remainder string) string {
 			return reasonPathParameter
 		case strings.Contains(segment, "\\"):
 			return reasonBackslash
+		case !allBytes(segment, allowed):
+			return unlisted
 		}
 	}
 	return ""
+}
+
+// allBytes reports whether allowed holds for every byte of segment. It walks
+// bytes, not runes, so the answer never depends on the segment being valid
+// UTF-8: an overlong "%C0%AE" is two bytes outside either set, whatever a
+// lenient decoder would make of them.
+func allBytes(segment string, allowed func(byte) bool) bool {
+	for i := 0; i < len(segment); i++ {
+		if !allowed(segment[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// unreserved reports whether b is an RFC 3986 unreserved character (§2.3).
+func unreserved(b byte) bool {
+	switch {
+	case 'a' <= b && b <= 'z', 'A' <= b && b <= 'Z', '0' <= b && b <= '9':
+		return true
+	case b == '-', b == '.', b == '_', b == '~':
+		return true
+	}
+	return false
+}
+
+// endpointByte reports whether b may appear in a declared endpoint path: the
+// unreserved set, plus the two bytes ambiguousEndpointReason explains.
+func endpointByte(b byte) bool {
+	return unreserved(b) || b == '@' || b == ':'
 }
 
 // withinEndpoint reports whether a forwarded path is the declared endpoint or
