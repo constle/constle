@@ -32,11 +32,17 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 $bb mount -t proc proc /proc
 $bb mount -t sysfs sys /sys
 
-# finish <code> — record the exit code, echo the agent output to the serial
-# console (visible in the host's console.log), and shut the VM down.
+# finish <code> — record the exit code and shut the VM down.
+#
+# The agent's output is deliberately NOT echoed to the serial console. The
+# host reads /workspace/agent.log out of the jailed workspace image with
+# debugfs (FirecrackerBackend.Logs), which is the only path that ever mattered;
+# the echo existed solely to mirror it into <runDir>/console.log, where it sat
+# beside a state file that unprivileged `constle ps` has to be able to read.
+# Whatever the agent printed — tool output, tokens it was handed, its own
+# reasoning — stays inside the image.
 finish() {
 	echo "$1" > /workspace/exitcode
-	[ -f /workspace/agent.log ] && $bb cat /workspace/agent.log
 	echo "constle-init: agent exited with code $1"
 	$bb sync
 	$bb umount /workspace 2>/dev/null

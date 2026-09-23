@@ -67,6 +67,28 @@ func resolveFirecrackerBinary() (string, error) {
 	return "", fmt.Errorf("firecracker binary not found in PATH or at %s — run scripts/setup-firecracker", fcFallbackBinary)
 }
 
+// openConsoleLog creates the per-run serial console capture file.
+//
+// 0600, root-owned: the run directory is 0755 so unprivileged `constle ps`
+// can read the state file, which means every file in it is reachable by any
+// local user and must carry its own mode. The serial console receives VMM
+// diagnostics and the guest init's own chatter; nothing here is meant for a
+// user who is not the operator.
+func openConsoleLog(runDir string) (*os.File, error) {
+	f, err := os.OpenFile(fcConsoleLogPath(runDir), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, err
+	}
+	// O_CREATE's mode is masked by the umask, and an existing file keeps the
+	// mode it already had — restate it so the result does not depend on how
+	// the operator's shell was configured.
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 // launchVM starts jailer (which execs into firecracker — the returned
 // command's PID is the VMM PID) and waits for the API socket to appear.
 // The serial console and VMM log stream into <runDir>/console.log.
@@ -81,7 +103,7 @@ func launchVM(runID, runDir string) (*exec.Cmd, error) {
 		return nil, err
 	}
 
-	console, err := os.OpenFile(fcConsoleLogPath(runDir), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	console, err := openConsoleLog(runDir)
 	if err != nil {
 		return nil, err
 	}

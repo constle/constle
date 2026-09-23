@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -54,6 +55,7 @@ import (
 	"github.com/constle/constle/internal/audit"
 	"github.com/constle/constle/internal/humangate"
 	"github.com/constle/constle/internal/spending"
+	"github.com/constle/constle/internal/termsafe"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -140,6 +142,20 @@ type Outcome struct {
 	// caused by a signature that failed to verify, rather than an ordinary
 	// human "no".
 	Event audit.EventType
+
+	// Evidence, when non-nil, is the signed decision this Outcome came from,
+	// which runGate writes to the audit log so the decision can be
+	// re-verified offline against the approver's key
+	// (spec/human-gates-webhook.md §9). An Approver that produces no signed
+	// statement — TerminalApprover, whose answer is a keystroke — leaves it
+	// nil, and the entry keeps exactly the details it always had.
+	//
+	// It is evidence ABOUT a decision, never an input TO one, on the same
+	// rule the subject_digest already follows in runGate: nothing here may
+	// change whether the call proceeds. Decision alone decides that, and
+	// Evidence that could not be built or written must not turn an approval
+	// into a denial.
+	Evidence *humangate.RecordedDecision
 }
 
 // ReasoningApprover is implemented by an Approver that can explain a denial
@@ -213,7 +229,16 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 		agentName: m.Identity.Name,
 	}
 
-	if m.HumanGates.Enabled {
+	// The master switch, read through the one predicate the CLI also reports
+	// from, so neither side can start disagreeing about whether gates are on
+	// at all (manifest.HumanGates.GatesArmed).
+	//
+	// The entry set built below is deliberately wider than what the CLI calls
+	// enforced: an entry no declared server could serve stays here so the
+	// case-fold near-miss refusal further down still covers it, while
+	// EnforcedGateEntries drops it rather than promise a gate on a tool the
+	// tools allowlist rejects first.
+	if m.HumanGates.GatesArmed() {
 		for _, entry := range m.HumanGates.RequireApprovalFor {
 			g.gated[entry] = true
 		}
@@ -231,8 +256,10 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 		// serves "/admin": the gate's promise would hold for the string and
 		// fail for the resource. Refused here rather than in the parser
 		// because this is where the base is taken, so no caller can reach the
-		// rewrite with a base that was never checked.
-		if reason := ambiguousPathReason(strings.TrimPrefix(target.Path, "/")); reason != "" {
+		// rewrite with a base that was never checked. The endpoint's check
+		// admits '@' and ':' where the sub-path's does not; see
+		// ambiguousEndpointReason for why that is safe only here.
+		if reason := ambiguousEndpointReason(strings.TrimPrefix(target.Path, "/")); reason != "" {
 			return nil, fmt.Errorf(
 				"mcp server %q: url path %q cannot be an endpoint — %s; "+
 					"declare the endpoint the server actually serves",
@@ -276,6 +303,11 @@ func New(m *manifest.AgentManifest, approver Approver, notifier Notifier, logger
 				scrubHopByHop(req.Header)
 			},
 			ModifyResponse: refuseProtocolSwitch(len(meters) > 0),
+			// ErrorLog rather than ErrorHandler: ReverseProxy routes every
+			// message it emits through this logger, the default error
+			// handler's included, so one writer covers the lot and the 502
+			// that handler sends stays exactly as it was.
+			ErrorLog: log.New(gateLogWriter{"proxy"}, "", 0),
 		}
 
 		g.servers[srv.ID] = &upstream{id: srv.ID, path: target.Path, tools: tools, meters: meters, proxy: proxy}
@@ -327,7 +359,10 @@ func (g *Gate) Bind(runID string, candidateIPs []string) (port int, token string
 
 	g.port = port
 	g.listeners = listeners
-	g.server = &http.Server{Handler: g}
+	// The same omission one level up: an http.Server with no ErrorLog logs
+	// through the global logger too, and what it logs — a handler panic, a
+	// TLS handshake failure — is assembled from whatever the peer sent.
+	g.server = &http.Server{Handler: g, ErrorLog: log.New(gateLogWriter{"server"}, "", 0)}
 	for _, ln := range listeners {
 		go func() {
 			// Serve never returns nil. ErrServerClosed is the ordinary exit
@@ -337,7 +372,7 @@ func (g *Gate) Bind(runID string, candidateIPs []string) (port int, token string
 			// error is telling the operator why, instead of leaving them to
 			// debug an agent that suddenly cannot reach a declared server.
 			if err := g.server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				fmt.Fprintf(os.Stderr, "constle: MCP gate listener on %s stopped: %v\n", ln.Addr(), err)
+				termsafe.Fprintf(os.Stderr, "constle: MCP gate listener on %s stopped: %v\n", ln.Addr(), err)
 			}
 		}()
 	}
@@ -386,8 +421,10 @@ func (g *Gate) Close() error {
 // about. The target must address the declared endpoint or a path under it, and
 // a sub-path that some second reading of the same bytes would turn into
 // structure — a dot segment, an interior empty segment, a percent sign that
-// survives one decode, a path parameter, a backslash — is refused rather than
-// normalised, because normalising it would silently pick one of the readings.
+// survives one decode, a path parameter, a backslash, or any byte outside the
+// RFC 3986 unreserved set, where the NFKC and best-fit readings live — is
+// refused rather than normalised, because normalising it would silently pick
+// one of the readings.
 // And a request asking to stop speaking HTTP (Connection: Upgrade) is refused,
 // with an upstream's 101 refused in turn, so no tunnel is ever spliced through
 // the gate. The guarantee is over every byte a request can move, not only over
@@ -455,9 +492,10 @@ func (g *Gate) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The sub-path is forwarded, so it decides which resource on the origin
 	// this request reaches. A segment either side would resolve — "..", an
 	// interior empty segment, or a separator or dot hidden behind
-	// percent-encoding — lets a client address a path other than the declared
-	// endpoint: another MCP server mounted beside this one, whose tool
-	// allowlist was never consulted, or anything else the origin serves.
+	// percent-encoding or behind a Unicode form the origin folds into one —
+	// lets a client address a path other than the declared endpoint: another
+	// MCP server mounted beside this one, whose tool allowlist was never
+	// consulted, or anything else the origin serves.
 	//
 	// The check runs on the decoded sub-path, which is what r.URL.Path holds:
 	// "%2e%2e%2f" has already become "../" by the time it arrives here, and
@@ -531,6 +569,7 @@ const (
 	reasonPercentEncoding     = "percent-encoding in the request path"
 	reasonPathParameter       = "path parameter in the request path"
 	reasonBackslash           = "backslash in the request path"
+	reasonUnlistedCharacter   = "character outside A-Z a-z 0-9 - . _ ~ in the request path"
 	reasonProtocolUpgrade     = "the MCP transport defines no protocol upgrade"
 	reasonPathEscapedEndpoint = "forwarded path outside the declared endpoint"
 )
@@ -558,10 +597,60 @@ const (
 //   - A backslash is not a separator in a URL, but an origin on a platform
 //     that treats it as one resolves "..\..\x" exactly like "../../x".
 //
+// Those name the readings that are known, and they cannot be the whole rule,
+// because the readings are open-ended: NFKC folds '．' into '.' and '‥' into
+// "..", a Windows best-fit code page maps '∕' to '/' and '¥' to '\', a decoder
+// that re-parses the decoded path ends it at '?' or '#' and drops a tab, and
+// every further normalisation form or code page is one more table. So every
+// byte must also be RFC 3986 unreserved — A-Z a-z 0-9 - . _ ~ — the only
+// characters that mean the same whether or not they arrived percent-encoded
+// (RFC 3986 §6.2.2.2), and that all four Unicode normalisation forms and
+// every Windows ANSI code page leave as they are. The named rules run first
+// so that the audit log says which known reading a refusal was; the allowlist
+// is what makes the list of readings irrelevant.
+//
 // Segments are compared whole, so "..foo", "foo..bar" and a name that merely
 // contains a dot stay legal; only a segment that *is* a dot segment does not.
 func ambiguousPathReason(remainder string) string {
-	segments := strings.Split(remainder, "/")
+	return pathReason(remainder, unreserved, reasonUnlistedCharacter)
+}
+
+// reasonUnlistedEndpointCharacter is ambiguousEndpointReason's counterpart of
+// reasonUnlistedCharacter. It names the endpoint's wider set, and it never
+// reaches the audit log: an endpoint is refused when the gate is built, before
+// there is a request to log.
+const reasonUnlistedEndpointCharacter = "character outside A-Z a-z 0-9 - . _ ~ @ : in the endpoint path"
+
+// ambiguousEndpointReason is ambiguousPathReason for the declared endpoint
+// path, held to the same rules over a wider set of bytes: '@' and ':' are
+// admitted as well, because hosted MCP servers serve paths such as
+// "/@org/name/mcp".
+//
+// The two sets differ on purpose. The endpoint is a constant the operator
+// wrote into the Agentfile, checked once when the gate is built; the sub-path
+// is chosen by the sender of every request, so it is the part an attacker
+// controls, and it gets nothing beyond the unreserved set. Joining cannot mix
+// the two: the sub-path follows a separator and can hold neither byte, so no
+// request places '@' or ':' anywhere the operator did not.
+//
+// Neither byte is inert to every reader. '@' is structure only inside an
+// authority, and the refusal of a leading empty segment keeps "//" — and with
+// it any authority — off the front of the path. ':' after a single letter at
+// the start of the path names a drive to a Windows file server that joins
+// paths the way Python's ntpath does, so a declared "/C:/x" means something
+// other than it says to such an origin. That reading is confined to a string
+// the operator wrote.
+func ambiguousEndpointReason(endpoint string) string {
+	return pathReason(endpoint, endpointByte, reasonUnlistedEndpointCharacter)
+}
+
+// pathReason applies the rules ambiguousPathReason describes, with allowed as
+// the byte allowlist and unlisted as the reason a byte outside it is refused
+// with. Callers are the two functions above, and no other: the allowlist is
+// the whole difference between a sub-path and an endpoint, so it is fixed by
+// which of them is called rather than passed in at the call site.
+func pathReason(p string, allowed func(byte) bool, unlisted string) string {
+	segments := strings.Split(p, "/")
 	for i, segment := range segments {
 		switch {
 		case segment == "." || segment == "..":
@@ -574,9 +663,41 @@ func ambiguousPathReason(remainder string) string {
 			return reasonPathParameter
 		case strings.Contains(segment, "\\"):
 			return reasonBackslash
+		case !allBytes(segment, allowed):
+			return unlisted
 		}
 	}
 	return ""
+}
+
+// allBytes reports whether allowed holds for every byte of segment. It walks
+// bytes, not runes, so the answer never depends on the segment being valid
+// UTF-8: an overlong "%C0%AE" is two bytes outside either set, whatever a
+// lenient decoder would make of them.
+func allBytes(segment string, allowed func(byte) bool) bool {
+	for i := 0; i < len(segment); i++ {
+		if !allowed(segment[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// unreserved reports whether b is an RFC 3986 unreserved character (§2.3).
+func unreserved(b byte) bool {
+	switch {
+	case 'a' <= b && b <= 'z', 'A' <= b && b <= 'Z', '0' <= b && b <= '9':
+		return true
+	case b == '-', b == '.', b == '_', b == '~':
+		return true
+	}
+	return false
+}
+
+// endpointByte reports whether b may appear in a declared endpoint path: the
+// unreserved set, plus the two bytes ambiguousEndpointReason explains.
+func endpointByte(b byte) bool {
+	return unreserved(b) || b == '@' || b == ':'
 }
 
 // withinEndpoint reports whether a forwarded path is the declared endpoint or
@@ -911,12 +1032,24 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		OnTimeout:      g.gates.OnTimeout,
 	}
 
+	// evidence is the signed decision, once an approver has produced one.
+	// It is declared here so gateDetails can pick it up: still nil when
+	// gate_triggered is written (no request_id exists before the approver
+	// mints one), populated by the time any terminal event is.
+	var evidence *humangate.RecordedDecision
+
 	// gateDetails seeds the details map every terminal event of this gate
-	// shares, so none of them can drift out of naming the same subject.
+	// shares, so none of them can drift out of naming the same subject —
+	// including the §9 decision evidence, which every terminal event of a
+	// webhook-decided gate therefore carries by construction rather than by
+	// each call site remembering to attach it.
 	gateDetails := func(extra map[string]any) map[string]any {
 		d := map[string]any{"server": up.id, "tool": tool}
 		if subjectDigest != "" {
 			d["subject_digest"] = subjectDigest
+		}
+		for k, v := range evidence.Details() {
+			d[k] = v
 		}
 		for k, v := range extra {
 			d[k] = v
@@ -943,11 +1076,11 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 	defer cancel()
 
 	decision := DecisionNone
-	decidedBy := "terminal"
+	decidedBy := humangate.DecidedByTerminal
 	var eventOverride audit.EventType
 	if ra, ok := g.approver.(ReasoningApprover); ok {
 		outcome := ra.DecideWithReason(ctx, req)
-		decision, eventOverride = outcome.Decision, outcome.Event
+		decision, eventOverride, evidence = outcome.Decision, outcome.Event, outcome.Evidence
 		if outcome.DecidedBy != "" {
 			decidedBy = outcome.DecidedBy
 		}
@@ -964,7 +1097,8 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		if eventOverride != "" {
 			event = eventOverride
 		}
-		g.log(event, gateDetails(map[string]any{"decided_by": decidedBy, "wait_ms": waitMS}))
+		g.log(event, gateDetails(map[string]any{
+			humangate.DetailDecidedBy: decidedBy, "wait_ms": waitMS}))
 		forward()
 
 	case DecisionDenied:
@@ -972,7 +1106,8 @@ func (g *Gate) runGate(w http.ResponseWriter, msg *jsonRPCMessage, up *upstream,
 		if eventOverride != "" {
 			event = eventOverride
 		}
-		g.log(event, gateDetails(map[string]any{"decided_by": decidedBy, "wait_ms": waitMS}))
+		g.log(event, gateDetails(map[string]any{
+			humangate.DetailDecidedBy: decidedBy, "wait_ms": waitMS}))
 		writeJSONRPCError(w, msg.ID, fmt.Sprintf(
 			"constle: human gate DENIED tool call %q on server %q", tool, up.id))
 
@@ -1027,13 +1162,68 @@ func (g *Gate) log(event audit.EventType, details map[string]any) {
 // outf writes one piece of operator-facing text — an approval prompt, a
 // webhook warning — to a caller-supplied writer.
 //
+// It is also this package's terminal-integrity chokepoint. Everything it
+// prints is operator-facing plain text: nothing in internal/mcpgate emits
+// styling of its own, so there is no legitimate escape sequence here to
+// preserve, and sanitizing unconditionally costs nothing. That matters
+// because this writer is the same one the human gate draws its prompt on and
+// reads its answer beside — a gate's promise that the bytes shown are the
+// bytes signed for is worth only as much as constle's hold on the screen.
+//
+// Two layers, because they stop different things:
+//
+//   - termsafe.Args escapes the interpolated values before formatting, so an
+//     untrusted string (an unset url_secret_ref out of an Agentfile, a
+//     reason phrase from a decision endpoint) cannot end its line and write
+//     a line that reads as constle speaking. Arguments whose newlines ARE
+//     constle's own say so with termsafe.Preformatted.
+//   - termsafe.Block over the result is the backstop for whatever Args does
+//     not reach — a %v over a composite, a future call site that forgets.
+//     It cannot undo a forged line at that point, but nothing that drives a
+//     terminal survives it.
+//
 // The dropped error is justified once here rather than at a dozen call
 // sites: this writer IS the channel constle reports problems on, so a
 // failure to write to it has nowhere left to be reported. Nothing the gate
 // enforces depends on it either — a gated call is decided and audited
 // whether or not the human ever saw the prompt.
 func outf(w io.Writer, format string, args ...any) {
-	_, _ = fmt.Fprintf(w, format, args...)
+	termsafe.Fprintf(w, format, args...)
+}
+
+// gateLogOut is where this package's standard-library loggers land. It is a
+// package var only so the test can capture it; production writes to stderr,
+// like the listener error that reports the same class of background failure.
+var gateLogOut io.Writer = os.Stderr
+
+// gateLogWriter routes a standard-library logger through this package's
+// chokepoint. what names which one, for the operator reading the line.
+//
+// It exists because these are the writers here that are not call sites.
+// httputil.ReverseProxy and http.Server each do their own logging, and one
+// built with no ErrorLog logs through the standard library's global logger,
+// which writes straight to os.Stderr: around outf, around termsafe, inside
+// the package that draws the approval prompt and reads the answer beside it.
+// Nothing about those lines is constle's to compose, which is exactly why
+// they have to be held.
+//
+// What they log is assembled from whatever the peer did. net/http quotes
+// most of what it reports with %q, and %q escapes a control byte on its own
+// — but that is net/http's wording, not an invariant constle may rest on,
+// and crypto/x509 already does not: x509.HostnameError joins the
+// certificate's DNS names verbatim, so an upstream whose certificate chains
+// to a trusted CA and fails hostname verification puts those bytes on the
+// screen.
+//
+// The logged line goes in as a value and not as preformatted text: a logger
+// relaying someone else's error must not be able to open a line of its own.
+// Only what names the writer is constle's own, and it says so.
+type gateLogWriter struct{ what string }
+
+func (g gateLogWriter) Write(b []byte) (int, error) {
+	outf(gateLogOut, "constle: MCP gate %s: %s\n",
+		termsafe.Preformatted(g.what), strings.TrimSuffix(string(b), "\n"))
+	return len(b), nil
 }
 
 // statusRecorder captures the HTTP status a proxied response was sent with,
@@ -1210,6 +1400,19 @@ func checkUnambiguousNames(msg *jsonRPCMessage) error {
 				errAmbiguousBody, clampJSONValue(msg.Method), methodToolsCall)
 		}
 		return nil
+	}
+	if msg.Params.Name == "" {
+		// A tools/call with no tool name has nothing the gate can decide
+		// about. It is refused here rather than carried, because an empty
+		// name is a name the audit trail cannot hold a decision to: an
+		// offline verifier requires an entry's tool and its recorded
+		// request's to be present and equal, and treats an empty one as
+		// absent — so a gate armed on "" would write records that are
+		// correctly signed and cannot be verified. Refusing at the producer
+		// keeps that requirement fail-closed instead of loosening it into
+		// "absent and empty are the same thing", which is how a deleted
+		// field passes for a missing one.
+		return fmt.Errorf("%w: params.name is empty", errAmbiguousBody)
 	}
 	return checkRoutingName("params.name", msg.Params.Name)
 }

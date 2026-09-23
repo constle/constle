@@ -1,5 +1,5 @@
 # Constle Agent Manifest — annotated reference file
-# Spec version: 0.1.0   (apiVersion: constle.dev/v1alpha1)
+# Spec version: 0.5.0   (apiVersion: constle.dev/v1alpha1)
 # https://docs.constle.dev/reference/agent-manifest/
 #
 # This file is the EXECUTABLE companion to spec/agent-manifest.md. That
@@ -191,6 +191,76 @@ capabilities:
   - send_email
 
 # ---------------------------------------------------------------------------
+# credentials — the host environment variables the sandbox receives
+# ---------------------------------------------------------------------------
+# ENFORCED, at sandbox environment construction. This list is complete and
+# exclusive for HOST variables: nothing reaches a sandbox from the machine
+# constle runs on unless it is declared below, and an Agentfile with no
+# credentials section receives no host variables at all. The sandbox also holds
+# the variables constle builds for the run (the proxy addresses, and the
+# CONSTLE_* gate and guest-network variables), the image's own ENV, and the few
+# a container runtime always sets; those are not the operator's environment and
+# this section does not govern them.
+#
+# "Credential" names the motivating case, not the mechanism. The section also
+# carries non-secret operator input — a task prompt is not a secret but it is a
+# host variable, and this is the only door. Everything declared here is handled
+# as a secret regardless: never printed, and recorded in the audit log by name
+# only.
+#
+# This section does NOT affect the capability floor. A credential is not a
+# capability and does not imply one; sandbox.isolation is derived from
+# `capabilities` and from nothing else.
+#
+# Note what is NOT a credential: human_gates.notify[].url_secret_ref names a
+# variable the HOST process reads to deliver a webhook. It is resolved outside
+# the sandbox and never forwarded into it, so it is not declared here.
+credentials:
+    # REQUIRED. The variable's name INSIDE the sandbox.
+    #
+    # Must be a portable environment variable name — an initial letter or
+    # underscore, then letters, digits and underscores. Anything else is a
+    # validation error rather than something escaped downstream: the name is
+    # rendered into `docker run -e NAME` (where a "=" would put the value into
+    # a world-readable argv) and into an `export NAME='value'` line in the
+    # Firecracker guest's env file (where a quote or newline would start a
+    # second statement in a file the guest runs). Same judgement as
+    # sandbox.network.allowed_hosts.
+    #
+    # Names constle builds for the run itself are refused: any name starting
+    # with CONSTLE_, and HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / FTP_PROXY /
+    # NO_PROXY, in
+    # any letter case. Declaring one would let the Agentfile point its own
+    # sandbox at a different proxy or a different gate. All four proxy names
+    # are set by the runtime on every run — including the two it has no value
+    # of its own for — because the Docker CLI otherwise fills them in from the
+    # operator's ~/.docker/config.json.
+    #
+    # Must be unique across entries, compared case-insensitively — two entries
+    # for one variable have no answer to which value the agent gets, and a case
+    # variant is one variable on Windows and two on unix.
+  - name: ANTHROPIC_API_KEY
+
+    # Optional. The HOST variable holding the value; defaults to `name`.
+    #
+    # The indirection is what makes the scoping per-agent rather than per-name:
+    # two agents can both read ANTHROPIC_API_KEY inside their sandboxes while
+    # resolving it from ANTHROPIC_API_KEY_PROD and ANTHROPIC_API_KEY_DEV on the
+    # host. The value itself never enters this file — the same pattern as
+    # human_gates.notify[].url_secret_ref and identity.did.
+    #
+    # Held to the name grammar above, but NOT to the reserved-name list: it
+    # names a variable in the operator's own environment.
+    secret_ref: ANTHROPIC_API_KEY_PROD
+
+    # A variable that is not set on this host — or is set to the empty string —
+    # fails `constle run` before any sandbox resource is created. `constle
+    # validate` warns instead of failing, because validation is not execution
+    # and an Agentfile is legitimately validated on a machine holding no keys.
+    # Same split as identity.did.
+  - name: AGENT_TASK
+
+# ---------------------------------------------------------------------------
 # mcp — Model Context Protocol servers the agent may call
 # ---------------------------------------------------------------------------
 # Every declared server is reachable ONLY through the constle gate proxy — a
@@ -305,7 +375,10 @@ spending:
 limits:
   # ENFORCED. Maximum wall-clock run time. On expiry constle stops the
   # sandbox and records a terminated_by_limit audit event. 0 or omitted
-  # means no limit.
+  # means no limit. A negative value is refused rather than read as "no
+  # limit", and so is anything above 9223372036 seconds, past which the
+  # number no longer converts to the time it names and the run would be
+  # killed at some arbitrary earlier moment.
   max_duration_seconds: 300
 
 # ---------------------------------------------------------------------------
@@ -352,10 +425,20 @@ human_gates:
     - "send_email"
 
   # How long a gated call waits for a decision. Default 300 when omitted.
+  # Refused below 0 and above 9223372036, past which the number no longer
+  # converts to the time it names and the gate would stop waiting almost
+  # immediately.
   approval_timeout_seconds: 300
 
   # What happens when approval does not arrive in time.
   # Accepted: abort | proceed. Default abort. There is no "retry".
+  #
+  # "Does not arrive" is wider than "nobody answered": an unreachable decision
+  # endpoint, one that never returns a parseable decision, and an
+  # approver_pubkey whose notify URL never resolved all end up here. abort
+  # refuses the call and stops the run; proceed forwards it unapproved. A
+  # decision that DOES arrive and fails verification is a denial, not a
+  # timeout, and this field does not affect it.
   on_timeout: abort
 
   # ENFORCED. "webhook" is the only channel this version supports, and an

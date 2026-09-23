@@ -36,6 +36,22 @@ jobs:
           # everything is what keeps it at zero.
           args: --timeout=5m
 
+      # The generated Squid configuration is only a string to Go. A directive
+      # this Squid does not accept satisfies every assertion in the suite and
+      # then fails every run in the field, at startup, in the proxy the whole
+      # sandbox depends on. Installing it here is what makes
+      # TestGeneratedConfigParsesUnderRealSquid load-bearing rather than a
+      # silent skip.
+      - name: Install Squid (for the generated-config parse test)
+        run: sudo apt-get update && sudo apt-get install -y squid
+
+      # scripts/hygiene-check.sh reads the embedded metadata of binary and
+      # media files through exiftool. The tests that hand it a real image
+      # need the real reader and skip without it; installing it here is what
+      # makes them load-bearing rather than a silent skip, as with Squid.
+      - name: Install exiftool (for the hygiene metadata tests)
+        run: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl && exiftool -ver
+
       - name: Test
         run: go test ./...
 
@@ -63,14 +79,16 @@ jobs:
           }" spec/
 
   # ---------------------------------------------------------------------------
-  # Hygiene: no AI-attribution trailers or unexpected script ranges in the
-  # commits a PR would add. Generic patterns only — maintainer-private
-  # patterns run in the local pre-push hook (see scripts/hygiene-check.sh).
+  # Hygiene: scan the commits a PR would add with scripts/hygiene-check.sh.
+  # The patterns are not in the repository; they come from the
+  # HYGIENE_PATTERNS_B64 secret (the pattern file, base64-encoded so raw bytes
+  # survive). Without it the job fails rather than scan for nothing — which
+  # includes PRs from forks, which are not given secrets.
   # Scoped to the PR range rather than --all deliberately: it gates new
   # content without re-litigating history on every run.
   # ---------------------------------------------------------------------------
   hygiene:
-    name: Hygiene (attribution & identity)
+    name: Hygiene
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
@@ -78,13 +96,28 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The scan reads the embedded metadata of every binary or media file
+      # the range adds or changes, and without exiftool it fails closed: a PR
+      # that adds an image would fail here rather than pass unread.
+      - name: Install exiftool
+        run: sudo apt-get update && sudo apt-get install -y libimage-exiftool-perl && exiftool -ver
+
       # Invoked via `sh`, not ./: the script's exec bit was once lost on a
       # checkout where git could not see file modes (core.filemode=false),
       # and this job failed with "Permission denied" (exit 126) instead of
       # ever running the scan. The bit is now committed too, but the sh
       # invocation keeps this job immune to that class of regression.
       - name: Scan PR commits
-        run: sh scripts/hygiene-check.sh --range "origin/${{ github.base_ref }}..HEAD"
+        env:
+          HYGIENE_PATTERNS_B64: ${{ secrets.HYGIENE_PATTERNS_B64 }}
+        run: |
+          if [ -z "$HYGIENE_PATTERNS_B64" ]; then
+            echo "::error::the HYGIENE_PATTERNS_B64 secret is not available to this run"
+            exit 2
+          fi
+          patterns="$RUNNER_TEMP/hygiene-patterns"
+          printf '%s' "$HYGIENE_PATTERNS_B64" | base64 -d > "$patterns"
+          CONSTLE_HYGIENE_PATTERNS="$patterns" sh scripts/hygiene-check.sh --range "origin/${{ github.base_ref }}..HEAD"
 
   # ---------------------------------------------------------------------------
   # Cross-platform build of the CLI binary.

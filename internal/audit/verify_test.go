@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -258,5 +259,88 @@ func TestSignedEntriesCarryChainFields(t *testing.T) {
 		if !strings.Contains(s, `"did":"did:key:z`) || !strings.HasSuffix(s, `"}`) || !strings.Contains(s, `,"sig":"`) {
 			t.Errorf("line %d is missing signing fields: %s", i+1, s)
 		}
+	}
+}
+
+// TestTamperReportNeverEchoesAnUnvalidatedDID covers F81.
+//
+// VerifyFile decodes exactly one DID — the entry that fixes the log's
+// identity, and only when the caller pinned nothing. Every other entry's
+// `did` is compared as a string and, until this fix, spliced into the tamper
+// report with %s: neither did.MaxLen nor the base58 alphabet had been applied
+// to it. That value is arbitrary bytes out of a file designed to travel here
+// from elsewhere, and encoding/json turns a `\u001b` escape into a real ESC
+// even though it rejects a raw one.
+//
+// The fix is at the point the error is BUILT rather than the point it is
+// printed, because VerifyFile is exported: an embedder that never touches
+// constle's CLI must not inherit an error that can drive a terminal.
+func TestTamperReportNeverEchoesAnUnvalidatedDID(t *testing.T) {
+	victim := newTestSigner(t)
+
+	hostile := `\u001b[2J\u001b[H\rAUDIT LOG VERIFIED`
+	line := `{"timestamp":"2026-09-21T00:00:00Z","event":"run_started",` +
+		`"did":"` + hostile + `","prev_hash":"deadbeef","sig":"AAAA"}`
+
+	path := filepath.Join(t.TempDir(), "hostile.jsonl")
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	_, err := VerifyFile(path, victim.did)
+	var te *TamperError
+	if !errors.As(err, &te) {
+		t.Fatalf("VerifyFile() error = %v, want *TamperError", err)
+	}
+	if te.Kind != TamperDIDMismatch {
+		t.Fatalf("got kind %q, want %q", te.Kind, TamperDIDMismatch)
+	}
+
+	// The premise: the file really does decode to a raw ESC, so a test that
+	// found none would otherwise pass without proving anything.
+	var entry Entry
+	if uerr := json.Unmarshal([]byte(line), &entry); uerr != nil {
+		t.Fatalf("premise unmarshal: %v", uerr)
+	}
+	if !strings.ContainsRune(entry.DID, 0x1B) {
+		t.Fatal("premise wrong: the crafted entry carries no ESC after JSON decoding")
+	}
+
+	report := err.Error()
+	for _, bad := range []rune{0x1B, 0x0D} {
+		if strings.ContainsRune(report, bad) {
+			t.Errorf("%U reached the tamper report verbatim: %q", bad, report)
+		}
+	}
+	// Escaped, not dropped — the operator still sees what the entry claimed.
+	if !strings.Contains(report, `\x1b[2J`) {
+		t.Errorf("the offending value was hidden rather than quoted: %q", report)
+	}
+}
+
+// TestTamperReportBoundsAnOversizedDID keeps one line of a log from becoming
+// the whole error. Nothing caps the field before the comparison, so without a
+// bound the report is as long as the attacker's file.
+func TestTamperReportBoundsAnOversizedDID(t *testing.T) {
+	victim := newTestSigner(t)
+
+	huge := strings.Repeat("z", 8192)
+	line := `{"timestamp":"2026-09-21T00:00:00Z","event":"run_started",` +
+		`"did":"did:key:` + huge + `","prev_hash":"deadbeef","sig":"AAAA"}`
+
+	path := filepath.Join(t.TempDir(), "huge.jsonl")
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	_, err := VerifyFile(path, victim.did)
+	if err == nil {
+		t.Fatal("VerifyFile() error = nil, want a tamper report")
+	}
+	if n := len(err.Error()); n > 4*did.MaxLen {
+		t.Errorf("tamper report is %d bytes for an %d-byte DID; the bound did not apply", n, len(huge))
+	}
+	if !strings.Contains(err.Error(), "bytes in all") {
+		t.Errorf("an over-long DID should be reported by length: %q", err.Error())
 	}
 }

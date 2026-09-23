@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/constle/constle/pkg/did"
 )
@@ -55,6 +56,46 @@ func (e *TamperError) Error() string {
 type VerifyReport struct {
 	Entries int
 	DID     string
+
+	// Parsed are the log's entries in file order, available once the
+	// signature and chain checks above have all passed. A caller that wants
+	// to inspect what the log SAYS — as `constle audit verify` does, to
+	// re-verify the gate decisions recorded under spec
+	// human-gates-webhook.md §9 — reads them from here rather than parsing
+	// the file a second time, so it can only ever examine entries this
+	// function has already proved authentic.
+	//
+	// Retaining them raises this call's peak memory by a decoded copy of the
+	// log, on top of the raw file and the line index it already holds. That
+	// is linear in the file either way, but a large log now costs more than
+	// it did.
+	Parsed []Entry
+}
+
+// quoteDID renders a DID for a tamper report.
+//
+// The DID of a mismatching entry is the one value this file echoes that has
+// NOT been through did.PublicKey: only the entry that fixes the log's
+// identity is decoded (and only when the caller pinned nothing), so a later
+// line's did carries neither the did.MaxLen byte cap nor the base58
+// alphabet. It is arbitrary bytes out of a file that, by design, travelled
+// here from somewhere else — internal/mcpgate's gate documents that the
+// audit log is meant to travel, and a fully attacker-authored log is
+// internally consistent by construction, which is exactly what the
+// pinned-DID rewrite test exercises.
+//
+// So it is bounded and quoted, at the point the error is built rather than
+// at the point it is printed: VerifyFile is exported, and an embedder that
+// never touches constle's CLI must not inherit an error that can drive a
+// terminal. strconv.Quote escapes ESC, every other control byte, the bidi
+// overrides and invalid UTF-8; the length cap keeps a whole file out of one
+// error line. This matches pkg/did's own rule — it reports a DID's length
+// rather than its value once the value is too long to be one.
+func quoteDID(s string) string {
+	if len(s) > did.MaxLen {
+		return fmt.Sprintf("%q… (%d bytes in all)", s[:did.MaxLen], len(s))
+	}
+	return strconv.Quote(s)
 }
 
 // VerifyFile reads a signed audit log and verifies it end to end: every
@@ -104,6 +145,7 @@ func VerifyFile(path, expectedDID string) (*VerifyReport, error) {
 	}
 
 	prevHash := GenesisHash
+	parsed := make([]Entry, 0, len(lines))
 	for i, line := range lines {
 		lineNo := i + 1
 
@@ -124,7 +166,7 @@ func VerifyFile(path, expectedDID string) (*VerifyReport, error) {
 			}
 		} else if entry.DID != logDID {
 			return nil, &TamperError{lineNo, TamperDIDMismatch,
-				fmt.Sprintf("entry is attributed to %s, expected %s", entry.DID, logDID)}
+				fmt.Sprintf("entry is attributed to %s, expected %s", quoteDID(entry.DID), quoteDID(logDID))}
 		}
 
 		sig, err := base64.StdEncoding.DecodeString(entry.Sig)
@@ -158,7 +200,8 @@ func VerifyFile(path, expectedDID string) (*VerifyReport, error) {
 				fmt.Sprintf("prev_hash matches no line in this file — the entry between lines %d and %d was deleted or altered", i, lineNo)}
 		}
 		prevHash = lineHash[i]
+		parsed = append(parsed, entry)
 	}
 
-	return &VerifyReport{Entries: len(lines), DID: logDID}, nil
+	return &VerifyReport{Entries: len(lines), DID: logDID, Parsed: parsed}, nil
 }

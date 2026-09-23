@@ -110,12 +110,12 @@ func (w *WebhookApprover) DecideWithReason(ctx context.Context, req Request) Out
 		// but a digest we cannot compute is a request we cannot build, and
 		// that must deny, not panic or silently skip verification.
 		w.warn("cannot compute subject_digest: %v", err)
-		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook"}
+		return Outcome{Decision: DecisionDenied, DecidedBy: humangate.DecidedByWebhook}
 	}
 
 	requestID := newRequestID()
 	now := time.Now().UTC()
-	body, err := json.Marshal(gateRequestWire{
+	wire := gateRequestWire{
 		RequestID:              requestID,
 		AgentName:              req.AgentName,
 		ToolCall:               toolCallWire{Name: req.Tool, Arguments: args},
@@ -125,10 +125,23 @@ func (w *WebhookApprover) DecideWithReason(ctx context.Context, req Request) Out
 		ApprovalTimeoutSeconds: req.TimeoutSeconds,
 		TimeoutAt:              now.Add(time.Duration(req.TimeoutSeconds) * time.Second),
 		OnTimeout:              req.OnTimeout,
-	})
+	}
+	body, err := json.Marshal(wire)
 	if err != nil {
 		w.warn("cannot build gate request: %v", err)
-		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook"}
+		return Outcome{Decision: DecisionDenied, DecidedBy: humangate.DecidedByWebhook}
+	}
+
+	// The audit record of the request (spec §9) is derived from the very
+	// struct that goes on the wire, field for field, so the log cannot come
+	// to describe a request different from the one sent. tool_call.arguments
+	// is the one field deliberately left behind — see RequestRecord.
+	record := humangate.RequestRecord{
+		RequestID:     wire.RequestID,
+		AgentName:     wire.AgentName,
+		ToolName:      wire.ToolCall.Name,
+		SubjectDigest: wire.SubjectDigest,
+		Timestamp:     wire.Timestamp,
 	}
 
 	decisionURL := strings.TrimSuffix(w.URL, "/") + "/" + requestID + "/decision"
@@ -155,12 +168,19 @@ func (w *WebhookApprover) DecideWithReason(ctx context.Context, req Request) Out
 		// has no decision yet, which polling discovers the same way a
 		// delivery failure does — no special case needed here.
 		if resp, ok := w.poll(ctx, decisionURL); ok {
-			return w.verify(requestID, subjectDigest, resp)
+			return w.verify(record, resp)
 		}
 
 		select {
 		case <-ctx.Done():
-			return Outcome{Decision: DecisionNone}
+			// Nobody answered. There is no signed statement to record, but
+			// the request itself is still worth recording: it is what lets
+			// a timed-out gate be correlated with the receiver's own log by
+			// request_id, which is otherwise minted here and lost here.
+			return Outcome{Decision: DecisionNone, Evidence: &humangate.RecordedDecision{
+				Request:        record,
+				ApproverPubkey: w.ApproverPubkey,
+			}}
 		case <-ticker.C:
 		}
 	}
@@ -170,28 +190,47 @@ func (w *WebhookApprover) DecideWithReason(ctx context.Context, req Request) Out
 // specific audit event the fail-closed table calls for. approved is never
 // true unless VerifyDecision says so.
 //
-// requestID is the id this gate actually minted, passed in rather than read
-// back off resp: the decision was fetched from a URL derived from it, but a
-// response body is free to say anything, and "the endpoint I asked" is not
-// the same guarantee as "the gate this answers." Only comparing against the
-// locally-held id binds the decision to this call.
-func (w *WebhookApprover) verify(requestID, subjectDigest string, resp humangate.DecisionResponse) Outcome {
-	approved, reason, err := humangate.VerifyDecision(w.ApproverPubkey, requestID, subjectDigest, resp)
+// req carries the id and digest this gate actually sent, passed in rather
+// than read back off resp: the decision was fetched from a URL derived from
+// the id, but a response body is free to say anything, and "the endpoint I
+// asked" is not the same guarantee as "the gate this answers." Only
+// comparing against the locally-held values binds the decision to this call.
+//
+// Every outcome below carries the decision as evidence, the denials
+// included: a decision that failed to verify is exactly the record an
+// investigation needs, and dropping it would leave gate_signature_invalid
+// asserting a forgery with nothing to show for it. The fields are bounded on
+// the way in by NewResponseRecord, which is what keeps an endpoint from
+// using a rejected decision to write whatever it likes into a signed log.
+func (w *WebhookApprover) verify(req humangate.RequestRecord, resp humangate.DecisionResponse) Outcome {
+	approved, reason, err := humangate.VerifyDecision(
+		w.ApproverPubkey, req.RequestID, req.SubjectDigest, resp)
+
+	record := humangate.NewResponseRecord(resp)
+	out := Outcome{
+		Decision:  DecisionDenied,
+		DecidedBy: humangate.DecidedByWebhook,
+		Evidence: &humangate.RecordedDecision{
+			Request:        req,
+			Response:       &record,
+			ApproverPubkey: w.ApproverPubkey,
+		},
+	}
+
 	switch {
 	case approved:
-		return Outcome{Decision: DecisionApproved, DecidedBy: "webhook"}
+		out.Decision = DecisionApproved
 	case reason == humangate.ReasonSignatureInvalid:
 		w.warn("decision signature did not verify: %v", err)
-		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook", Event: audit.EventGateSignatureInvalid}
+		out.Event = audit.EventGateSignatureInvalid
 	case reason == humangate.ReasonRequestIDMismatch:
 		w.warn("decision request_id did not match the request: %v", err)
-		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook", Event: audit.EventGateRequestIDMismatch}
+		out.Event = audit.EventGateRequestIDMismatch
 	case reason == humangate.ReasonDigestMismatch:
 		w.warn("decision subject_digest did not match the request: %v", err)
-		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook", Event: audit.EventGateDigestMismatch}
-	default:
-		return Outcome{Decision: DecisionDenied, DecidedBy: "webhook"}
+		out.Event = audit.EventGateDigestMismatch
 	}
+	return out
 }
 
 func (w *WebhookApprover) client() *http.Client {

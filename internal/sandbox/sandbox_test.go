@@ -80,8 +80,8 @@ func mustBuildSquidConfig(t *testing.T, runID string, hosts []string, httpPort, 
 func TestBuildSquidConfigOneACLLinePerHost(t *testing.T) {
 	config := mustBuildSquidConfig(t, "testrun07", []string{"api.openai.com", "arxiv.org"}, "3128", "/tmp/x.log", "", "", nil)
 	for _, want := range []string{
-		"acl allowed_hosts dstdomain api.openai.com\n",
-		"acl allowed_hosts dstdomain arxiv.org\n",
+		"acl allowed_hosts dstdomain -n api.openai.com\n",
+		"acl allowed_hosts dstdomain -n arxiv.org\n",
 	} {
 		if !strings.Contains(config, want) {
 			t.Errorf("config missing its own line %q:\n%s", want, config)
@@ -134,10 +134,11 @@ func TestBuildSquidConfigGateClause(t *testing.T) {
 		t.Errorf("config must scope the gate ACL to both gate ports:\n%s", config)
 	}
 
-	// A hostname gate host uses dstdomain.
+	// A hostname gate host uses dstdomain, with reverse lookups off like every
+	// other name ACL here.
 	config = mustBuildSquidConfig(t, "testrun04", []string{"api.openai.com"}, "3128", "/tmp/x.log", "", "gate.internal", []int{41234})
-	if !strings.Contains(config, "acl constle_gate_dst dstdomain gate.internal") {
-		t.Errorf("hostname gate host should use dstdomain:\n%s", config)
+	if !strings.Contains(config, "acl constle_gate_dst dstdomain -n gate.internal") {
+		t.Errorf("hostname gate host should use dstdomain -n:\n%s", config)
 	}
 
 	// No gates bound: no gate clause at all.

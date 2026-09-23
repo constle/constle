@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/constle/constle/internal/termsafe"
 	"github.com/constle/constle/internal/webhookkey"
 )
 
@@ -43,7 +44,7 @@ func cmdWebhookKeygen(name string) error {
 
 	printf("\n✓ webhook signing key created: %q\n\n", name)
 	printf("  did:       %s\n", kp.DID())
-	printf("  key file:  %s (mode 0600 — never leaves this machine)\n", webhookkey.Dir(name))
+	printf("  key file:  %s (mode 0600 — never leaves this machine)\n", termsafe.Line(webhookkey.Dir(name)))
 	printf("\n")
 	printf("  this key is NOT an agent identity — it authenticates the human\n")
 	printf("  approving gated calls, not the agent making them.\n")

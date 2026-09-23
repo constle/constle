@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/constle/constle/internal/identity"
 	"github.com/constle/constle/internal/mcpgate"
 	"github.com/constle/constle/internal/sandbox"
+	"github.com/constle/constle/internal/termsafe"
 	"github.com/constle/constle/pkg/manifest"
 )
 
@@ -74,9 +76,8 @@ func auditLog(logger *audit.Logger, runID, agentName string, event audit.EventTy
 // the failure goes to stderr.
 func killAgent(backend sandbox.SandboxBackend, runCtx *sandbox.RunContext, reason string) {
 	if err := backend.Kill(runCtx); err != nil {
-		fmt.Fprintf(os.Stderr,
-			"  warning: %s: could not stop the agent: %v\n"+
-				"           the sandbox may still be running — check `constle ps`\n", reason, err)
+		errf("  warning: %s: could not stop the agent: %v\n"+
+			"           the sandbox may still be running — check `constle ps`\n", reason, err)
 	}
 }
 
@@ -142,13 +143,13 @@ func main() {
 
 	case "audit":
 		if len(args) < 2 || args[1] != "verify" {
-			die("usage: constle audit verify [--did=<did:key:…>] <logfile>")
+			die("%s", auditVerifyUsage)
 		}
-		logPath, expectedDID, err := parseAuditVerifyArgs(args[2:])
+		verifyArgs, err := parseAuditVerifyArgs(args[2:])
 		if err != nil {
 			die("%v", err)
 		}
-		if err := cmdAuditVerify(logPath, expectedDID); err != nil {
+		if err := cmdAuditVerify(verifyArgs); err != nil {
 			die("%v", err)
 		}
 
@@ -275,11 +276,26 @@ func isolationOrigin(m *manifest.AgentManifest) string {
 // explicit operator downgrade, which the entry then names outright. A reader
 // of the log can therefore never mistake a requested boundary for an
 // enforced one.
+//
+// credentials_granted records which host variables this run handed the agent.
+// NAMES ONLY — never values, and never a digest of a value either: a hash of a
+// low-entropy secret is broken offline, and no audit requirement in
+// spec/agent-manifest.md asks for one. The list is the manifest's declaration
+// order, which is deterministic for a given Agentfile; ranging over the
+// resolved map instead would reorder a JSON array that is part of the signed
+// bytes of the entry, so two runs of one Agentfile would produce two different
+// signatures.
+//
+// The key is present even when the list is empty, so "this agent was granted
+// nothing" is a recorded fact rather than the absence of one. An entry with no
+// such key is a run from before this was enforced, and those are exactly the
+// runs where every key the operator had reached every agent.
 func runStartedDetails(m *manifest.AgentManifest, sel *sandbox.Selection) map[string]any {
 	details := map[string]any{
-		"backend":            string(sel.Type),
-		"image":              m.Sandbox.Image,
-		"isolation_achieved": string(sel.Achieved),
+		"backend":             string(sel.Type),
+		"image":               m.Sandbox.Image,
+		"isolation_achieved":  string(sel.Achieved),
+		"credentials_granted": m.CredentialNames(),
 	}
 	if sel.Downgraded {
 		details["isolation_downgrade_accepted"] = true
@@ -393,7 +409,7 @@ func cmdRun(opts runOptions) error {
 		// cost the run entries (a full disk surfaces at close as often as at
 		// write), so it is reported rather than dropped.
 		if err := logger.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: could not close the audit log %s: %v\n", logPath, err)
+			errf("  warning: could not close the audit log %s: %v\n", logPath, err)
 		}
 	}()
 
@@ -441,11 +457,16 @@ func cmdRun(opts runOptions) error {
 					Out:            lockedStdout{},
 				},
 			}}
-		case wn == nil && m.HumanGates.ApproverPubkey != "":
+		case wn == nil && m.HumanGates.ApproverPubkey != "" && m.HumanGates.GatesArmed():
 			// Declared but unusable: approver_pubkey names a verifier with
 			// nothing to verify, because no notify webhook URL resolved.
 			// Same principle as warnUnenforcedHumanGates — a declared
 			// protection must never look real when it isn't.
+			//
+			// Gated by GatesArmed for that same reason in the other
+			// direction: with the master switch off nothing is ever decided
+			// at this terminal either, and promising that it would be is the
+			// false assurance rather than a warning about one.
 			printf("⚠️  warning: human_gates.approver_pubkey is set but no notify " +
 				"webhook URL resolved — gated calls will only be decided at this terminal\n")
 		}
@@ -534,7 +555,7 @@ func cmdRun(opts runOptions) error {
 			// and recording what it contained as audit events. Either way
 			// the run's network activity is not fully in the audit log.
 			nlSpin.stopClear()
-			fmt.Fprintf(os.Stderr, "  warning: network events were not fully logged: %v\n", flushErr)
+			errf("  warning: network events were not fully logged: %v\n", flushErr)
 		} else if styled && runSucceeded {
 			nlSpin.stopClear()
 		} else {
@@ -547,7 +568,7 @@ func cmdRun(opts runOptions) error {
 		cuSpin := startSpinner("cleaning up sandbox...")
 		if err := backend.Stop(runCtx); err != nil {
 			cuSpin.stopClear()
-			fmt.Fprintf(os.Stderr, "  warning: cleanup error: %v\n", err)
+			errf("  warning: cleanup error: %v\n", err)
 		} else if styled && runSucceeded {
 			cuSpin.stopClear()
 		} else {
@@ -681,26 +702,11 @@ func cmdRun(opts runOptions) error {
 
 	exitCode, waitErr := backend.Wait(runCtx)
 
-	var agentLines []string
-	if logs, logsErr := backend.Logs(runCtx); logsErr == nil && len(logs) > 0 {
-		for _, line := range strings.Split(strings.TrimSpace(string(logs)), "\n") {
-			if line != "" {
-				if styled {
-					agentLines = append(agentLines, line)
-				} else {
-					printf("  │ %s\n", line)
-				}
-			}
-		}
+	logs, logsErr := backend.Logs(runCtx)
+	if logsErr != nil {
+		logs = nil
 	}
-
-	if styled {
-		printf("\n")
-		renderAgentOutput("agent output", agentLines)
-		printf("\n")
-	} else {
-		printf("  └─────────────────────────────────────────\n\n")
-	}
+	printAgentOutput(logs)
 
 	duration := time.Since(startTime).Round(time.Millisecond)
 
@@ -835,8 +841,10 @@ func cmdRun(opts runOptions) error {
 // argument is emitted verbatim, so captured output stays byte-identical.
 func finalStatus(kind statusKind, plain, label, meta, auditPath, runID string, dur time.Duration) {
 	if !styled {
-		printf("%s\n", plain)
-		printf("  audit log: %s\n\n", auditPath)
+		printf("%s\n", termsafe.Line(plain))
+		// The audit log's filename is "<identity.name>-<date>.jsonl", so this
+		// path carries an Agentfile field on every run outcome.
+		printf("  audit log: %s\n\n", termsafe.Line(auditPath))
 		return
 	}
 	initStyles()
@@ -846,7 +854,7 @@ func finalStatus(kind statusKind, plain, label, meta, auditPath, runID string, d
 	}
 	printf("%s\n", line)
 
-	foot := []string{"audit " + prettyPath(auditPath)}
+	foot := []string{"audit " + termsafe.Line(prettyPath(auditPath))}
 	if runID != "" {
 		foot = append(foot, "run "+shortID(runID))
 	}
@@ -889,8 +897,59 @@ func a2aNames(m *manifest.AgentManifest) []string {
 	return names
 }
 
+// printAgentOutput renders the sandbox's own stdout and stderr — the only
+// place in this package that holds bytes the agent wrote.
+//
+// termsafe.Lines both splits and escapes, and the splitting is half the fix.
+// Breaking on "\n" alone left a lone carriage return inside a line, where it
+// returns the cursor to column zero and overwrites whatever is already
+// there: the "  │ " gutter and the "▎" spine are drawn before each line's
+// content, so an agent could erase its own framing and print lines that read
+// as constle speaking, or scroll the run summary away before the outcome
+// lands.
+//
+// Escaping is unconditional rather than gated on `styled`. A pipe is not
+// protection — `constle run … | less -R` hands the same bytes to a renderer
+// that acts on them — and because termsafe.Line returns benign text
+// unchanged, the plain path stays byte-for-byte what it has always been for
+// every agent that is not attacking the operator.
+//
+// There is deliberately no volume cap here, unlike the human gate's prompt.
+// That cap exists because a decision hangs on the operator having read the
+// whole thing; this output carries no decision, and truncating an agent's
+// own output would break the ordinary use of the command.
+func printAgentOutput(logs []byte) {
+	var agentLines []string
+	for _, line := range termsafe.Lines(logs) {
+		// Empty AFTER escaping, so a line that looked blank because it held
+		// only control bytes is not suppressed: those come back as visible
+		// \uNNNN text, which TrimSpace does not remove.
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if styled {
+			agentLines = append(agentLines, line)
+		} else {
+			printf("  │ %s\n", line)
+		}
+	}
+
+	if styled {
+		printf("\n")
+		renderAgentOutput("agent output", agentLines)
+		printf("\n")
+	} else {
+		printf("  └─────────────────────────────────────────\n\n")
+	}
+}
+
 // printRunSummaryPlain is the non-TTY run-summary block. It reproduces the
 // exact bytes constle has always emitted — do not restyle this path.
+//
+// The credentials row is a deliberate addition rather than drift: it states what
+// the run will hand the agent, and it prints even when that is nothing, because
+// "nothing" is what changed about this runtime (see credentialsSummary). Its
+// label is wider than the column, like max_duration below it.
 //
 // The one deliberate exception is the "(requested)" qualifier on the isolation
 // row: this block is printed before backend selection, so the level it shows
@@ -898,13 +957,15 @@ func a2aNames(m *manifest.AgentManifest) []string {
 // Leaving it unqualified let a bare "isolation: kernel" read as an achieved
 // boundary. The achieved level is reported separately once it is known.
 func printRunSummaryPlain(m *manifest.AgentManifest) {
-	printf("     agent:     %s v%s\n", m.Identity.Name, m.Identity.Version)
+	printf("     agent:     %s v%s\n", termsafe.Line(m.Identity.Name), termsafe.Line(m.Identity.Version))
 	printf("     isolation: %s (requested)\n", m.Sandbox.Isolation)
 	printf("     memory:    %dMB\n", m.Sandbox.MemoryMB)
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		printf("     network:   restricted → %s\n",
 			strings.Join(m.Sandbox.Network.AllowedHosts, ", "))
 	}
+	// Always printed, including the empty case — see credentialsSummary.
+	printf("     credentials: %s\n", credentialsSummary(m))
 	if m.Limits.MaxDurationSeconds > 0 {
 		printf("     max_duration: %ds\n", m.Limits.MaxDurationSeconds)
 	}
@@ -953,6 +1014,7 @@ func renderRunSummary(m *manifest.AgentManifest) {
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		rows = append(rows, kv{"network", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", ")) + stMuted.Render("  ∙  restricted")})
 	}
+	rows = append(rows, kv{"credentials", credentialsSummaryStyled(m)})
 	if m.Limits.MaxDurationSeconds > 0 {
 		rows = append(rows, kv{"timeout", stInk.Render(fmt.Sprintf("%ds", m.Limits.MaxDurationSeconds))})
 	}
@@ -994,38 +1056,62 @@ func cmdValidate(agentfilePath string) error {
 	warnUnenforcedHumanGates(m)
 	warnUnenforcedSpending(m)
 	warnUnverifiableIdentity(m)
+	warnUnresolvableCredentials(m)
 	return nil
 }
 
 // printValidatePlain is the non-TTY validate output — exact bytes, unchanged.
 func printValidatePlain(agentfilePath string, m *manifest.AgentManifest) {
-	printf("✓ %s is valid\n\n", agentfilePath)
-	printf("  name:        %s\n", m.Identity.Name)
-	printf("  version:     %s\n", m.Identity.Version)
+	// identity.name, identity.version and sandbox.image are the Agentfile's
+	// free-form fields: name is checked only for path separators, image only
+	// for a leading "-", version not at all. did is charset-checked by
+	// did.Validate and isolation is one of four constants, so neither needs
+	// escaping — they are escaped anyway, because a reader should not have to
+	// know which is which to see that this block is safe.
+	printf("✓ %s is valid\n\n", termsafe.Line(agentfilePath))
+	printf("  name:        %s\n", termsafe.Line(m.Identity.Name))
+	printf("  version:     %s\n", termsafe.Line(m.Identity.Version))
 	if m.Identity.DID != "" {
-		printf("  did:         %s\n", m.Identity.DID)
+		printf("  did:         %s\n", termsafe.Line(m.Identity.DID))
 	}
 	printf("  isolation:   %s (%s)\n", m.Sandbox.Isolation, isolationOrigin(m))
-	printf("  image:       %s\n", m.Sandbox.Image)
+	printf("  image:       %s\n", termsafe.Line(m.Sandbox.Image))
 	printf("  memory:      %dMB\n", m.Sandbox.MemoryMB)
 
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		printf("  allowed:     %s\n",
 			strings.Join(m.Sandbox.Network.AllowedHosts, ", "))
 	}
+	printf("  credentials: %s\n", credentialsSummary(m))
 
 	gates := manifest.InferRequiredGates(m.Capabilities)
 	if len(gates) > 0 {
-		// Careful wording: capability-derived gates are spec-level advice;
-		// enforcement happens on MCP tool calls whose names exactly match
-		// require_approval_for entries.
-		printf("  human gates: %s (approval required by spec — enforced for matching MCP tools)\n",
+		// Capability-derived gates are spec-level advice and nothing else:
+		// declaring send_email under capabilities gates no call on its own
+		// (spec §8). This row therefore makes no claim about enforcement.
+		//
+		// It used to end "— enforced for matching MCP tools", which was true
+		// only when the same name also appeared in require_approval_for AND
+		// matched a declared tool AND the master switch was on. With an empty
+		// require_approval_for the proxy gates nothing and the row still said
+		// enforced. Every enforcement claim now comes from one place: the
+		// "enforced" row below, via EnforcedGateEntries.
+		//
+		// That is not the identical set the proxy arms. EnforcedGateEntries
+		// additionally drops entries no declared server could ever serve,
+		// which the proxy keeps in g.gated so its case-fold near-miss refusal
+		// still covers them. The two agree on what actually gets gated,
+		// because such a call is rejected by the server's own tools allowlist
+		// first; they differ only in that the CLI must not call an
+		// unreachable entry enforced. What is single-sourced is the master
+		// switch itself, through GatesArmed.
+		printf("  human gates: %s (approval required by spec)\n",
 			strings.Join(gates, ", "))
 	}
 
 	if enforced, _ := m.EnforcedGateEntries(); len(enforced) > 0 {
 		printf("  enforced:    %s (paused at the MCP gate proxy for approval)\n",
-			strings.Join(enforced, ", "))
+			termsafe.Line(strings.Join(enforced, ", ")))
 	}
 
 	printf("\n")
@@ -1036,27 +1122,31 @@ func printValidatePlain(agentfilePath string, m *manifest.AgentManifest) {
 func renderValidateStyled(agentfilePath string, m *manifest.AgentManifest) {
 	initStyles()
 	printf("\n%s%s %s%s\n\n", indent, stGreen.Render("✓"),
-		stInk.Render(prettyPath(agentfilePath)), stMuted.Render(" is valid"))
+		stInk.Render(termsafe.Line(prettyPath(agentfilePath))), stMuted.Render(" is valid"))
 	subjectLine(m.Identity.Name, m.Identity.Version)
 
 	var rows []kv
 	if m.Identity.DID != "" {
-		rows = append(rows, kv{"did", stInk.Render(m.Identity.DID)})
+		rows = append(rows, kv{"did", stInk.Render(termsafe.Line(m.Identity.DID))})
 	}
 	rows = append(rows,
 		kv{"isolation", stInk.Render(string(m.Sandbox.Isolation)) +
 			stMuted.Render("  ∙  "+isolationOrigin(m))},
-		kv{"image", stInk.Render(m.Sandbox.Image)},
+		kv{"image", stInk.Render(termsafe.Line(m.Sandbox.Image))},
 		kv{"memory", stInk.Render(fmt.Sprintf("%d MB", m.Sandbox.MemoryMB))},
 	)
 	if len(m.Sandbox.Network.AllowedHosts) > 0 {
 		rows = append(rows, kv{"allowed", stInk.Render(strings.Join(m.Sandbox.Network.AllowedHosts, ", "))})
 	}
+	rows = append(rows, kv{"credentials", credentialsSummaryStyled(m)})
 	if gates := manifest.InferRequiredGates(m.Capabilities); len(gates) > 0 {
-		rows = append(rows, kv{"human gates", stInk.Render(strings.Join(gates, ", ")) + stMuted.Render("  ∙  by spec")})
+		// Advice only — see printValidatePlain. "by spec" is the whole claim.
+		rows = append(rows, kv{"human gates",
+			stInk.Render(strings.Join(gates, ", ")) + stMuted.Render("  ∙  by spec")})
 	}
 	if enforced, _ := m.EnforcedGateEntries(); len(enforced) > 0 {
-		rows = append(rows, kv{"enforced", stInk.Render(strings.Join(enforced, ", ")) + stMuted.Render("  ∙  at gate")})
+		rows = append(rows, kv{"enforced",
+			stInk.Render(termsafe.Line(strings.Join(enforced, ", "))) + stMuted.Render("  ∙  at gate")})
 	}
 	renderSummaryRows(rows)
 	printf("\n")
@@ -1085,8 +1175,12 @@ usage:
     --owner=<email>             bind the identity to an owner
   constle identity show <name>  show an agent's DID and key location
   constle webhook-keygen <name>  generate a human-gates webhook approver keypair (did:key)
-  constle audit verify <logfile>  verify a signed audit log (signatures + hash chain)
+  constle audit verify <logfile>  verify a signed audit log (signatures + hash chain),
+                                and re-verify the human-gate decisions it records
+    --agentfile=<path>          take both pins below from an Agentfile
     --did=<did:key:…>           pin the identity the log must be signed with
+    --approver-pubkey=<did:key:…>  pin the human_gates.approver_pubkey that the
+                                log's recorded gate decisions must verify against
   constle ps                    list running and recent agents
   constle stop <run_id>         stop a running agent by run ID
   constle version               show version
@@ -1102,8 +1196,13 @@ docs: https://constle.dev
 `, constleVersion)
 }
 
+// printStep and printOK compose their line before styling it, which makes
+// that composed string the right place to escape: a2a.listen, an Agentfile
+// path, a DID and an audit-log filename carrying identity.name all arrive
+// here as %s. Escaping after composition also keeps a value from ending its
+// line, since termsafe.Line has no newline to honour.
 func printStep(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := termsafe.Line(fmt.Sprintf(format, args...))
 	if !styled {
 		printf("  → %s\n", msg)
 		return
@@ -1113,7 +1212,7 @@ func printStep(format string, args ...any) {
 }
 
 func printOK(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
+	msg := termsafe.Line(fmt.Sprintf(format, args...))
 	if !styled {
 		printf("  ✓ %s\n", msg)
 		return
@@ -1122,7 +1221,34 @@ func printOK(format string, args ...any) {
 	printf("%s%s %s\n", indent, stGreen.Render("✓"), stInk.Render(msg))
 }
 
+// errf is the single path for operator-facing text on stderr, and this
+// package's terminal-integrity chokepoint for it.
+//
+// stderr is never styled here — style.go's `styled` gate is a property of
+// stdout, and the palette deliberately has no foreground error colour — so
+// there is no escape sequence on this stream that constle itself wrote, and
+// everything termsafe.Block strips is something constle did not write.
+// What reaches here is exactly the untrusted material: an agent's console
+// tail quoted by a Firecracker startup failure, a docker or nft stderr
+// spliced in by cmdError, a DID out of an audit log that came from
+// somewhere else.
+//
+// Block and not Args: nearly every caller is die("%v", err), where the error
+// IS the message and its newlines are constle's own — validation errors and
+// usage text are composed across lines on purpose, and escaping those would
+// turn readable output into one long line. The trade is stated rather than
+// hidden: an untrusted value that reaches stderr carrying a newline can add
+// a line to an error message. It cannot move the cursor, colour anything,
+// erase what is above it, or query the terminal, and nothing on this stream
+// is answered by the operator — stderr carries no prompt and no decision.
+// Line forgery is held at the other end instead, where the value enters the
+// error: those sites quote with %q, and internal/audit's verifier bounds and
+// quotes the one field that did not.
+func errf(format string, args ...any) {
+	_, _ = io.WriteString(os.Stderr, termsafe.Block(fmt.Sprintf(format, args...)))
+}
+
 func die(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "\nerror: "+format+"\n\n", args...)
+	errf("\nerror: "+format+"\n\n", args...)
 	os.Exit(1)
 }

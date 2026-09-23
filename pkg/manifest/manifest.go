@@ -89,6 +89,7 @@ type AgentManifest struct {
 	Identity     Identity     `yaml:"identity"`
 	Sandbox      Sandbox      `yaml:"sandbox"`
 	Capabilities []Capability `yaml:"capabilities"`
+	Credentials  []Credential `yaml:"credentials,omitempty"`
 	MCP          MCP          `yaml:"mcp"`
 	A2A          A2A          `yaml:"a2a"`
 	Spending     Spending     `yaml:"spending"`
@@ -157,6 +158,65 @@ type Network struct {
 	// allowlist, so Validate rejects anything the hostname grammar does not
 	// admit (see ValidateAllowedHost).
 	AllowedHosts []string `yaml:"allowed_hosts,omitempty"`
+}
+
+// Credential declares one host environment variable the sandbox receives.
+//
+// It is the complete list of what crosses the boundary from the OPERATOR's
+// machine: no host variable reaches a sandbox unless it is declared here. An
+// Agentfile that declares none gets none — the operator's keys are not ambient.
+//
+// The sandbox's environment also holds the variables constle builds for the run
+// (the proxy address and the CONSTLE_* gate and guest-network variables), the
+// image's own ENV, and the few a container runtime supplies itself. Those are
+// properties of the run, the image and the runtime rather than of the operator's
+// environment, and this section does not govern them.
+//
+// "Credential" names the motivating case rather than the mechanism: the
+// section also carries non-secret operator input such as a task prompt.
+// Everything declared here is handled as a secret regardless — never printed,
+// and recorded in the audit log by name only.
+type Credential struct {
+	// Name is the variable's name INSIDE the sandbox.
+	//
+	// Two constraints, and neither is cosmetic. It must be a legal
+	// environment-variable name (ValidateCredentialName): the Docker backend
+	// passes it as `docker run -e NAME`, where a name containing "=" would
+	// carry a value into a world-readable argv, and the Firecracker backend
+	// writes it into a shell `export NAME='value'` line in the guest's env
+	// file, where a quote or a newline injects a second statement. And it must
+	// not name something constle builds for the run, which would let an
+	// Agentfile overwrite its own sandbox's proxy or gate address.
+	Name string `yaml:"name"`
+
+	// SecretRef names the HOST environment variable holding the value.
+	// Defaults to Name when omitted — see Source.
+	//
+	// The indirection is what makes the scoping per-agent rather than
+	// per-name: two agents can both read ANTHROPIC_API_KEY inside their
+	// sandboxes while resolving it from ANTHROPIC_API_KEY_PROD and
+	// ANTHROPIC_API_KEY_DEV on the host. Same pattern as
+	// human_gates.notify[].url_secret_ref — the value is referenced, never
+	// embedded in the Agentfile.
+	//
+	// Unlike Name, this is not held to the reserved-name list: it names a
+	// variable in the operator's own environment, and refusing spellings
+	// there would reject legitimate host layouts.
+	SecretRef string `yaml:"secret_ref,omitempty"`
+}
+
+// Source returns the host variable this credential resolves from.
+//
+// Every caller must go through this rather than reading SecretRef: the empty
+// SecretRef means "same name on the host", and a caller that read the field
+// directly would look up "" and find nothing — a declared credential silently
+// absent from the sandbox, which is the failure this whole section exists to
+// prevent.
+func (c Credential) Source() string {
+	if c.SecretRef != "" {
+		return c.SecretRef
+	}
+	return c.Name
 }
 
 // MCP declares the Model Context Protocol servers the agent may call.
@@ -342,6 +402,20 @@ type HumanGates struct {
 	// fails otherwise (fail closed — a gate with no way to verify who
 	// approved it is not a gate).
 	ApproverPubkey string `yaml:"approver_pubkey,omitempty"`
+}
+
+// GatesArmed reports whether human gates are enforced for this manifest at
+// all — the master switch of spec/agent-manifest.md §14.1. When Enabled is
+// false, no gating occurs even if RequireApprovalFor lists entries.
+//
+// It is the single definition of "gates are on". The gate proxy arms its
+// gated-tool set behind it (internal/mcpgate.New) and the CLI reports
+// enforcement behind it (AgentManifest.EnforcedGateEntries), so the two can
+// never drift into disagreeing about whether a declared gate is real — the
+// drift that let `constle validate` print an entry as enforced while the
+// proxy forwarded every call to it ungated.
+func (g HumanGates) GatesArmed() bool {
+	return g.Enabled
 }
 
 // NotifyChannel is one notification target for gate events.

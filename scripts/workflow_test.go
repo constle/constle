@@ -18,6 +18,7 @@ package scripts_test
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -275,5 +276,60 @@ func TestReleaseWorkflowVerifiesItsOwnSignature(t *testing.T) {
 		if !strings.Contains(verifyScript, want) {
 			t.Errorf("the self-verification step does not use %q, so it is not verifying what the installers verify", want)
 		}
+	}
+}
+
+// TestNoSourceFileIsGitIgnored is the backstop for a failure that is invisible
+// from inside the working tree.
+//
+// .gitignore carries a `credentials/` rule under "Secrets & credentials", to
+// keep an operator's credential directory out of the repository. It also matches
+// a source directory of that name at any depth, and it silently swallowed a Go
+// package added at internal/credentials/: `git add -A` skipped it without a
+// word, the commit did not contain the package, and nothing local noticed —
+// `go build`, `go vet` and the entire test suite read the working tree, not the
+// commit. It took an independent reviewer working from a clone to see that HEAD
+// did not compile.
+//
+// Any ignore rule can do this to any source file. So rather than pin the one
+// rule that did, this asks git the general question: is there a file that makes
+// up this project which a commit would leave behind?
+func TestNoSourceFileIsGitIgnored(t *testing.T) {
+	repo := ".."
+
+	// git's own answer, for the files that constitute the project. Listing
+	// candidates with `find` and asking `check-ignore` about each would be the
+	// same query asked less reliably: this form reports exactly what `git add`
+	// would skip, which is the thing that went wrong.
+	// Scoped to what the build and the published spec are made of. A blanket
+	// scan over every *.md would be worse than useless here: .git/info/exclude
+	// is how the maintainer keeps private working documents out of a public
+	// repository, and a check that failed on those would be turned off.
+	cmd := exec.Command("git", "ls-files", "--others", "--ignored", "--exclude-standard",
+		"--", "*.go", "go.mod", "go.sum", "scripts/*", "spec/*", "examples/*", "cmd/*", "pkg/*", "internal/*")
+	cmd.Dir = repo
+	out, err := cmd.Output()
+	if err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+
+	var swallowed []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		// dist/ is release output and legitimately ignored.
+		if strings.HasPrefix(line, "dist/") {
+			continue
+		}
+		swallowed = append(swallowed, line)
+	}
+
+	if len(swallowed) > 0 {
+		t.Errorf("these source files are gitignored, so a commit silently leaves them out "+
+			"while the working tree keeps building and testing green:\n  %s\n"+
+			"check `git check-ignore -v <path>` for the rule, and move the file rather than "+
+			"negating the rule if the rule is a secrets guard",
+			strings.Join(swallowed, "\n  "))
 	}
 }

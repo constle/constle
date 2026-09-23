@@ -1,11 +1,13 @@
 # Human Gates Webhook — External Decision Channel
 
 **Status:** Draft
-**Spec version:** 0.3.0 (adds §4.1 delivery mechanism and implements §5 canonicalization)
-**Last updated:** 2026-09-04
+**Spec version:** 0.4.0 (§9 now describes a decision record the runtime actually writes and can re-verify)
+**Last updated:** 2026-09-21
 
 ## Changelog
 
+- **0.4.0** (2026-09-21): §9 rewritten. Every version up to 0.3.0 promised that the signed decision was persisted and re-verifiable offline, and the runtime persisted none of it — `gate_approved` recorded that something had been approved and nothing that showed the approver had approved it. The decision is now written as its signed fields rather than as the raw response body (equivalent for a §6 signature, which covers a derived string, and bounded where the body is not); the recorded request deliberately omits `tool_call.arguments`; the `approver_pubkey` actually verified against is recorded alongside; and `constle audit verify --agentfile=<path>` (or `--approver-pubkey=<did:key:…>`) re-verifies the result. §9 also states which fields the 256-byte bound actually covers and that only approvals are required to carry proof, and §10 records the relabelling limitation that excluding the arguments leaves open.
+- **0.3.1** (2026-09-21): Documentation accuracy only — no change to the wire format, the verification steps, or any runtime behaviour. §8 previously read as an unconditional "fail closed, always". It is now split into what holds unconditionally (§8.1: a decision that arrives is verified and can only deny), what is operator policy rather than a guarantee (§8.2: a gate that receives *no* decision is resolved by `human_gates.on_timeout`, which may legally be `proceed`), and what this channel does not cover at all (§8.3: a racing terminal prompt approves without signing). §4's timeout bullet and §4.1's poll table are corrected to match: a `200` whose body does not parse as a decision object continues polling rather than denying.
 - **0.3.0** (2026-09-04): Resolved the two questions 0.2.0 left open. §4.1 (new) specifies the delivery mechanism previously deferred as "out of scope for this revision": POST-once-then-poll against the same URL `human_gates.notify` already uses, with a derivable per-request decision endpoint. §5 canonicalization is now implemented (`internal/humangate.SubjectDigest`) rather than merely specified, with its two documented, deliberate deviations from strict RFC 8785 noted inline.
 - **0.2.0** (2026-09-04): Replaced HMAC-SHA256 symmetric signing with Ed25519 asymmetric signatures. Introduced a dedicated webhook signing keypair, decoupled from `internal/identity`'s per-agent DIDs. Public key now declared in the Agentfile as a `did:key` string. Fail-closed behavior for a missing or malformed key made explicit.
 - **0.1.0** (2026-08-28): Initial draft. HMAC-SHA256 signing (Stripe-style), subject-digest binding, signed-decision verbatim logging.
@@ -54,21 +56,24 @@ human_gates:
 ```
 
 - `subject_digest` is SHA-256 over the exact, canonical byte representation of `tool_call` (§5) — this is what the approver is actually signing off on, byte for byte.
-- No response within the configured timeout = denied (existing behavior, unchanged).
+- No response within the configured timeout is **not** a denial in itself. The gate has nothing to verify, so `human_gates.on_timeout` decides: `abort` (the default) refuses the call and stops the run, `proceed` forwards it unapproved. See §8.2.
 - Constle MAY include additional fields beyond the five above — `run_id`, `approval_timeout_seconds`, `timeout_at`, `on_timeout` — for a receiver's own bookkeeping (a countdown display, knowing when to give up holding a gate open). These carry no cryptographic weight: the signed statement in §6 is exactly `request_id + "." + decision + "." + subject_digest`, nothing else. A receiver MUST NOT require them; one that only implements the five fields above still works correctly end to end.
 
 ## 4.1 Delivery mechanism
 
-Constle POSTs the §4 request to the URL configured via `human_gates.notify` (`channel: webhook`, `url_secret_ref`) — the same URL that already receives gate-triggered notifications; there is no separate URL to configure for decisions. The receiver acknowledges with any `2xx` status. `request_id` is the idempotency key: a receiver MUST treat a repeated POST carrying the same `request_id` as a retry of the same gate, never as a new one.
+Constle POSTs the §4 request to the URL configured via `human_gates.notify` (`channel: webhook`, `url_secret_ref`) — the same URL that already receives gate-triggered notifications; there is no separate URL to configure for decisions. Where several `notify` entries resolve to several URLs, trigger notifications fan out to all of them but the decision channel is the **first** resolved URL only: one gate has one decision endpoint, and it is not the case that any declared receiver may answer. The receiver acknowledges with any `2xx` status. `request_id` is the idempotency key: a receiver MUST treat a repeated POST carrying the same `request_id` as a retry of the same gate, never as a new one.
 
 The decision is fetched by polling `GET <configured URL>/<request_id>/decision` — derivable from the configured URL and `request_id` alone, so a receiver that never saw the POST (or whose `2xx` response was lost in transit) still exposes a discoverable decision endpoint once it learns about the gate by whatever means. Poll responses:
 
 | Response | Meaning |
 |---|---|
-| `200` with a decision body (§6) | Decided. Constle verifies it per §7 and stops polling either way — an invalid decision denies the call (§8); it does not fall back to continued polling. |
+| `200` with a body that parses as a §6 decision object | Decided. Constle verifies it per §7 and stops polling either way — an invalid decision denies the call (§8.1); it does not fall back to continued polling. |
+| `200` with a body that does **not** parse as a decision object | **Not yet decided.** Parsing is what makes a response a decision at all, so a body Constle cannot decode is indistinguishable from "no answer yet" and polling continues. An endpoint that answers `200` with a permanently malformed body therefore resolves as a timeout (§8.2), not as a denial. A body that parses but is empty or unsigned — `{}`, `null`, a decision object with no `signature` — is a decision, and denies. |
 | anything else (`202`, `404`, `5xx`, connection failure, timeout, …) | Not yet decided. Constle retries the POST (if not yet acknowledged) and re-polls, on a fixed interval, until a decision arrives or the gate's timeout elapses. |
 
 A receiver MAY hold the GET open before answering, as a latency optimization — Constle neither requests nor requires this; it simply polls again on its own schedule regardless.
+
+**This endpoint is one input to a gate, not necessarily the only one.** When Constle is also running an interactive terminal prompt for the same gate, both channels are live simultaneously and the first to produce a decision wins; the loser's context is then canceled. Nothing in this spec makes the decision endpoint authoritative over a local operator, and §8.3 states what that costs.
 
 Every outbound request is bound by the gate's own `approval_timeout_seconds` deadline, computed once when the gate opens. No single request, retry, or poll extends a decision's validity past that deadline, and no response arriving after it is honored — unchanged from the existing timeout behavior.
 
@@ -116,6 +121,10 @@ Constle computes this once when building the request. The decision endpoint does
 
 ## 8. Fail-closed behavior
 
+The boundary is narrower than "fail closed, always," and stating it precisely matters more than stating it strongly: **a decision that arrives is fail-closed; the absence of a decision is resolved by operator policy.** Those are two different kinds of claim — one is a property of this protocol, the other is a configuration default — so they are separated below rather than summed into a single sentence that is only true under the default.
+
+### 8.1 A decision that arrives — unconditional
+
 | Condition | Result |
 |---|---|
 | `approver_pubkey` missing from Agentfile | `constle validate` fails — agent cannot run at all |
@@ -123,20 +132,56 @@ Constle computes this once when building the request. The decision endpoint does
 | Signature verification fails | denied, logged as `EventGateSignatureInvalid` |
 | `request_id` mismatch between request and response | denied, logged as `EventGateRequestIDMismatch` |
 | `subject_digest` mismatch between request and response | denied, logged as `EventGateDigestMismatch` |
-| Response timeout | denied (existing behavior, unchanged) |
 | `decision` missing, malformed, or anything other than `"approved"` | denied |
 
-There is no code path that treats an unverifiable or malformed decision as approved. A broken or misconfigured webhook fails toward blocking the agent, never toward letting it through.
+No configuration relaxes any row above: at an armed gate, nothing turns one of these into an approval. (The one thing that removes them is `human_gates.enabled: false`, which disarms every gate so that no call is ever held and no decision is ever solicited — the rows do not apply because there is no gate, not because they were softened. `constle validate` still requires a valid `approver_pubkey` in that state, and Constle warns at both validate and run time that the declared entries will run without approval.) Verification returns approved on exactly one path — signature, `request_id` and `subject_digest` all check out **and** `decision == "approved"` — and no code path treats an unverifiable or malformed decision as approval. A decision that fails any check denies the call at once and stops polling: it is never retried into a later poll that might answer differently.
+
+### 8.2 No decision at all — policy, not guarantee
+
+When the deadline passes and no channel has produced a decision, there is nothing to verify and §8.1 does not apply. `human_gates.on_timeout` decides, and both of its values are legal:
+
+| `on_timeout` | Result |
+|---|---|
+| `abort` (the default) | The call is refused and the run is terminated. Logged as `gate_timeout`. |
+| `proceed` | **The call is forwarded without approval.** Logged as `gate_timeout`. |
+
+Everything that yields no decision lands here, including cases that look like failures rather than like silence:
+
+- The decision endpoint is unreachable, or is reachable and never answers.
+- The endpoint answers `200` with a body that does not parse as a decision object (§4.1) — indistinguishable from "not yet".
+- `approver_pubkey` is declared but no `human_gates.notify` URL resolves, so no decision endpoint exists to poll. Constle warns at run time and continues with the terminal prompt as the only decision channel; it does not refuse to start.
+
+Under `on_timeout: abort` each of these blocks the call. Under `on_timeout: proceed` each of them forwards it. **A broken or misconfigured webhook therefore fails toward whatever `on_timeout` names** — toward blocking the agent on the default, toward letting the call through where an operator has chosen `proceed`. An agent running `proceed` has a gate that delays a consequential call rather than one that can block it, and that is a property of the deployment, not a defect in this channel.
+
+### 8.3 What this channel does not cover
+
+A terminal prompt racing this endpoint (§4.1) can approve a gated call on its own. That approval is an unsigned local operator action: it is not signed, not bound to `subject_digest`, and leaves no artifact anyone can re-verify offline. §8.1 constrains what *this channel* can be talked into approving. It does not constrain every route by which a gated call can be approved, and an audit log showing an approved gate does not by itself imply a signed decision was involved — `decided_by` on the `gate_approved` event is what distinguishes them.
 
 > **Naming note:** `internal/audit/logger.go` names its existing gate events `EventGateTriggered`, `EventGateApproved`, `EventGateDenied`, `EventGateTimeout` (string values `"gate_triggered"`, `"gate_approved"`, `"gate_denied"`, `"gate_timeout"`) — a `Gate` prefix, not `HumanGate`. The three new constants above follow that existing convention (`EventGateSignatureInvalid` / `"gate_signature_invalid"`, `EventGateRequestIDMismatch` / `"gate_request_id_mismatch"`, `EventGateDigestMismatch` / `"gate_digest_mismatch"`) rather than introducing a new `HumanGate` prefix alongside it.
 
 ## 9. Audit log
 
-The full response object — `signature` included — is written to the audit log verbatim, alongside the original request. Anyone holding the Agentfile's `approver_pubkey` can re-verify, offline, that a given decision was genuinely signed by the approver's key over that exact tool call.
+Every terminal event of a gate decided through this channel — `gate_approved`, `gate_denied`, and the three fail-closed events of §8.1 — carries the decision that produced it, alongside the identifying fields of the request it answers. A denial is the exception in both directions: two of them are reachable before a request exists at all — when the subject digest or the request body cannot be built — so a `gate_denied` may carry nothing, and verification does not require it to. It requires evidence only of `gate_approved`, because a denial needs no approver signature to justify having blocked a call. What has to be provable is a call that ran. A gate that timed out unanswered records the request alone, so it can still be correlated with the receiver's own records by `request_id`. Anyone holding the Agentfile's `approver_pubkey` can re-verify, offline, that a given decision was genuinely signed by the approver's key over that `subject_digest` — which is a weaker statement than "over that exact tool call", and deliberately so: the fourth limitation in §10 is that nothing in the log ties the digest back to the tool name the entry displays; `constle audit verify --approver-pubkey=<did:key:…> <logfile>` does exactly that.
+
+**"The full response object" means its fields, not its bytes.** The four signed fields and the one unsigned one are recorded as fields, not as the raw HTTP body they arrived in. The two are equivalent here, and only here: §6's signature covers the derived string `request_id + "." + decision + "." + subject_digest`, which a verifier reconstructs from the parsed fields and never from the body, so a record of the fields reproduces the signed payload exactly. The codebase's other two signed payloads sign their own wire bytes and genuinely do require them (see the note in §5); this one does not. Keeping the body instead would add nothing verifiable while copying an unbounded, endpoint-controlled blob into a signed, hash-chained log that is designed to travel.
+
+Each of the four **endpoint-supplied** fields is bounded at 256 bytes — far above any real value, since a `request_id`, a `subject_digest` and an Ed25519 signature all have fixed short lengths. The bound covers exactly what an untrusted endpoint chooses, because the records that matter most are the *rejected* decisions, whose contents it chose entirely. It does not cover the recorded request's `agent_name` and tool name, or `approver_pubkey`: those are operator configuration, validated at parse time, and are recorded as the manifest declares them. Across a run the evidence grows linearly with the number of gates — one record per gate, no per-run budget — as every other audit event does. A record that hit the bound is marked as truncated, and the verifier reports it as unverifiable rather than as a bad signature: those bytes were dropped by the runtime, not forged by the endpoint.
+
+`decided_at` is recorded but not attested. It falls outside the signed payload, so it is the endpoint's own claim about when it decided, and nothing verifies it.
+
+**The recorded request omits `tool_call.arguments`.** It carries `request_id`, `agent_name`, the tool name, `subject_digest` and the timestamp. Arguments routinely carry secrets and payloads, and the signature attests to the digest rather than to them, so excluding them costs nothing that the signature itself establishes. It is not free: it is exactly what leaves the digest unrelatable to the displayed tool name, which is the fourth limitation in §10. The trade is deliberate — a travelling log that cannot be made to leak an argument, against a verifier that cannot by itself say which call a signed digest was for. The digest is not a substitute for the secrecy of the arguments, and the record should not be read as though it were: `subject_digest` is an unsalted SHA-256 over the tool name and arguments, so over an enumerable argument space — a PIN, a boolean confirmation, an address from a known set — it is recoverable by brute force. §5 requires exactly that construction, so it cannot be salted without breaking the cross-side reproducibility it exists for. Treat it as a forensic handle rather than a confidentiality boundary, and assume anyone who can read the log can learn guessable arguments. (`internal/mcpgate`'s `runGate` states the same caveat at the point the digest is computed.)
+
+**The approver key in use is recorded too.** The paragraph above assumes a verifier who brings `approver_pubkey` from the Agentfile; recording it as well pins which key the runtime actually verified against, so a runtime that ran with a swapped approver key leaves a log that visibly disagrees with the Agentfile rather than one that verifies cleanly against the swap. Pinning the key at verification time is what acts on that difference — an unpinned check accepts whatever key the log names, which establishes the log's internal consistency and nothing about its trust anchor.
+
+**What this closes.** Verification compares the cryptography against the event the log claims, in both directions: a `gate_approved` that does not re-verify as approved is an approval the declared approver never gave, and a `gate_signature_invalid` that now verifies cleanly is a denial the log misattributes to the approver. An approval that was never signed can therefore no longer be recorded as though it had been, and an approval with no decision recorded at all fails however many other entries share that shape — an absence of proof is not excused by the absence being thorough.
+
+What it does not close is three things. A host that lies about what it is asking approval for lies before any of this is written (§10). A genuine decision can still be relabelled afterwards as answering a different call, because excluding the arguments leaves nothing to recompute the digest from (§10). And `decided_by` is narrower than it may look: every entry carrying a decision is verified whatever that field says, and the field decides only one question — whether an approval carrying NO decision is exempt. The single exempt value is `terminal`, because §8.3 states that a terminal approval signs nothing and leaves no artifact to re-verify. An approval with no decision and any other value, or none, fails: a provenance claim a forger can decline to make is not one worth reading.
 
 ## 10. Known limitations
 
 - **No rotation or revocation mechanism.** A compromised approver key stays valid until someone notices and edits the file.
 - **The webhook keypair is not part of `internal/identity`.** A future version may unify it with the agent DID system if a real need for cross-referencing emerges.
 - **Ed25519 removes host-side forgery, not host-side coercion.** The runtime host can still lie about what it's asking approval for before the digest is computed. This spec closes the "declared approval that was never real" gap; it doesn't make the host itself trustworthy by assumption.
+- **A recorded decision does not bind to the tool call the log names it for.** The signature covers `subject_digest`, and the digest commits to the tool name and the arguments together (§5) — but §9 excludes the arguments, so nothing reading the log offline can recompute it. Whoever writes the log can therefore present a genuine approval for one call as an approval for another, by rewriting the recorded tool name and the entry's own together. A verifier catches the half-done version of this — it requires the entry's own tool name and digest and the recorded request's to be present and equal, so deleting either side is itself a failure — and it cannot catch the consistent one. Recording the arguments is not the only way out of this, and §9's exclusion of them is not what makes it permanent: a future revision could have the approver sign the tool name as a field of its own, or sign a commitment to the name and a separate argument digest, either of which would bind the label without publishing the arguments. What is fixed is that the CURRENT signed fields cannot do it. The `request_id` recorded alongside is what settles such a case out of band: the approver's endpoint holds its own record of what it was shown for that id, and §4.1 makes `request_id` the idempotency key it files that under.
 - **Single approver per agent.** Multi-approver / M-of-N gating is not supported by this version.
+- **The signed-decision guarantee is not the gate's whole guarantee.** §8.1 holds unconditionally, but it covers only decisions that arrive through this channel. A gate can still be resolved without one: by `on_timeout` when nothing answers (§8.2), or by an unsigned terminal approval that wins the race (§8.3). Read §8 in full before treating "the approver's key" as the only thing standing in front of a gated call.

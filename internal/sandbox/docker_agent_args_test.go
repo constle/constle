@@ -44,7 +44,9 @@ func TestAgentRunArgsEndOptionsBeforeImage(t *testing.T) {
 				t.Errorf("image %q: option %s must precede \"--\" (found at %d, separator at %d)\ngot: %v", image, opt, i, sep, args)
 			}
 		}
-		if !hasOptionArg(args[:sep], "-e", "ANTHROPIC_API_KEY=sk-test") {
+		// By name only — the value reaches the client through its own
+		// environment, never the argv. See TestAgentRunArgsCarryNoSecretValues.
+		if !hasOptionArg(args[:sep], "-e", "ANTHROPIC_API_KEY") {
 			t.Errorf("image %q: forwarded env var is missing before \"--\"\ngot: %v", image, args)
 		}
 		for key, val := range labels {

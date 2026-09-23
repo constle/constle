@@ -1,8 +1,10 @@
 package manifest
 
 import (
+	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestInferIsolation(t *testing.T) {
@@ -490,6 +492,10 @@ func TestValidateMCP(t *testing.T) {
 		name    string
 		mutate  func(*AgentManifest)
 		wantErr bool
+		// wantErrContains, when set, requires the refusal to be the one the
+		// case is about. Without it a case that starts failing earlier, for
+		// an unrelated reason, still passes and stops testing anything.
+		wantErrContains string
 	}{
 		{
 			name:    "valid server",
@@ -568,6 +574,156 @@ func TestValidateMCP(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		// The bypass check compares an allowlist entry, which the grammar has
+		// already forced to one spelling, against a host taken from a URL,
+		// where several spellings of the same name are legal. Every one of
+		// these reaches the same server through Squid, which matches names
+		// case-insensitively, so every one of them has to be an overlap here.
+		{
+			name: "MCP host in allowed_hosts, declared in uppercase — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://API.EXAMPLE.COM/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "MCP host in allowed_hosts, declared in mixed case — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://Api.Example.Com/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "MCP host in allowed_hosts, declared fully qualified — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://api.example.com./mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "MCP host in allowed_hosts, both spellings at once — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://ApI.eXaMpLe.CoM./mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "subdomain wildcard covering an uppercase MCP host — gate bypass",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://MCP.EXAMPLE.COM/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{".example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		// Go's HTTP transport runs a URL host through IDNA before resolving
+		// it, so each of these is dialled as "api.example.com" while the
+		// allowlist grammar can spell none of them. The comparison cannot be
+		// made in two alphabets, so a non-ASCII host is refused outright and
+		// the operator is pointed at the punycode form.
+		{
+			name: "MCP host written with an ideographic full stop — uncomparable",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://api\u3002example.com/mcp" // ideographic full stop
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr: true,
+			// The refusal names the host this manifest would really have
+			// dialled, which is the allowlisted one.
+			wantErrContains: "resolves to, api.example.com",
+		},
+		{
+			name: "MCP host written with a fullwidth full stop — uncomparable",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://api\uff0eexample.com/mcp" // fullwidth full stop
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "non-ASCII host",
+		},
+		{
+			name: "MCP host written with fullwidth letters — uncomparable",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://\uff41pi.example.com/mcp" // fullwidth a
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "non-ASCII host",
+		},
+		{
+			name: "MCP host written with a Cyrillic homoglyph — uncomparable",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://\u0430pi.example.com/mcp" // Cyrillic a
+				m.Sandbox.Network.AllowedHosts = []string{"api.example.com"}
+			},
+			wantErr: true,
+			// And here it names a host that is visibly not the one the
+			// operator meant, which is the whole value of naming it.
+			wantErrContains: "resolves to, xn--pi-6kc.example.com",
+		},
+		{
+			name: "an internationalised MCP host in unicode is refused, with its ASCII form named",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://bücher.example/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "resolves to, xn--bcher-kva.example",
+		},
+		{
+			// The hint is computed on the normalised host, so the two
+			// spellings this commit already folds do not cost the operator
+			// the one piece of information the message exists to give.
+			name: "an internationalised MCP host, fully qualified and uppercase, still names its form",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://B\u00dcCHER.EXAMPLE./mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "resolves to, xn--bcher-kva.example",
+		},
+		{
+			name: "a non-ASCII host that maps to no usable name names none",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://\u200b.example/mcp" // zero-width space
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr:         true,
+			wantErrContains: "is not a usable name",
+		},
+		{
+			name: "an internationalised MCP host in punycode is comparable, and overlaps",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://xn--bcher-kva.example/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"xn--bcher-kva.example"}
+			},
+			wantErr:         true,
+			wantErrContains: "also appears in network.allowed_hosts",
+		},
+		{
+			name: "an internationalised MCP host in punycode, not allowlisted, is fine",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://xn--bcher-kva.example/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr: false,
+		},
+		{
+			name: "a different host in another case is still a different host",
+			mutate: func(m *AgentManifest) {
+				m.MCP.Servers[0].URL = "https://API.EXAMPLE.COM/mcp"
+				m.Sandbox.Network.AllowedHosts = []string{"api.openai.com"}
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -580,6 +736,9 @@ func TestValidateMCP(t *testing.T) {
 			}
 			if !tt.wantErr && err != nil {
 				t.Errorf("unexpected validation error: %v", err)
+			}
+			if tt.wantErrContains != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErrContains)) {
+				t.Errorf("error = %v, want one containing %q", err, tt.wantErrContains)
 			}
 		})
 	}
@@ -608,6 +767,100 @@ func TestValidateHumanGates(t *testing.T) {
 	m.HumanGates.ApprovalTimeoutSeconds = -5
 	if err := m.Validate(); err == nil {
 		t.Error("expected error for negative approval_timeout_seconds, got nil")
+	}
+}
+
+// TestValidateApprovalTimeoutIsRepresentable: the gate converts this field
+// with time.Duration(n) * time.Second, which wraps NEGATIVE above
+// maxSecondsField. A wrapped timeout makes the approval context expire the
+// moment it is created, so the gate never waits — and with on_timeout:
+// proceed it forwards the gated tool call with no human in the loop. Only
+// "> 0" was checked, so the whole range above the wrap point validated clean.
+func TestValidateApprovalTimeoutIsRepresentable(t *testing.T) {
+	for _, secs := range representableSeconds(
+		maxSecondsField+1, // the first value that stops meaning what it says
+		9223372037,        // converts to -9223372036709551616ns
+		18446744074,       // wraps all the way round to +290448384ns
+		math.MaxInt64/2,
+		math.MaxInt64,
+	) {
+		m := validManifestWithMCP()
+		m.HumanGates.ApprovalTimeoutSeconds = secs
+		m.HumanGates.OnTimeout = "proceed"
+		if err := m.Validate(); err == nil {
+			t.Errorf("approval_timeout_seconds=%d: want a validation error", secs)
+			continue
+		}
+		// And rejected for the right reason: the value must genuinely fail to
+		// survive the conversion. Checking only "converts negative" would be
+		// wrong — the product is modular, so far enough out it comes back
+		// round positive (18446744074 seconds becomes 290ms) and still has to
+		// be refused. The invariant is that the seconds do not round-trip.
+		if back := int64(time.Duration(secs)*time.Second) / int64(time.Second); back == int64(secs) {
+			t.Errorf("approval_timeout_seconds=%d round-trips cleanly to %d — rejected for the wrong reason", secs, back)
+		}
+	}
+
+	// The largest timeout this platform can express is still accepted, and
+	// still converts to a positive duration.
+	largest := largestValidSeconds()
+	m := validManifestWithMCP()
+	m.HumanGates.ApprovalTimeoutSeconds = largest
+	if err := m.Validate(); err != nil {
+		t.Errorf("the largest representable timeout (%d) must stay valid: %v", largest, err)
+	}
+	if d := time.Duration(largest) * time.Second; d <= 0 {
+		t.Errorf("%d does not convert to a positive duration: %v", largest, d)
+	}
+}
+
+// representableSeconds keeps only the values this platform's int can hold.
+// Both seconds fields are typed int, so on a 32-bit build nothing can exceed
+// maxSecondsField and the upper-bound branch is unreachable — there is no
+// value left to assert. Converting at run time rather than writing 64-bit
+// literals is also what lets this file compile on 386 at all: a constant that
+// overflows int is a compile error, and `go build ./...` never catches it
+// because it does not build test files.
+func representableSeconds(vs ...int64) []int {
+	var out []int
+	for _, v := range vs {
+		if c := int(v); int64(c) == v {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// largestValidSeconds is the biggest value these int fields accept here:
+// maxSecondsField on a 64-bit build, and the largest int on a 32-bit one,
+// which is below the bound and therefore always valid.
+func largestValidSeconds() int {
+	bound := maxSecondsField
+	largest := int(^uint(0) >> 1)
+	if int64(largest) > bound {
+		largest = int(bound)
+	}
+	return largest
+}
+
+// TestValidateLimits: max_duration_seconds was not validated at all. The
+// runtime arms its kill timer behind "> 0", so a negative value left the run
+// unbounded, and a value past the wrap point armed a timer that fires at once.
+func TestValidateLimits(t *testing.T) {
+	for _, secs := range representableSeconds(-1, -300, math.MinInt64, maxSecondsField+1, 9223372037, 18446744074, math.MaxInt64) {
+		m := validManifestWithMCP()
+		m.Limits.MaxDurationSeconds = secs
+		if err := m.Validate(); err == nil {
+			t.Errorf("max_duration_seconds=%d: want a validation error", secs)
+		}
+	}
+
+	for _, secs := range []int{0, 1, 300, largestValidSeconds()} {
+		m := validManifestWithMCP()
+		m.Limits.MaxDurationSeconds = secs
+		if err := m.Validate(); err != nil {
+			t.Errorf("max_duration_seconds=%d must stay valid: %v", secs, err)
+		}
 	}
 }
 
@@ -650,6 +903,10 @@ func TestValidateApproverPubkey(t *testing.T) {
 
 func TestEnforcedGateEntries(t *testing.T) {
 	m := validManifestWithMCP()
+	// The master switch is load-bearing here and is set deliberately: without
+	// it nothing is enforced whatever the tool mapping says, which is what
+	// TestEnforcedGateEntriesRespectsMasterSwitch covers.
+	m.HumanGates.Enabled = true
 	m.HumanGates.RequireApprovalFor = []string{"send_email", "payment"}
 
 	enforced, unenforced := m.EnforcedGateEntries()
@@ -672,6 +929,50 @@ func TestEnforcedGateEntries(t *testing.T) {
 	enforced, unenforced = m.EnforcedGateEntries()
 	if len(enforced) != 0 || len(unenforced) != 2 {
 		t.Errorf("with no servers: enforced = %v, unenforced = %v, want all unenforced", enforced, unenforced)
+	}
+}
+
+// TestEnforcedGateEntriesRespectsMasterSwitch pins the precedence between the
+// master switch and the tool mapping. human_gates.enabled: false disarms the
+// gate proxy outright (spec/agent-manifest.md §14.1), so an entry that matches
+// a declared tool perfectly is still not enforced — reporting it as enforced
+// is what made `constle validate` promise a pause the proxy never performed.
+func TestEnforcedGateEntriesRespectsMasterSwitch(t *testing.T) {
+	m := validManifestWithMCP()
+	m.HumanGates.Enabled = false
+	m.HumanGates.RequireApprovalFor = []string{"send_email"}
+
+	enforced, unenforced := m.EnforcedGateEntries()
+	if len(enforced) != 0 {
+		t.Errorf("enforced = %v, want none: the master switch is off", enforced)
+	}
+	if len(unenforced) != 1 || unenforced[0] != "send_email" {
+		t.Errorf("unenforced = %v, want [send_email]", unenforced)
+	}
+
+	// A server with no tools allowlist does not resurrect the entry either:
+	// "may match at runtime" is only true while the proxy is arming gates.
+	m.MCP.Servers[0].Tools = nil
+	if enforced, _ := m.EnforcedGateEntries(); len(enforced) != 0 {
+		t.Errorf("with an open tool list: enforced = %v, want none", enforced)
+	}
+
+	// Flipping the switch on, and nothing else, enforces it.
+	m.MCP.Servers[0].Tools = []string{"send_email"}
+	m.HumanGates.Enabled = true
+	enforced, unenforced = m.EnforcedGateEntries()
+	if len(enforced) != 1 || enforced[0] != "send_email" {
+		t.Errorf("with the switch on: enforced = %v, want [send_email]", enforced)
+	}
+	if len(unenforced) != 0 {
+		t.Errorf("with the switch on: unenforced = %v, want none", unenforced)
+	}
+
+	// An empty list reports nothing either way — there is no gate to report.
+	m.HumanGates.Enabled = false
+	m.HumanGates.RequireApprovalFor = nil
+	if enforced, unenforced := m.EnforcedGateEntries(); len(enforced) != 0 || len(unenforced) != 0 {
+		t.Errorf("with no entries: enforced = %v, unenforced = %v, want both empty", enforced, unenforced)
 	}
 }
 
@@ -1041,5 +1342,41 @@ func TestInferIsolationMatchesCapabilityFloor(t *testing.T) {
 		for _, b := range all {
 			check([]Capability{a, b})
 		}
+	}
+}
+
+// TestHumanGatesRejectsEmptyToolEntry: an empty entry arms a gate on a name
+// nothing can be held to. The gate would match a tools/call whose
+// params.name is also empty and write an audit record with the tool name
+// empty on both sides — correctly signed, and unverifiable offline, because
+// a verifier that accepted an empty name as a match would also accept a
+// deleted one. Found by review of the offline verifier's presence rules.
+func TestHumanGatesRejectsEmptyToolEntry(t *testing.T) {
+	const pubkey = "did:key:z6MkgZ9rP6b8ugnXJwtJzQc3yheTPPU7ZBLgdYuVZGEs3eH6"
+	for _, entry := range []string{`""`, `" "`, `"\t"`} {
+		yaml := "apiVersion: constle.dev/v1alpha1\nkind: AgentManifest\n" +
+			"identity:\n  name: gate-test\n" +
+			"human_gates:\n  enabled: true\n  require_approval_for: [" + entry + "]\n" +
+			"  approver_pubkey: \"" + pubkey + "\"\n"
+		m, err := Parse([]byte(yaml))
+		if err != nil {
+			t.Fatalf("Parse() error: %v", err)
+		}
+		if err := m.Validate(); err == nil {
+			t.Errorf("Validate() accepted require_approval_for: [%s]", entry)
+		}
+	}
+
+	// A real tool name still validates, or the check is too broad.
+	yaml := "apiVersion: constle.dev/v1alpha1\nkind: AgentManifest\n" +
+		"identity:\n  name: gate-test\n" +
+		"human_gates:\n  enabled: true\n  require_approval_for: [\"fs.write\"]\n" +
+		"  approver_pubkey: \"" + pubkey + "\"\n"
+	m, err := Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error: %v", err)
+	}
+	if err := m.Validate(); err != nil {
+		t.Errorf("Validate() rejected a named tool: %v", err)
 	}
 }

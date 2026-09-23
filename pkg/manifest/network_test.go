@@ -81,3 +81,73 @@ func TestValidateAllowedHost(t *testing.T) {
 		})
 	}
 }
+
+// TestNormalizeHost pins the two spellings a hostname has that the allowlist
+// grammar never produces but a URL may legally carry: a DNS name is
+// case-insensitive (RFC 4343), and a URL's host explicitly so (RFC 3986
+// §3.2.2); a trailing dot is the fully-qualified form of the same name.
+//
+// The allowlist's own leading dot is not part of a name and must survive.
+func TestNormalizeHost(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"api.example.com", "api.example.com"},
+		{"API.EXAMPLE.COM", "api.example.com"},
+		{"Api.Example.Com", "api.example.com"},
+		{"api.example.com.", "api.example.com"},
+		{"ApI.eXaMpLe.CoM.", "api.example.com"},
+		{".example.com", ".example.com"},
+		{".EXAMPLE.COM.", ".example.com"},
+		{"", ""},
+	} {
+		if got := normalizeHost(tc.in); got != tc.want {
+			t.Errorf("normalizeHost(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestHostsOverlapFoldsBothSides: the guarantee belongs to the comparison, not
+// to whichever side happened to be validated first. An allowed_hosts entry has
+// been through ValidateAllowedHost and is lowercase with no trailing dot; a
+// host from mcp.servers[].url or a2a.peers[].endpoint has been through
+// neither. Folding only the entry side would leave the bypass open.
+func TestHostsOverlapFoldsBothSides(t *testing.T) {
+	for _, tc := range []struct {
+		allowed, host string
+		want          bool
+	}{
+		{"api.example.com", "API.EXAMPLE.COM", true},
+		{"api.example.com", "api.example.com.", true},
+		{"api.example.com", "ApI.eXaMpLe.CoM.", true},
+		{"API.EXAMPLE.COM", "api.example.com", true},
+		{".example.com", "MCP.EXAMPLE.COM", true},
+		{".example.com", "example.com.", true},
+		{".EXAMPLE.COM", "mcp.example.com", true},
+		{"api.example.com", "api.openai.com", false},
+		{"api.example.com", "notapi.example.com", false},
+		{".example.com", "example.com.evil.test", false},
+	} {
+		if got := hostsOverlap(tc.allowed, tc.host); got != tc.want {
+			t.Errorf("hostsOverlap(%q, %q) = %v, want %v", tc.allowed, tc.host, got, tc.want)
+		}
+	}
+}
+
+// TestIsHostLoopbackAliasFoldsCase: this one only ever sees allowlist entries,
+// which the grammar already holds to one spelling, so folding here is a guard
+// against that grammar being relaxed later rather than a live hole today.
+func TestIsHostLoopbackAliasFoldsCase(t *testing.T) {
+	for _, host := range []string{
+		"localhost", "LOCALHOST", "LocalHost", "localhost.",
+		"host.docker.internal", "HOST.DOCKER.INTERNAL", ".HOST.DOCKER.INTERNAL",
+		"127.0.0.1", "::1",
+	} {
+		if !isHostLoopbackAlias(host) {
+			t.Errorf("isHostLoopbackAlias(%q) = false, want true", host)
+		}
+	}
+	for _, host := range []string{"api.example.com", "localhost.evil.test", "notlocalhost"} {
+		if isHostLoopbackAlias(host) {
+			t.Errorf("isHostLoopbackAlias(%q) = true, want false", host)
+		}
+	}
+}

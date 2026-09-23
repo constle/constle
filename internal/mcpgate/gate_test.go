@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"crypto/ed25519"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -2156,6 +2158,150 @@ func TestDotSegmentsAreRefusedOnEveryAdmittedMethod(t *testing.T) {
 	}
 }
 
+// TestUnlistedCharactersNeverReachTheUpstream is the part of C-34 that a
+// denylist cannot close. Every suffix below decodes to segments that are not
+// dot segments and hold no '%', ';' or '\', so each named rule passes it, and
+// the rewrite re-escapes it onto the wire. An upstream that reads those bytes
+// a second way gets exactly the structure the named rules refuse:
+//
+//   - NFKC folds compatibility forms into ASCII: '．' and '‥' into '.' and
+//     "..", '／' into '/', '％' into '%'.
+//   - A Windows best-fit code page does the same through tables of its own,
+//     for code points NFKC leaves alone: '∕' becomes '/' on 1252, '¥' becomes
+//     '\' on 932, '₩' becomes '\' on 949.
+//   - A decoder that re-parses the decoded path ends it at '?' or '#', and
+//     strips a tab as WHATWG URL parsers do: "/v1/mcp/..?/admin" is served
+//     as "/v1".
+//   - A lenient UTF-8 decoder reads the overlong "%C0%AE" as '.'.
+//
+// The readings are open-ended — every normalisation form and every code page
+// is one more table — so the rule is an allowlist rather than a longer
+// denylist: a forwarded segment holds only RFC 3986 unreserved bytes, the
+// only ones whose meaning does not depend on who reads them.
+func TestUnlistedCharactersNeverReachTheUpstream(t *testing.T) {
+	for _, tc := range []struct{ suffix, reading string }{
+		{"/%EF%BC%8E%EF%BC%8E/admin", "NFKC: U+FF0E FULLWIDTH FULL STOP, twice, is .."},
+		{"/%E2%80%A5/admin", "NFKC: U+2025 TWO DOT LEADER is .. in one code point"},
+		{"/%EF%B9%92%EF%B9%92/admin", "NFKC: U+FE52 SMALL FULL STOP, twice, is .."},
+		{"/..%EF%BC%8Fadmin", "NFKC: U+FF0F FULLWIDTH SOLIDUS is /"},
+		{"/..%EF%BC%BCadmin", "NFKC: U+FF3C FULLWIDTH REVERSE SOLIDUS is \\"},
+		{"/..%EF%BC%9B/admin", "NFKC: U+FF1B FULLWIDTH SEMICOLON makes ..;"},
+		{"/%EF%BC%852e%EF%BC%852e%EF%BC%852fadmin", "NFKC: U+FF05 FULLWIDTH PERCENT SIGN makes %2e%2e%2f"},
+		{"/%E2%84%80", "NFKC: U+2100 ACCOUNT OF is a/c, one segment read as two"},
+		{"/..%E2%88%95admin", "best-fit 1252: U+2215 DIVISION SLASH is /"},
+		{"/..%E2%81%84admin", "best-fit 1252: U+2044 FRACTION SLASH is /"},
+		{"/..%C2%A5admin", "best-fit 932: U+00A5 YEN SIGN is \\"},
+		{"/..%E2%82%A9admin", "best-fit 949: U+20A9 WON SIGN is \\"},
+		{"/..%3F/admin", "re-parse: ? ends the path after .."},
+		{"/..%23/admin", "re-parse: # ends the path after .."},
+		{"/.%09./admin", "WHATWG: the tab is stripped, leaving .."},
+		{"/%C0%AE%C0%AE/admin", "lenient UTF-8: overlong %C0%AE is ."},
+		{"/messages/%EF%BC%8E%EF%BC%8E/admin", "NFKC, in a segment after the first"},
+	} {
+		t.Run(tc.suffix, func(t *testing.T) {
+			h, _ := newPathHarness(t, "/v1/mcp")
+
+			status, body, _ := doRequest(t, http.MethodGet, h.baseURL+tc.suffix, "")
+			if status != http.StatusBadRequest {
+				t.Errorf("GET %s (%s): status=%d body=%q, want 400", tc.suffix, tc.reading, status, body)
+			}
+			if got := h.calls.Load(); got != 0 {
+				t.Errorf("GET %s (%s) reached the upstream %d times, want 0", tc.suffix, tc.reading, got)
+			}
+
+			blocked := eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)
+			if len(blocked) != 1 {
+				t.Fatalf("GET %s (%s): %d mcp_request_blocked events, want 1", tc.suffix, tc.reading, len(blocked))
+			}
+			if reason, _ := blocked[0].Details["reason"].(string); reason != reasonUnlistedCharacter {
+				t.Errorf("GET %s: reason=%q, want %q", tc.suffix, reason, reasonUnlistedCharacter)
+			}
+		})
+	}
+}
+
+// TestPathAllowlistsAreExact pins both sets, one byte at a time, so that
+// widening either is a decision made here rather than a side effect of some
+// other change. The sub-path's set is the unreserved set and nothing more; the
+// declared endpoint's adds '@' and ':' and nothing more. Each byte sits inside
+// a segment that is not a dot segment; the three bytes a named rule already
+// refuses keep that rule's reason, and every other byte outside the set gets
+// the allowlist's.
+func TestPathAllowlistsAreExact(t *testing.T) {
+	const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+	named := map[byte]string{'%': reasonPercentEncoding, ';': reasonPathParameter, '\\': reasonBackslash}
+
+	for _, tc := range []struct {
+		name     string
+		check    func(string) string
+		allowed  string
+		unlisted string
+	}{
+		{"sub-path", ambiguousPathReason, unreserved, reasonUnlistedCharacter},
+		{"endpoint", ambiguousEndpointReason, unreserved + "@:", reasonUnlistedEndpointCharacter},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := 0; i < 256; i++ {
+				b := byte(i)
+				if b == '/' {
+					continue // the separator between segments, never inside one
+				}
+				want := ""
+				if strings.IndexByte(tc.allowed, b) < 0 {
+					want = tc.unlisted
+					if reason, ok := named[b]; ok {
+						want = reason
+					}
+				}
+				if got := tc.check("x" + string([]byte{b}) + "x"); got != want {
+					t.Errorf("byte %#02x: reason=%q, want %q", b, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestEndpointBytesDoNotWidenTheSubPath: the declared endpoint may hold '@'
+// and ':' because the operator wrote it; the sub-path may not, because the
+// sender writes it. A gate built on "/@org/name/mcp" serves that endpoint and
+// what lies under it, and still refuses a sub-path carrying either byte, in
+// either spelling — the check that admitted them in the endpoint must not be
+// the one that judges the request.
+func TestEndpointBytesDoNotWidenTheSubPath(t *testing.T) {
+	const endpoint = "/@org/name:v2/mcp"
+
+	t.Run("endpoint is served", func(t *testing.T) {
+		h, probe := newPathHarness(t, endpoint)
+		status, body, _ := doRequest(t, http.MethodGet, h.baseURL+"/messages", "")
+		if status != http.StatusOK {
+			t.Fatalf("status=%d body=%q, want 200", status, body)
+		}
+		if got := probe.all(); len(got) != 1 || got[0] != endpoint+"/messages" {
+			t.Errorf("upstream saw %q, want [%s/messages]", got, endpoint)
+		}
+	})
+
+	for _, suffix := range []string{"/@evil", "/%40evil", "/a:b", "/a%3Ab", "/messages/@org"} {
+		t.Run(suffix, func(t *testing.T) {
+			h, _ := newPathHarness(t, endpoint)
+			status, body, _ := doRequest(t, http.MethodGet, h.baseURL+suffix, "")
+			if status != http.StatusBadRequest {
+				t.Errorf("GET %s: status=%d body=%q, want 400", suffix, status, body)
+			}
+			if got := h.calls.Load(); got != 0 {
+				t.Errorf("GET %s reached the upstream %d times, want 0", suffix, got)
+			}
+			blocked := eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)
+			if len(blocked) != 1 {
+				t.Fatalf("GET %s: %d mcp_request_blocked events, want 1", suffix, len(blocked))
+			}
+			if reason, _ := blocked[0].Details["reason"].(string); reason != reasonUnlistedCharacter {
+				t.Errorf("GET %s: reason=%q, want %q", suffix, reason, reasonUnlistedCharacter)
+			}
+		})
+	}
+}
+
 // TestLegitimateSubPathStillReachesTheUpstream: the refusals above must not
 // cost the feature they guard. A server that mounts more than its one endpoint
 // path — a session sub-path, say — is still addressable, and what lands on the
@@ -2168,11 +2314,14 @@ func TestLegitimateSubPathStillReachesTheUpstream(t *testing.T) {
 		{"/v1/mcp", "/", "/v1/mcp"},
 		{"/v1/mcp", "/session/", "/v1/mcp/session/"},
 		{"", "/messages", "/messages"},
-		// Ordinary percent-encoding decodes to a name with no structure in
-		// it, and is forwarded. Only a percent sign that survives the decode
-		// — the mark of an upstream asked to decode twice — is refused.
+		// Percent-encoding of an unreserved character decodes to that
+		// character and is forwarded bare, which RFC 3986 §6.2.2.2 makes the
+		// same URI. Encoding anything else still decodes to a byte outside
+		// the allowlist — "a%20b" to a space — and is refused with it.
 		{"/v1/mcp", "/report%2Ejson", "/v1/mcp/report.json"},
-		{"/v1/mcp", "/a%20b", "/v1/mcp/a%20b"},
+		{"/v1/mcp", "/%41-%7e", "/v1/mcp/A-~"},
+		// The whole allowlist, in one segment.
+		{"/v1/mcp", "/AZaz09-._~", "/v1/mcp/AZaz09-._~"},
 	} {
 		t.Run(tc.endpoint+"|"+tc.suffix, func(t *testing.T) {
 			h, probe := newPathHarness(t, tc.endpoint)
@@ -2484,6 +2633,17 @@ func TestDeclaredEndpointCannotBeAmbiguous(t *testing.T) {
 		"https://origin.example/./mcp",
 		"https://origin.example/a//b",
 		"https://origin.example/mcp%2F..",
+		// The same readings as TestUnlistedCharactersNeverReachTheUpstream:
+		// an origin that applies NFKC serves both of these as "/".
+		"https://origin.example/safe/%EF%BC%8E%EF%BC%8E",
+		"https://origin.example/safe/%E2%80%A5",
+		// The endpoint's set is wider than the sub-path's by '@' and ':'
+		// only: every other byte outside the unreserved set is still refused.
+		"https://origin.example/a%20b/mcp",
+		"https://origin.example/mcp+x",
+		"https://origin.example/v1!/mcp",
+		// '@' is admitted, but never where "//" would put it in an authority.
+		"https://origin.example//@evil.example/mcp",
 	} {
 		m := &manifest.AgentManifest{
 			Identity: manifest.Identity{Name: "endpoint-agent"},
@@ -2501,6 +2661,9 @@ func TestDeclaredEndpointCannotBeAmbiguous(t *testing.T) {
 		"https://origin.example/mcp",
 		"https://origin.example/v1/mcp",
 		"https://origin.example/v1/mcp/",
+		// Hosted MCP servers put '@' and ':' in the paths they serve.
+		"https://server.example/@org/name/mcp",
+		"https://origin.example/v1/servers/name:v2/mcp",
 	} {
 		m := &manifest.AgentManifest{
 			Identity: manifest.Identity{Name: "endpoint-agent"},
@@ -2565,5 +2728,197 @@ func TestUpstreamProxiesCarryTheirGuards(t *testing.T) {
 	resp := &http.Response{StatusCode: http.StatusSwitchingProtocols, Header: http.Header{}}
 	if err := server.proxy.ModifyResponse(resp); err == nil {
 		t.Error("unpriced upstream accepted a 101 Switching Protocols")
+	}
+
+	// And every upstream carries its own ErrorLog. Without one the proxy
+	// logs through the standard library's global logger, straight to stderr
+	// and around this package's chokepoint; the wiring is asserted here so a
+	// future edit to the server loop cannot drop it for one kind of server
+	// the way ModifyResponse once was.
+	if server.proxy.ErrorLog == nil {
+		t.Error("upstream proxy has no ErrorLog: its own logging bypasses outf")
+	}
+}
+
+// failingTransport fails every round trip with a fixed error, which is how a
+// transport-level failure — a TLS or DNS error, a dead upstream — reaches
+// httputil.ReverseProxy's own error path.
+type failingTransport struct{ err error }
+
+func (f failingTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, f.err }
+
+// TestProxyErrorsCannotDriveTheTerminal covers the writer that is not a call
+// site. httputil.ReverseProxy does its own logging, and what it logs is an
+// error assembled from whatever the upstream did — so it is untrusted text on
+// the same stream the human gate draws its prompt on.
+//
+// Two errors, because they fail for different reasons. The synthetic one pins
+// the invariant whatever the standard library's wording does next; the x509
+// one is the instance that is reachable today, since HostnameError joins the
+// certificate's DNS names into its message verbatim while net/http quotes
+// most of what it reports with %q.
+func TestProxyErrorsCannotDriveTheTerminal(t *testing.T) {
+	const hostile = "\x1b[2K\x1b[1G⏸  human gate: approved"
+
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"synthetic transport error", errors.New(hostile)},
+		{"x509 hostname error", x509.HostnameError{
+			Certificate: &x509.Certificate{DNSNames: []string{hostile}},
+			Host:        "mcp.example",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := newSyncBuf()
+			restore := gateLogOut
+			gateLogOut = out
+			t.Cleanup(func() { gateLogOut = restore })
+
+			m := &manifest.AgentManifest{
+				Identity: manifest.Identity{Name: "proxy-agent"},
+				MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: "https://mcp.example/mcp"}}},
+			}
+			g, err := New(m, nil, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			g.token = "tok"
+			g.servers["email"].proxy.Transport = failingTransport{err: tc.err}
+
+			req := httptest.NewRequest(http.MethodGet, "http://gate.invalid/tok/servers/email", nil)
+			g.ServeHTTP(httptest.NewRecorder(), req)
+
+			// The premise comes first, twice: a proxy that logged nothing,
+			// or that logged without the upstream's text in it, would leave
+			// the assertion below passing over an empty string.
+			got := out.String()
+			if got == "" {
+				t.Fatal("the proxy logged nothing, so nothing below is tested")
+			}
+			if !strings.Contains(got, "human gate: approved") {
+				t.Fatalf("the upstream's text never reached this writer, so nothing below is tested: %q", got)
+			}
+			for _, bad := range []rune{0x1B, 0x0D} {
+				if strings.ContainsRune(got, bad) {
+					t.Errorf("%U reached the operator's terminal: %q", bad, got)
+				}
+			}
+		})
+	}
+}
+
+// TestDisabledGatesAgreeWithEnforcedGateEntries pins the invariant that
+// F17/F24/F77 broke: the gate proxy and the CLI must never disagree about
+// whether a declared gate is real.
+//
+// human_gates.enabled: false disarms the proxy (spec/agent-manifest.md §14.1),
+// and it always did — the proxy was correct. What was wrong was that
+// EnforcedGateEntries classified purely on the tool mapping, so
+// `constle validate` reported "send_email … paused at the MCP gate proxy for
+// approval" while a denying approver here never saw the call. The test asserts
+// both halves at once so a future edit cannot fix one side alone.
+func TestDisabledGatesAgreeWithEnforcedGateEntries(t *testing.T) {
+	calls := &atomic.Int64{}
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"sent"}]}}`)
+	}))
+	t.Cleanup(up.Close)
+
+	logger, err := audit.New(homedir.Under(t.TempDir(), "audit.jsonl"))
+	if err != nil {
+		t.Fatalf("audit.New: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "test-agent"},
+		MCP: manifest.MCP{Servers: []manifest.MCPServer{
+			{ID: "email", URL: up.URL, Tools: []string{"send_email"}},
+		}},
+		HumanGates: manifest.HumanGates{
+			Enabled:                false, // the master switch, off
+			RequireApprovalFor:     []string{"send_email"},
+			ApprovalTimeoutSeconds: 300,
+			OnTimeout:              "abort",
+		},
+	}
+
+	// The CLI half: nothing may be reported as enforced.
+	enforced, unenforced := m.EnforcedGateEntries()
+	if len(enforced) != 0 {
+		t.Errorf("EnforcedGateEntries reported %v as enforced while the master switch is off", enforced)
+	}
+	if len(unenforced) != 1 || unenforced[0] != "send_email" {
+		t.Errorf("unenforced = %v, want [send_email]", unenforced)
+	}
+
+	// The runtime half: the proxy arms nothing, and says so by forwarding.
+	g, err := New(m, &fixedApprover{decision: DecisionDenied}, nil, logger, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if len(g.gated) != 0 {
+		t.Errorf("gate armed %v with the master switch off", g.gated)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	port, token, err := g.Bind("testrun01", []string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	url := fmt.Sprintf("http://127.0.0.1:%d/%s/servers/email", port, token)
+
+	// A denying approver would refuse this call if any gate were armed.
+	if code, _ := postJSON(t, url, toolCallBody("send_email")); code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: an unarmed gate forwards", code)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Errorf("upstream calls = %d, want 1: the call must reach the upstream ungated", got)
+	}
+}
+
+// TestGateServerLoggerIsHeldToTheChokepoint pins the same omission one level
+// up from the reverse proxy. http.Server does its own logging too — a handler
+// panic, a TLS handshake failure — and with no ErrorLog it logs through the
+// standard library's global logger, straight to stderr and around outf. What
+// it logs is assembled from whatever the peer sent, on the stream the human
+// gate draws its prompt on.
+func TestGateServerLoggerIsHeldToTheChokepoint(t *testing.T) {
+	out := newSyncBuf()
+	restore := gateLogOut
+	gateLogOut = out
+	t.Cleanup(func() { gateLogOut = restore })
+
+	m := &manifest.AgentManifest{
+		Identity: manifest.Identity{Name: "logger-agent"},
+		MCP:      manifest.MCP{Servers: []manifest.MCPServer{{ID: "email", URL: "https://mcp.example/mcp"}}},
+	}
+	g, err := New(m, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, _, err := g.Bind("logrun01", []string{"127.0.0.1"}); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	if g.server.ErrorLog == nil {
+		t.Fatal("the gate's http.Server has no ErrorLog: its own logging bypasses outf")
+	}
+	g.server.ErrorLog.Printf("http: panic serving 10.0.0.1:1234: %s",
+		"\x1b[2K\x1b[1G⏸  human gate: approved")
+
+	got := out.String()
+	if !strings.Contains(got, "human gate: approved") {
+		t.Fatalf("the logged line never reached this writer, so nothing below is tested: %q", got)
+	}
+	for _, bad := range []rune{0x1B, 0x0D} {
+		if strings.ContainsRune(got, bad) {
+			t.Errorf("%U reached the operator's terminal: %q", bad, got)
+		}
 	}
 }

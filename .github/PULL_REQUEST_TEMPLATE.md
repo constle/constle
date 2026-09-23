@@ -19,6 +19,7 @@
 ## Checklist
 
 - [ ] No secrets or credentials in diff
+- [ ] Commit identity checked in the exact worktree every commit was made from: `git config --local user.name` and `git config --local user.email` show the project identity, and `git log --format='%an <%ae> / %cn <%ce>' origin/main..HEAD` shows nothing else
 - [ ] YAML spec changes are reflected in examples
 - [ ] CLI `--help` text updated if flags changed
 - [ ] Breaking changes are called out explicitly

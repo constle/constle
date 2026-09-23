@@ -20,9 +20,26 @@ import (
 // Runs the bypass scenarios from spec/bypass-test.yaml against every
 // available backend and requires IDENTICAL, designed results:
 //
-//	Test 1  non-allowlisted host through the proxy   → BLOCKED: YES
-//	Test 2  unset proxy env vars, connect directly    → BYPASS: FAILED
-//	Test 3  connect to a raw IP (DNS + IP-literal)    → BYPASS: FAILED
+//	Test 1  non-allowlisted host through the proxy    → BLOCKED: YES
+//	Test 2  allowlisted host, non-HTTPS port          → BYPASS: FAILED
+//	Test 3  allowlisted name resolving to loopback    → BYPASS: FAILED
+//	Test 4  raw IP whose reverse name is allowlisted  → BYPASS: FAILED
+//	Test 5  unset proxy env vars, connect directly    → BYPASS: FAILED
+//	Test 6  direct IP with no proxy                   → BYPASS: FAILED
+//
+// Tests 2, 3 and 4 are asserted host-side, not on the guest's own echo. Each
+// names a destination that would fail from inside the sandbox anyway — a port
+// nothing answers on, a loopback address belonging to another namespace, an
+// address that is merely slow — so the guest cannot tell a refusal from a
+// timeout, and against an unfixed proxy it reports "BYPASS: FAILED" for a
+// connection the proxy did attempt. What separates them is the line the proxy
+// wrote, which is why the audit log has to show each destination denied by
+// name.
+//
+// Test 4 asserts an invariant rather than reproducing a bypass: whether an
+// address can be admitted by its reverse name depends on whether the proxy's
+// resolver answers PTR queries at all, which differs between the two backends
+// and between hosts. The address must be refused either way.
 //
 // Gated behind CONSTLE_E2E=1 because the scenarios start real sandboxes
 // (Docker containers / Firecracker microVMs):
@@ -34,7 +51,7 @@ import (
 type bypassOutcome struct {
 	Test1Blocked      bool // "BLOCKED: YES" seen
 	BypassSucceeded   bool // any "BYPASS: SUCCEEDED" seen (must never be)
-	BypassFailedCount int  // "BYPASS: FAILED" occurrences (want 2)
+	BypassFailedCount int  // "BYPASS: FAILED" occurrences (want 5)
 }
 
 func conformanceBackends(t *testing.T) map[string]SandboxBackend {
@@ -88,8 +105,8 @@ func TestConformanceBypassScenarios(t *testing.T) {
 			if outcome.BypassSucceeded {
 				t.Errorf("[%s] a bypass attempt SUCCEEDED:\n%s", name, output)
 			}
-			if outcome.BypassFailedCount != 2 {
-				t.Errorf("[%s] want 2 failed bypass attempts, got %d:\n%s",
+			if outcome.BypassFailedCount != 5 {
+				t.Errorf("[%s] want 5 failed bypass attempts, got %d:\n%s",
 					name, outcome.BypassFailedCount, output)
 			}
 
@@ -103,6 +120,38 @@ func TestConformanceBypassScenarios(t *testing.T) {
 			}
 			if blocked == 0 {
 				t.Errorf("[%s] no network_blocked audit events recorded", name)
+			}
+
+			// Tests 2 to 4. Every destination below is covered by an entry on
+			// the allowlist — by name, by the name it resolves from, or by its
+			// reverse name — so a denial can only have come from a rule that
+			// looked past the entry: the port policy, the internal-destination
+			// rule, or reverse lookups being off. example.com, by contrast, is
+			// denied for not being listed at all, which is the older guarantee.
+			// The status matters as much as the event. parseSquidLine records
+			// a Squid NONE result - a connection that failed for its own
+			// reasons - as network_blocked too, so the event type alone would
+			// let "the proxy tried it and could not connect" pass for "the
+			// proxy refused it". 403 is what an ACL denial writes.
+			for host, why := range map[string]string{
+				"httpbin.org": "a tunnel to a non-443 port was not refused",
+				"localhost":   "an allowlisted name reaching an internal address was not refused",
+				"1.1.1.1":     "an address reached the network; only names may match the allowlist",
+			} {
+				denied := false
+				for _, event := range events {
+					if event.Event != audit.EventNetworkBlocked {
+						continue
+					}
+					got, _ := event.Details["host"].(string)
+					status, _ := event.Details["http_status"].(float64)
+					if got == host && status == 403 {
+						denied = true
+					}
+				}
+				if !denied {
+					t.Errorf("[%s] no 403 network_blocked event for %s: %s", name, host, why)
+				}
 			}
 		})
 	}

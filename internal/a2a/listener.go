@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/constle/constle/internal/audit"
+	"github.com/constle/constle/internal/termsafe"
 )
 
 // ============================================================
@@ -86,7 +87,7 @@ type inboundCall struct {
 func (g *Gate) StartListener(addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("cannot bind A2A listener on %s: %w", addr, err)
+		return fmt.Errorf("cannot bind A2A listener on %q: %w", addr, err)
 	}
 
 	g.public = &http.Server{
@@ -103,7 +104,11 @@ func (g *Gate) StartListener(addr string) error {
 		// identical to this agent refusing calls. ErrServerClosed is the
 		// ordinary end-of-run exit via Close.
 		if err := g.public.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Fprintf(os.Stderr, "constle: A2A public listener on %s stopped: %v\n", addr, err)
+			// ln.Addr() and not addr: the bound address is both the more
+			// accurate thing to report (":8080" resolves to something
+			// specific) and the only one of the two that is not a
+			// free-form a2a.listen string out of an Agentfile.
+			termsafe.Fprintf(os.Stderr, "constle: A2A public listener on %s stopped: %v\n", ln.Addr(), err)
 		}
 	}()
 	return nil

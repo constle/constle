@@ -30,15 +30,15 @@ Open an issue first for anything beyond a small fix - it's a quick way to confir
 
 ## Repository hygiene checks
 
-`scripts/hygiene-check.sh` scans commits (messages, authorship, and patch
-content) for things that don't belong in this repository: AI-attribution
-trailers, non-English text, and - for maintainers - private identifier
-patterns loaded from an untracked file outside the repo
-(`~/.config/constle/hygiene-patterns`, overridable via
-`CONSTLE_HYGIENE_PATTERNS`).
+`scripts/hygiene-check.sh` scans commits (messages, authorship, patch
+content, and the embedded metadata of binary and media files) for content
+that must not reach this repository. Its patterns are loaded from an
+untracked file outside the repo (`~/.config/constle/hygiene-patterns`,
+overridable via `CONSTLE_HYGIENE_PATTERNS`); without that file it refuses to
+run. Reading embedded metadata needs `exiftool`.
 
-CI runs the generic checks on every PR's commit range. To also run the full
-check locally on every push, install the pre-push hook once per clone:
+CI runs the check on every PR's commit range. To also run it locally on
+every push, install the pre-push hook once per clone:
 
 ```bash
 scripts/hygiene-check.sh --install-hook
@@ -46,4 +46,5 @@ scripts/hygiene-check.sh --install-hook
 
 Other modes: `--all` (every commit on every ref), `--range A..B`, `--tree`
 (tracked files as checked out). Exit code 1 means hits were found and
-printed with their commit hashes.
+printed with their commit hashes; 2 means the check could not run in full
+(no pattern file, or no `exiftool` for a file that needs it).

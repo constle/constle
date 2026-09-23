@@ -11,7 +11,10 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/mattn/go-runewidth"
+
 	"github.com/constle/constle/internal/sandbox"
+	"github.com/constle/constle/internal/termsafe"
 )
 
 // psContainer represents a single entry from `docker ps --format "{{json .}}"`.
@@ -25,11 +28,28 @@ type psContainer struct {
 }
 
 // psRow is one line of `constle ps` output, backend-agnostic.
+//
+// agentName reaches here from an Agentfile: the Docker backend writes
+// identity.name into the constle.agent-name label, and the Firecracker state
+// file records it the same way. `constle ps` therefore prints a field out of
+// every manifest that has ever run on this host — including ones the operator
+// ran once, months ago, and no longer has in front of them. newRow escapes it
+// on the way in so that neither renderer has to remember to.
 type psRow struct {
 	runID     string
 	agentName string
 	status    string
 	duration  string
+}
+
+// newRow builds a display row with every untrusted field already escaped.
+func newRow(runID, agentName, status, duration string) psRow {
+	return psRow{
+		runID:     termsafe.Line(runID),
+		agentName: termsafe.Line(agentName),
+		status:    termsafe.Line(status),
+		duration:  duration,
+	}
 }
 
 func runPS() error {
@@ -83,19 +103,20 @@ func renderPSStyled(rows []psRow) error {
 		}
 		return id
 	}
-	// Widths are measured in runes (not bytes): the "…" is one column but three
-	// UTF-8 bytes, and padr() pads by rune count — so a byte-based width would
-	// over-pad the RUN ID column. status/agent may also hold non-ASCII.
-	runeLen := func(s string) int { return len([]rune(s)) }
+	// Widths are measured in terminal columns, matching padr(): the "…" is one
+	// column but three UTF-8 bytes, so a byte-based width would over-pad the
+	// RUN ID column, and a rune-based one would under-pad an agent name whose
+	// characters are double-width.
+	colW := runewidth.StringWidth
 	idW, nameW, stW := len("RUN ID"), len("AGENT"), len("STATUS")
 	for _, r := range rows {
-		if l := runeLen(shortID(r.runID)); l > idW {
+		if l := colW(shortID(r.runID)); l > idW {
 			idW = l
 		}
-		if l := runeLen(r.agentName); l > nameW {
+		if l := colW(r.agentName); l > nameW {
 			nameW = l
 		}
-		if l := runeLen(r.status); l > stW {
+		if l := colW(r.status); l > stW {
 			stW = l
 		}
 	}
@@ -103,7 +124,7 @@ func renderPSStyled(rows []psRow) error {
 	printf("\n%s%s\n", indent, stMuted.Render(
 		padr("RUN ID", idW)+gap+padr("AGENT", nameW)+gap+padr("STATUS", stW)+gap+"DURATION"))
 	for _, r := range rows {
-		status := styledStatus(r.status) + strings.Repeat(" ", stW-runeLen(r.status))
+		status := styledStatus(r.status) + strings.Repeat(" ", stW-colW(r.status))
 		printf("%s%s%s%s%s%s%s%s\n", indent,
 			stInk.Render(padr(shortID(r.runID), idW)), gap,
 			stInk.Render(padr(r.agentName, nameW)), gap,
@@ -144,12 +165,12 @@ func dockerPSRows() []psRow {
 		// docker ps JSON labels are "key1=val1,key2=val2,..." not a map.
 		labels := parseDockerLabels(c.Labels)
 
-		rows = append(rows, psRow{
-			runID:     labels["constle.run-id"],
-			agentName: labels["constle.agent-name"],
-			status:    c.State,
-			duration:  calcDuration(labels["constle.started-at"]),
-		})
+		rows = append(rows, newRow(
+			labels["constle.run-id"],
+			labels["constle.agent-name"],
+			c.State,
+			calcDuration(labels["constle.started-at"]),
+		))
 	}
 	return rows
 }
@@ -163,12 +184,12 @@ func firecrackerPSRows() []psRow {
 		if run.Running {
 			status = "running"
 		}
-		rows = append(rows, psRow{
-			runID:     run.RunID,
-			agentName: run.AgentName,
-			status:    status,
-			duration:  calcDuration(run.StartedAt.Format(time.RFC3339)),
-		})
+		rows = append(rows, newRow(
+			run.RunID,
+			run.AgentName,
+			status,
+			calcDuration(run.StartedAt.Format(time.RFC3339)),
+		))
 	}
 	return rows
 }
