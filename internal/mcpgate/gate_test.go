@@ -2146,6 +2146,95 @@ func TestDotSegmentsAreRefusedOnEveryAdmittedMethod(t *testing.T) {
 	}
 }
 
+// TestUnlistedCharactersNeverReachTheUpstream is the part of C-34 that a
+// denylist cannot close. Every suffix below decodes to segments that are not
+// dot segments and hold no '%', ';' or '\', so each named rule passes it, and
+// the rewrite re-escapes it onto the wire. An upstream that reads those bytes
+// a second way gets exactly the structure the named rules refuse:
+//
+//   - NFKC folds compatibility forms into ASCII: '．' and '‥' into '.' and
+//     "..", '／' into '/', '％' into '%'.
+//   - A Windows best-fit code page does the same through tables of its own,
+//     for code points NFKC leaves alone: '∕' becomes '/' on 1252, '¥' becomes
+//     '\' on 932, '₩' becomes '\' on 949.
+//   - A decoder that re-parses the decoded path ends it at '?' or '#', and
+//     strips a tab as WHATWG URL parsers do: "/v1/mcp/..?/admin" is served
+//     as "/v1".
+//   - A lenient UTF-8 decoder reads the overlong "%C0%AE" as '.'.
+//
+// The readings are open-ended — every normalisation form and every code page
+// is one more table — so the rule is an allowlist rather than a longer
+// denylist: a forwarded segment holds only RFC 3986 unreserved bytes, the
+// only ones whose meaning does not depend on who reads them.
+func TestUnlistedCharactersNeverReachTheUpstream(t *testing.T) {
+	for _, tc := range []struct{ suffix, reading string }{
+		{"/%EF%BC%8E%EF%BC%8E/admin", "NFKC: U+FF0E FULLWIDTH FULL STOP, twice, is .."},
+		{"/%E2%80%A5/admin", "NFKC: U+2025 TWO DOT LEADER is .. in one code point"},
+		{"/%EF%B9%92%EF%B9%92/admin", "NFKC: U+FE52 SMALL FULL STOP, twice, is .."},
+		{"/..%EF%BC%8Fadmin", "NFKC: U+FF0F FULLWIDTH SOLIDUS is /"},
+		{"/..%EF%BC%BCadmin", "NFKC: U+FF3C FULLWIDTH REVERSE SOLIDUS is \\"},
+		{"/..%EF%BC%9B/admin", "NFKC: U+FF1B FULLWIDTH SEMICOLON makes ..;"},
+		{"/%EF%BC%852e%EF%BC%852e%EF%BC%852fadmin", "NFKC: U+FF05 FULLWIDTH PERCENT SIGN makes %2e%2e%2f"},
+		{"/%E2%84%80", "NFKC: U+2100 ACCOUNT OF is a/c, one segment read as two"},
+		{"/..%E2%88%95admin", "best-fit 1252: U+2215 DIVISION SLASH is /"},
+		{"/..%E2%81%84admin", "best-fit 1252: U+2044 FRACTION SLASH is /"},
+		{"/..%C2%A5admin", "best-fit 932: U+00A5 YEN SIGN is \\"},
+		{"/..%E2%82%A9admin", "best-fit 949: U+20A9 WON SIGN is \\"},
+		{"/..%3F/admin", "re-parse: ? ends the path after .."},
+		{"/..%23/admin", "re-parse: # ends the path after .."},
+		{"/.%09./admin", "WHATWG: the tab is stripped, leaving .."},
+		{"/%C0%AE%C0%AE/admin", "lenient UTF-8: overlong %C0%AE is ."},
+		{"/messages/%EF%BC%8E%EF%BC%8E/admin", "NFKC, in a segment after the first"},
+	} {
+		t.Run(tc.suffix, func(t *testing.T) {
+			h, _ := newPathHarness(t, "/v1/mcp")
+
+			status, body, _ := doRequest(t, http.MethodGet, h.baseURL+tc.suffix, "")
+			if status != http.StatusBadRequest {
+				t.Errorf("GET %s (%s): status=%d body=%q, want 400", tc.suffix, tc.reading, status, body)
+			}
+			if got := h.calls.Load(); got != 0 {
+				t.Errorf("GET %s (%s) reached the upstream %d times, want 0", tc.suffix, tc.reading, got)
+			}
+
+			blocked := eventsOfType(auditEvents(t, h), audit.EventMCPRequestBlocked)
+			if len(blocked) != 1 {
+				t.Fatalf("GET %s (%s): %d mcp_request_blocked events, want 1", tc.suffix, tc.reading, len(blocked))
+			}
+			if reason, _ := blocked[0].Details["reason"].(string); reason != reasonUnlistedCharacter {
+				t.Errorf("GET %s: reason=%q, want %q", tc.suffix, reason, reasonUnlistedCharacter)
+			}
+		})
+	}
+}
+
+// TestPathAllowlistIsExactlyUnreserved pins the set itself, one byte at a
+// time, so that widening it is a decision made here rather than a side effect
+// of some other change. Each byte sits inside a segment that is not a dot
+// segment; the three bytes a named rule already refuses keep that rule's
+// reason, and every other byte outside the set gets the allowlist's.
+func TestPathAllowlistIsExactlyUnreserved(t *testing.T) {
+	const unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
+	named := map[byte]string{'%': reasonPercentEncoding, ';': reasonPathParameter, '\\': reasonBackslash}
+
+	for i := 0; i < 256; i++ {
+		b := byte(i)
+		if b == '/' {
+			continue // the separator between segments, never inside one
+		}
+		want := ""
+		if strings.IndexByte(unreserved, b) < 0 {
+			want = reasonUnlistedCharacter
+			if reason, ok := named[b]; ok {
+				want = reason
+			}
+		}
+		if got := ambiguousPathReason("x" + string([]byte{b}) + "x"); got != want {
+			t.Errorf("byte %#02x: reason=%q, want %q", b, got, want)
+		}
+	}
+}
+
 // TestLegitimateSubPathStillReachesTheUpstream: the refusals above must not
 // cost the feature they guard. A server that mounts more than its one endpoint
 // path — a session sub-path, say — is still addressable, and what lands on the
@@ -2474,6 +2563,10 @@ func TestDeclaredEndpointCannotBeAmbiguous(t *testing.T) {
 		"https://origin.example/./mcp",
 		"https://origin.example/a//b",
 		"https://origin.example/mcp%2F..",
+		// The same readings as TestUnlistedCharactersNeverReachTheUpstream:
+		// an origin that applies NFKC serves both of these as "/".
+		"https://origin.example/safe/%EF%BC%8E%EF%BC%8E",
+		"https://origin.example/safe/%E2%80%A5",
 	} {
 		m := &manifest.AgentManifest{
 			Identity: manifest.Identity{Name: "endpoint-agent"},

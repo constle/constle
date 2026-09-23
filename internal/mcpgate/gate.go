@@ -564,6 +564,7 @@ const (
 	reasonPercentEncoding     = "percent-encoding in the request path"
 	reasonPathParameter       = "path parameter in the request path"
 	reasonBackslash           = "backslash in the request path"
+	reasonUnlistedCharacter   = "character outside A-Z a-z 0-9 - . _ ~ in the request path"
 	reasonProtocolUpgrade     = "the MCP transport defines no protocol upgrade"
 	reasonPathEscapedEndpoint = "forwarded path outside the declared endpoint"
 )
